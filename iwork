@@ -296,6 +296,8 @@ park_current_repo() {
   echo ""
   echo "Done! Worktree parked at:"
   echo "  $wt_path"
+
+  open_task_window "$folder_name" claude
 }
 
 detect_branch_from_worktree_folder() {
@@ -882,3 +884,4 @@ folder_name="${branch//\//-}"
 branch_slug="$folder_name"
 
 create_worktrees "$branch" "$folder_name" "$branch_slug" "${repos[@]}"
+open_task_window "$folder_name" claude
