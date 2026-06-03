@@ -830,6 +830,71 @@ handle_claude_hook() {
   exit 0
 }
 
+install_claude_hooks() {
+  local settings_path="$1"
+  local hook_cmd="$SELF_PATH --hook"
+
+  command -v python3 >/dev/null 2>&1 || die "install-hooks requires python3"
+
+  python3 - "$settings_path" "$hook_cmd" <<'PY'
+import json
+import os
+import sys
+
+settings_path = sys.argv[1]
+cmd = sys.argv[2]
+events = ["UserPromptSubmit", "Stop", "Notification"]
+
+data = {}
+if os.path.exists(settings_path):
+    with open(settings_path) as f:
+        data = json.load(f)
+
+hooks = data.setdefault("hooks", {})
+to_add = []
+for ev in events:
+    entries = hooks.setdefault(ev, [])
+    present = any(
+        h.get("command") == cmd
+        for entry in entries
+        for h in entry.get("hooks", [])
+    )
+    if not present:
+        to_add.append(ev)
+
+if not to_add:
+    print(f"iwork hook already installed for all events in {settings_path}")
+    sys.exit(0)
+
+print(f"Will add to {settings_path}:")
+for ev in to_add:
+    print(f'  {ev}: {{"type": "command", "command": "{cmd}"}}')
+
+if os.environ.get("IWORK_ASSUME_YES") != "1":
+    try:
+        with open("/dev/tty") as tty:
+            print("Proceed? [y/N] ", end="", flush=True)
+            answer = tty.readline().strip().lower()
+    except OSError:
+        sys.exit("no TTY available for confirmation; aborting")
+    if answer != "y":
+        sys.exit("aborted")
+
+for ev in to_add:
+    hooks[ev].append({"hooks": [{"type": "command", "command": cmd}]})
+
+settings_dir = os.path.dirname(settings_path)
+if settings_dir:
+    os.makedirs(settings_dir, exist_ok=True)
+tmp_path = settings_path + ".tmp"
+with open(tmp_path, "w") as f:
+    json.dump(data, f, indent=2)
+    f.write("\n")
+os.replace(tmp_path, settings_path)
+print(f"Updated {settings_path}")
+PY
+}
+
 if [[ $# -eq 0 ]]; then
   usage 0
 fi
@@ -901,6 +966,15 @@ if [[ "${1:-}" == "park" ]]; then
   fi
 
   park_current_repo "$2"
+  exit 0
+fi
+
+if [[ "${1:-}" == "install-hooks" ]]; then
+  if [[ $# -gt 2 ]]; then
+    die "usage: iwork install-hooks [settings-path]"
+  fi
+
+  install_claude_hooks "${2:-$HOME/.claude/settings.json}"
   exit 0
 fi
 
