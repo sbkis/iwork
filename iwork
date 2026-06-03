@@ -9,26 +9,36 @@ IWORK_NO_TMUX=""
 
 usage() {
   cat <<'EOF'
-Usage: iwork <branch-name> -r <repo1> [repo2 ...]
+Usage: iwork [--no-tmux] <branch-name> -r <repo1> [repo2 ...]
        iwork add-repo <folder-name-in-AAWORKTREES> -r <repo1> [repo2 ...]
-       iwork park <folder-name-in-AAWORKTREES>
-       iwork list
-       iwork cd <folder-name-in-AAWORKTREES>
-       iwork claude <folder-name-in-AAWORKTREES> [claude-args...]
-       iwork codex <folder-name-in-AAWORKTREES> [codex-args...]
+       iwork [--no-tmux] park <folder-name-in-AAWORKTREES>
+       iwork [--no-tmux] list
+       iwork [--no-tmux] cd <folder-name-in-AAWORKTREES>
+       iwork [--no-tmux] claude <folder-name-in-AAWORKTREES> [claude-args...]
+       iwork [--no-tmux] codex <folder-name-in-AAWORKTREES> [codex-args...]
+       iwork install-hooks [settings-path]
        iwork --completion <bash|zsh>
 
 Create a worktree folder in AAWORKTREES and set up git worktrees for the
 specified repos, all on the given branch.
 
+Inside tmux, each task maps to a window in a dedicated 'tasks' session
+(override the name with IWORK_TMUX_SESSION). Creation and park open the
+window (claude starts in the left pane, a shell in the right);
+claude/codex/cd switch to it if it exists. Claude Code hooks (see
+install-hooks) mark the window name with the agent state:
+*task = busy, !task = waiting for you.
+
 Subcommands:
-  add-repo Add one or more repos to an existing worktree folder
-  park    Move the current repo/branch into a worktree folder
-  list    List folders directly under AAWORKTREES
-  cd      Change the current shell into a worktree folder
-          Requires sourced shell integration from --completion
-  claude  Change into a worktree folder and start claude there
-  codex   Change into a worktree folder and start codex there
+  add-repo       Add one or more repos to an existing worktree folder
+  park           Move the current repo/branch into a worktree folder
+  list           List folders under AAWORKTREES (with window status in tmux)
+  cd             Switch to the task window, or cd into the worktree folder
+                 Requires sourced shell integration from --completion
+  claude         Open/switch to the task window and run claude there
+  codex          Open/switch to the task window and run codex there
+  install-hooks  Add Claude Code hooks to ~/.claude/settings.json that keep
+                 tmux window names in sync with agent status
 
 Examples:
   iwork feat/bla -r rent-api accounting-api
@@ -38,11 +48,13 @@ Examples:
   iwork list
   iwork cd feat-contract-status-improvements
   iwork claude feat-contract-status-improvements
-  iwork codex feat-contract-status-improvements
+  iwork --no-tmux claude feat-contract-status-improvements
+  iwork install-hooks
 
 Options:
-  -r    Repos to create worktrees for (required, at least one)
-  -h    Show this help
+  --no-tmux  Skip all tmux window handling (must be the first argument)
+  -r         Repos to create worktrees for (required, at least one)
+  -h         Show this help
 
 Completion:
   source <(iwork --completion bash)
@@ -605,12 +617,12 @@ _iwork() {
   fi
 
   if (( COMP_CWORD == 1 )); then
-    COMPREPLY=( $(compgen -W "add-repo park list cd claude codex -h --help --completion" -- "$cur") )
+    COMPREPLY=( $(compgen -W "add-repo park list cd claude codex install-hooks --no-tmux -h --help --completion" -- "$cur") )
     return 0
   fi
 
   if [[ "$cur" == -* ]]; then
-    COMPREPLY=( $(compgen -W "-r -h --help --completion" -- "$cur") )
+    COMPREPLY=( $(compgen -W "-r -h --help --completion --no-tmux" -- "$cur") )
     return 0
   fi
 
@@ -704,9 +716,11 @@ _iwork() {
       'add-repo[add repos to an existing worktree folder]' \
       'park[move the current repo branch into a worktree folder]' \
       'list[list worktree folders]' \
-      'cd[cd into a worktree folder]' \
-      'claude[cd into a worktree folder and run claude]' \
-      'codex[cd into a worktree folder and run codex]' \
+      'cd[cd into a worktree folder or switch to its tmux window]' \
+      'claude[open the task tmux window and run claude]' \
+      'codex[open the task tmux window and run codex]' \
+      'install-hooks[install Claude Code status hooks]' \
+      '--no-tmux[skip tmux window handling]' \
       '--completion[print shell integration]'
     return 0
   fi
