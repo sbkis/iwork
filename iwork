@@ -794,6 +794,42 @@ open_task_window() {
   tmux switch-client -t "=$TASKS_SESSION" 2>/dev/null || true
 }
 
+handle_claude_hook() {
+  local input=""
+  local event=""
+  local window_name=""
+  local base=""
+  local marker=""
+
+  [[ -n "${TMUX:-}" && -n "${TMUX_PANE:-}" ]] || exit 0
+
+  input="$(cat 2>/dev/null || true)"
+  event="$(printf '%s' "$input" | sed -n 's/.*"hook_event_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' || true)"
+  [[ -n "$event" ]] || exit 0
+
+  window_name="$(tmux display-message -p -t "$TMUX_PANE" '#{window_name}' 2>/dev/null)" || exit 0
+  base="${window_name#[*!]}"
+  [[ -n "$base" && -d "$WORKTREES_DIR/$base" ]] || exit 0
+
+  case "$event" in
+    UserPromptSubmit)
+      marker='*'
+      ;;
+    Stop|Notification)
+      marker='!'
+      ;;
+    *)
+      exit 0
+      ;;
+  esac
+
+  if [[ "$window_name" != "${marker}${base}" ]]; then
+    tmux rename-window -t "$TMUX_PANE" "${marker}${base}" 2>/dev/null || true
+  fi
+
+  exit 0
+}
+
 if [[ $# -eq 0 ]]; then
   usage 0
 fi
@@ -848,6 +884,9 @@ case "${1:-}" in
     tmux select-window -t "$switch_window_id" 2>/dev/null || exit 1
     tmux switch-client -t "=$TASKS_SESSION" 2>/dev/null || true
     exit 0
+    ;;
+  --hook)
+    handle_claude_hook
     ;;
 esac
 
