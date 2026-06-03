@@ -600,6 +600,9 @@ _iwork() {
     list)
       return 0
       ;;
+    install-hooks)
+      return 0
+      ;;
   esac
 
   seen_r=""
@@ -737,6 +740,9 @@ _iwork() {
       return 0
       ;;
     list)
+      return 0
+      ;;
+    install-hooks)
       return 0
       ;;
   esac
