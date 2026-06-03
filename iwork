@@ -156,6 +156,12 @@ run_tool_in_worktree() {
 
   shift 2
   folder_path="$(resolve_worktree_folder "$folder")"
+
+  if tmux_enabled; then
+    open_task_window "$folder" "$tool" "$@"
+    exit 0
+  fi
+
   cd "$folder_path"
   exec "$tool" "$@"
 }
