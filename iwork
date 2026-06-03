@@ -137,6 +137,53 @@ list_worktree_folders() {
   done | sort
 }
 
+list_worktree_folders_with_status() {
+  local folders=""
+  local windows=""
+  local folder=""
+  local window_name=""
+  local status=""
+  local width=0
+
+  folders="$(list_worktree_folders)"
+  [[ -n "$folders" ]] || return 0
+
+  windows="$(tmux list-windows -t "=$TASKS_SESSION" -F '#{window_name}' 2>/dev/null || true)"
+
+  while IFS= read -r folder; do
+    if (( ${#folder} > width )); then
+      width=${#folder}
+    fi
+  done <<< "$folders"
+
+  while IFS= read -r folder; do
+    status=""
+    while IFS= read -r window_name; do
+      [[ -n "$window_name" ]] || continue
+      case "$window_name" in
+        '*'"$folder")
+          status='*running'
+          break
+          ;;
+        '!'"$folder")
+          status='!waiting'
+          break
+          ;;
+        "$folder")
+          status='open'
+          break
+          ;;
+      esac
+    done <<< "$windows"
+
+    if [[ -n "$status" ]]; then
+      printf '%-*s  %s\n' "$width" "$folder" "$status"
+    else
+      printf '%s\n' "$folder"
+    fi
+  done <<< "$folders"
+}
+
 resolve_worktree_folder() {
   local folder="$1"
   local folder_path=""
@@ -960,7 +1007,11 @@ case "${1:-}" in
 esac
 
 if [[ "${1:-}" == "list" && $# -eq 1 ]]; then
-  list_worktree_folders
+  if tmux_enabled; then
+    list_worktree_folders_with_status
+  else
+    list_worktree_folders
+  fi
   exit 0
 fi
 
