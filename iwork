@@ -98,6 +98,9 @@ validate_worktree_folder_name() {
     ""|.|..|*/*|*\\* )
       die "folder '$folder' must be a direct child of $WORKTREES_DIR"
       ;;
+    \**|!* )
+      die "folder '$folder' must not start with '*' or '!'"
+      ;;
   esac
 }
 
