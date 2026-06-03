@@ -454,9 +454,17 @@ print_bash_completion() {
   printf '_iwork_bin=%s\n\n' "$self_path_q"
   cat <<'EOF'
 iwork() {
-  local cmd="${1:-}"
+  local cmd=""
   local folder=""
   local target=""
+  local notmux=""
+
+  if [[ "${1:-}" == "--no-tmux" ]]; then
+    notmux=1
+    shift
+  fi
+
+  cmd="${1:-}"
 
   case "$cmd" in
     park)
@@ -467,8 +475,10 @@ iwork() {
 
       folder="$2"
       target="$(command "$_iwork_bin" --resolve-park-target-path "$folder")" || return $?
-      command "$_iwork_bin" "$@" || return $?
-      builtin cd "$target" || return $?
+      command "$_iwork_bin" ${notmux:+--no-tmux} park "$folder" || return $?
+      if [[ -z "${TMUX:-}" || -n "$notmux" ]]; then
+        builtin cd "$target" || return $?
+      fi
       ;;
     cd)
       if [[ $# -lt 2 ]]; then
@@ -478,6 +488,9 @@ iwork() {
 
       folder="$2"
       shift 2
+      if [[ -n "${TMUX:-}" && -z "$notmux" ]] && command "$_iwork_bin" --switch-task-window "$folder" 2>/dev/null; then
+        return 0
+      fi
       target="$(command "$_iwork_bin" --resolve-worktree-folder "$folder")" || return $?
       builtin cd "$target" || return $?
       ;;
@@ -489,12 +502,16 @@ iwork() {
 
       folder="$2"
       shift 2
+      if [[ -n "${TMUX:-}" && -z "$notmux" ]]; then
+        command "$_iwork_bin" "$cmd" "$folder" "$@"
+        return $?
+      fi
       target="$(command "$_iwork_bin" --resolve-worktree-folder "$folder")" || return $?
       builtin cd "$target" || return $?
       "$cmd" "$@"
       ;;
     *)
-      command "$_iwork_bin" "$@"
+      command "$_iwork_bin" ${notmux:+--no-tmux} "$@"
       ;;
   esac
 }
@@ -567,47 +584,64 @@ print_zsh_completion() {
   printf '_iwork_bin=%s\n\n' "$self_path_q"
   cat <<'EOF'
 iwork() {
-  local cmd="${1:-}"
+  local cmd=""
   local folder=""
   local target=""
+  local notmux=""
+
+  if [[ "${1:-}" == "--no-tmux" ]]; then
+    notmux=1
+    shift
+  fi
+
+  cmd="${1:-}"
 
   case "$cmd" in
     park)
-      if (( $# < 2 )); then
+      if [[ $# -lt 2 ]]; then
         command "$_iwork_bin" park
         return $?
       fi
 
       folder="$2"
       target="$(command "$_iwork_bin" --resolve-park-target-path "$folder")" || return $?
-      command "$_iwork_bin" "$@" || return $?
-      builtin cd "$target" || return $?
+      command "$_iwork_bin" ${notmux:+--no-tmux} park "$folder" || return $?
+      if [[ -z "${TMUX:-}" || -n "$notmux" ]]; then
+        builtin cd "$target" || return $?
+      fi
       ;;
     cd)
-      if (( $# < 2 )); then
+      if [[ $# -lt 2 ]]; then
         command "$_iwork_bin" cd
         return $?
       fi
 
       folder="$2"
       shift 2
+      if [[ -n "${TMUX:-}" && -z "$notmux" ]] && command "$_iwork_bin" --switch-task-window "$folder" 2>/dev/null; then
+        return 0
+      fi
       target="$(command "$_iwork_bin" --resolve-worktree-folder "$folder")" || return $?
       builtin cd "$target" || return $?
       ;;
     claude|codex)
-      if (( $# < 2 )); then
+      if [[ $# -lt 2 ]]; then
         command "$_iwork_bin" "$cmd"
         return $?
       fi
 
       folder="$2"
       shift 2
+      if [[ -n "${TMUX:-}" && -z "$notmux" ]]; then
+        command "$_iwork_bin" "$cmd" "$folder" "$@"
+        return $?
+      fi
       target="$(command "$_iwork_bin" --resolve-worktree-folder "$folder")" || return $?
       builtin cd "$target" || return $?
       "$cmd" "$@"
       ;;
     *)
-      command "$_iwork_bin" "$@"
+      command "$_iwork_bin" ${notmux:+--no-tmux} "$@"
       ;;
   esac
 }
