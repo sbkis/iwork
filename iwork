@@ -1,0 +1,794 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+IGLOO_DIR="$HOME/dev/igloo"
+WORKTREES_DIR="$IGLOO_DIR/AAWORKTREES"
+SELF_PATH="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)/$(basename "${BASH_SOURCE[0]:-$0}")"
+
+usage() {
+  cat <<'EOF'
+Usage: iwork <branch-name> -r <repo1> [repo2 ...]
+       iwork add-repo <folder-name-in-AAWORKTREES> -r <repo1> [repo2 ...]
+       iwork park <folder-name-in-AAWORKTREES>
+       iwork list
+       iwork cd <folder-name-in-AAWORKTREES>
+       iwork claude <folder-name-in-AAWORKTREES> [claude-args...]
+       iwork codex <folder-name-in-AAWORKTREES> [codex-args...]
+       iwork --completion <bash|zsh>
+
+Create a worktree folder in AAWORKTREES and set up git worktrees for the
+specified repos, all on the given branch.
+
+Subcommands:
+  add-repo Add one or more repos to an existing worktree folder
+  park    Move the current repo/branch into a worktree folder
+  list    List folders directly under AAWORKTREES
+  cd      Change the current shell into a worktree folder
+          Requires sourced shell integration from --completion
+  claude  Change into a worktree folder and start claude there
+  codex   Change into a worktree folder and start codex there
+
+Examples:
+  iwork feat/bla -r rent-api accounting-api
+  iwork fix/login-bug -r auth-api rent-frontend-v2
+  iwork add-repo feat-contract-status-improvements -r auth-api
+  iwork park task-billing-followup
+  iwork list
+  iwork cd feat-contract-status-improvements
+  iwork claude feat-contract-status-improvements
+  iwork codex feat-contract-status-improvements
+
+Options:
+  -r    Repos to create worktrees for (required, at least one)
+  -h    Show this help
+
+Completion:
+  source <(iwork --completion bash)
+  source <(iwork --completion zsh)
+EOF
+  exit "${1:-0}"
+}
+
+die() {
+  echo "Error: $*" >&2
+  exit 1
+}
+
+warn() {
+  echo "Warning: $*" >&2
+}
+
+is_git_repo() {
+  local repo_path="$1"
+  git -C "$repo_path" rev-parse --git-dir >/dev/null 2>&1
+}
+
+current_repo_root() {
+  git rev-parse --show-toplevel 2>/dev/null || die "not inside a git repository"
+}
+
+validate_branch() {
+  local branch_name="$1"
+
+  if ! git check-ref-format --branch "$branch_name" >/dev/null 2>&1; then
+    die "invalid branch name '$branch_name'"
+  fi
+}
+
+validate_repo_name() {
+  local repo="$1"
+
+  case "$repo" in
+    ""|.|..|*/*|*\\*|*:* )
+      die "repo '$repo' must be a repo name directly under $IGLOO_DIR"
+      ;;
+  esac
+
+  if [[ ! "$repo" =~ ^[A-Za-z0-9._-]+$ ]]; then
+    die "repo '$repo' contains unsupported characters"
+  fi
+}
+
+validate_worktree_folder_name() {
+  local folder="$1"
+
+  case "$folder" in
+    ""|.|..|*/*|*\\* )
+      die "folder '$folder' must be a direct child of $WORKTREES_DIR"
+      ;;
+  esac
+}
+
+list_repos() {
+  local prefix="${1:-}"
+  local path=""
+  local name=""
+
+  for path in "$IGLOO_DIR"/*; do
+    [[ -d "$path" ]] || continue
+    name="${path##*/}"
+    [[ "$name" == "AAWORKTREES" ]] && continue
+
+    if is_git_repo "$path" && [[ "$name" == "$prefix"* ]]; then
+      printf '%s\n' "$name"
+    fi
+  done | sort
+}
+
+list_worktree_folders() {
+  local prefix="${1:-}"
+  local path=""
+  local name=""
+
+  [[ -d "$WORKTREES_DIR" ]] || return 0
+
+  for path in "$WORKTREES_DIR"/*; do
+    [[ -d "$path" ]] || continue
+    name="${path##*/}"
+
+    if [[ "$name" == "$prefix"* ]]; then
+      printf '%s\n' "$name"
+    fi
+  done | sort
+}
+
+resolve_worktree_folder() {
+  local folder="$1"
+  local folder_path=""
+
+  validate_worktree_folder_name "$folder"
+
+  folder_path="$WORKTREES_DIR/$folder"
+  [[ -d "$folder_path" ]] || die "worktree folder not found: $folder"
+
+  printf '%s\n' "$folder_path"
+}
+
+run_tool_in_worktree() {
+  local tool="$1"
+  local folder="$2"
+  local folder_path=""
+
+  shift 2
+  folder_path="$(resolve_worktree_folder "$folder")"
+  cd "$folder_path"
+  exec "$tool" "$@"
+}
+
+validate_primary_repo_root() {
+  local repo_root="$1"
+  local expected_prefix="$IGLOO_DIR/"
+
+  case "$repo_root" in
+    "$WORKTREES_DIR"|"$WORKTREES_DIR"/*)
+      die "park must be run from a primary repo under $IGLOO_DIR, not from AAWORKTREES"
+      ;;
+    "$expected_prefix"*)
+      ;;
+    *)
+      die "repo '$repo_root' must live directly under $IGLOO_DIR"
+      ;;
+  esac
+
+  if [[ "$(dirname "$repo_root")" != "$IGLOO_DIR" ]]; then
+    die "repo '$repo_root' must be a direct child of $IGLOO_DIR"
+  fi
+}
+
+current_repo_name() {
+  local repo_root="$1"
+  local repo_name="${repo_root##*/}"
+
+  validate_repo_name "$repo_name"
+  printf '%s\n' "$repo_name"
+}
+
+current_branch_name() {
+  local repo_root="$1"
+  local branch=""
+
+  branch="$(git -C "$repo_root" branch --show-current 2>/dev/null || true)"
+  [[ -n "$branch" ]] || die "repository is in detached HEAD state"
+  validate_branch "$branch"
+  printf '%s\n' "$branch"
+}
+
+switch_repo_to_base_branch() {
+  local repo_root="$1"
+  local base_ref=""
+  local base_branch=""
+
+  base_ref="$(resolve_base_ref "$repo_root")" || die "could not determine a base branch for $(basename "$repo_root")"
+  base_branch="${base_ref#origin/}"
+
+  if git -C "$repo_root" show-ref --verify --quiet "refs/heads/$base_branch" 2>/dev/null; then
+    git -C "$repo_root" switch "$base_branch" >/dev/null
+  else
+    git -C "$repo_root" switch -c "$base_branch" --track "$base_ref" >/dev/null
+  fi
+}
+
+resolve_park_target_path() {
+  local folder_name="$1"
+  local repo_root=""
+  local repo_name=""
+  local branch=""
+  local branch_slug=""
+
+  validate_worktree_folder_name "$folder_name"
+
+  repo_root="$(current_repo_root)"
+  validate_primary_repo_root "$repo_root"
+
+  repo_name="$(current_repo_name "$repo_root")"
+  branch="$(current_branch_name "$repo_root")"
+  branch_slug="${branch//\//-}"
+
+  printf '%s\n' "$WORKTREES_DIR/$folder_name/${repo_name}--${branch_slug}"
+}
+
+park_current_repo() {
+  local folder_name="$1"
+  local repo_root=""
+  local repo_name=""
+  local branch=""
+  local branch_slug=""
+  local wt_path=""
+  local folder_path=""
+  local status_output=""
+  local stash_created=""
+  local stash_ref=""
+
+  validate_worktree_folder_name "$folder_name"
+
+  repo_root="$(current_repo_root)"
+  validate_primary_repo_root "$repo_root"
+  repo_name="$(current_repo_name "$repo_root")"
+  branch="$(current_branch_name "$repo_root")"
+  branch_slug="${branch//\//-}"
+  folder_path="$WORKTREES_DIR/$folder_name"
+  wt_path="$folder_path/${repo_name}--${branch_slug}"
+
+  case "$branch" in
+    main|master|trunk)
+      die "refusing to park base branch '$branch'"
+      ;;
+  esac
+
+  if [[ -e "$wt_path" ]]; then
+    die "destination already exists: $wt_path"
+  fi
+
+  status_output="$(git -C "$repo_root" status --porcelain --untracked-files=all)"
+  if [[ -n "$status_output" ]]; then
+    stash_created=1
+    git -C "$repo_root" stash push --include-untracked --message "iwork park: $repo_name $branch" >/dev/null
+    stash_ref="stash@{0}"
+  fi
+
+  switch_repo_to_base_branch "$repo_root"
+
+  mkdir -p "$folder_path"
+  echo "Using $folder_path"
+  git -C "$repo_root" worktree add "$wt_path" "$branch"
+  echo "  -> ${repo_name}--${branch_slug} (branch: $branch)"
+
+  if [[ -n "$stash_created" ]]; then
+    if git -C "$wt_path" stash apply --index "$stash_ref" >/dev/null 2>&1; then
+      git -C "$wt_path" stash drop "$stash_ref" >/dev/null 2>&1 || true
+      echo "  -> restored stashed changes into parked worktree"
+    else
+      die "parked worktree created at $wt_path, but applying stashed changes failed; stash was kept as $stash_ref"
+    fi
+  fi
+
+  echo ""
+  echo "Done! Worktree parked at:"
+  echo "  $wt_path"
+}
+
+detect_branch_from_worktree_folder() {
+  local folder="$1"
+  local folder_path=""
+  local child_path=""
+  local branch=""
+  local detected_branch=""
+
+  folder_path="$(resolve_worktree_folder "$folder")"
+
+  for child_path in "$folder_path"/*; do
+    [[ -d "$child_path" ]] || continue
+
+    if ! is_git_repo "$child_path"; then
+      continue
+    fi
+
+    branch="$(git -C "$child_path" branch --show-current 2>/dev/null || true)"
+    [[ -n "$branch" ]] || continue
+
+    validate_branch "$branch"
+
+    if [[ -z "$detected_branch" ]]; then
+      detected_branch="$branch"
+      continue
+    fi
+
+    if [[ "$detected_branch" != "$branch" ]]; then
+      die "worktree folder '$folder' contains multiple branches ('$detected_branch' and '$branch')"
+    fi
+  done
+
+  [[ -n "$detected_branch" ]] || die "could not determine a branch from existing worktrees in $folder"
+  printf '%s\n' "$detected_branch"
+}
+
+parse_repos_flag() {
+  local missing_flag_message="$1"
+  shift
+
+  repos=()
+
+  if [[ "${1:-}" != "-r" ]]; then
+    die "$missing_flag_message"
+  fi
+  shift
+
+  while [[ $# -gt 0 ]]; do
+    repos+=("$1")
+    shift
+  done
+
+  if [[ ${#repos[@]} -eq 0 ]]; then
+    die "specify at least one repo after -r"
+  fi
+}
+
+create_worktrees() {
+  local branch="$1"
+  local folder_name="$2"
+  local branch_slug="$3"
+  local folder_path="$WORKTREES_DIR/$folder_name"
+  local seen_repos=""
+  local base_refs=()
+  local repo=""
+  local repo_path=""
+  local wt_name=""
+  local wt_path=""
+  local base_ref=""
+  local i=""
+
+  shift 3
+  local repos=("$@")
+
+  for repo in "${repos[@]}"; do
+    repo_path=""
+    wt_name=""
+    wt_path=""
+    base_ref=""
+
+    validate_repo_name "$repo"
+
+    case " $seen_repos " in
+      *" $repo "*) die "repo '$repo' was provided more than once" ;;
+    esac
+    seen_repos="$seen_repos $repo"
+
+    repo_path="$IGLOO_DIR/$repo"
+    if ! is_git_repo "$repo_path"; then
+      die "$repo_path is not a git repository"
+    fi
+
+    wt_name="${repo}--${branch_slug}"
+    wt_path="$folder_path/$wt_name"
+
+    if [[ -e "$wt_path" ]] && ! is_registered_worktree_path "$repo_path" "$wt_path"; then
+      die "destination already exists and is not a registered git worktree: $wt_path"
+    fi
+
+    if git -C "$repo_path" remote get-url origin >/dev/null 2>&1; then
+      if ! git -C "$repo_path" fetch origin --quiet 2>/dev/null; then
+        warn "could not fetch origin for $repo; using local refs"
+      fi
+    fi
+
+    if git -C "$repo_path" show-ref --verify --quiet "refs/heads/$branch" 2>/dev/null; then
+      base_refs+=("")
+      continue
+    fi
+
+    if git -C "$repo_path" show-ref --verify --quiet "refs/remotes/origin/$branch" 2>/dev/null; then
+      die "branch '$branch' already exists on origin for $repo"
+    fi
+
+    base_ref="$(resolve_base_ref "$repo_path")" || die "could not determine a base branch for $repo"
+    base_refs+=("$base_ref")
+  done
+
+  mkdir -p "$folder_path"
+  echo "Using $folder_path"
+
+  for i in "${!repos[@]}"; do
+    repo="${repos[$i]}"
+    repo_path="$IGLOO_DIR/$repo"
+    wt_name="${repo}--${branch_slug}"
+    wt_path="$folder_path/$wt_name"
+    base_ref="${base_refs[$i]}"
+
+    if [[ -e "$wt_path" ]]; then
+      echo "Skipping $wt_name (already exists)"
+      continue
+    fi
+
+    if [[ -n "$base_ref" ]]; then
+      git -C "$repo_path" worktree add -b "$branch" "$wt_path" "$base_ref"
+    else
+      git -C "$repo_path" worktree add "$wt_path" "$branch"
+    fi
+
+    echo "  -> $wt_name (branch: $branch)"
+  done
+
+  echo ""
+  echo "Done! Worktrees ready at:"
+  echo "  $folder_path"
+}
+
+print_bash_completion() {
+  local self_path_q=""
+
+  printf -v self_path_q '%q' "$SELF_PATH"
+
+  printf '_iwork_bin=%s\n\n' "$self_path_q"
+  cat <<'EOF'
+iwork() {
+  local cmd="${1:-}"
+  local folder=""
+  local target=""
+
+  case "$cmd" in
+    park)
+      if [[ $# -lt 2 ]]; then
+        command "$_iwork_bin" park
+        return $?
+      fi
+
+      folder="$2"
+      target="$(command "$_iwork_bin" --resolve-park-target-path "$folder")" || return $?
+      command "$_iwork_bin" "$@" || return $?
+      builtin cd "$target" || return $?
+      ;;
+    cd)
+      if [[ $# -lt 2 ]]; then
+        command "$_iwork_bin" cd
+        return $?
+      fi
+
+      folder="$2"
+      shift 2
+      target="$(command "$_iwork_bin" --resolve-worktree-folder "$folder")" || return $?
+      builtin cd "$target" || return $?
+      ;;
+    claude|codex)
+      if [[ $# -lt 2 ]]; then
+        command "$_iwork_bin" "$cmd"
+        return $?
+      fi
+
+      folder="$2"
+      shift 2
+      target="$(command "$_iwork_bin" --resolve-worktree-folder "$folder")" || return $?
+      builtin cd "$target" || return $?
+      "$cmd" "$@"
+      ;;
+    *)
+      command "$_iwork_bin" "$@"
+      ;;
+  esac
+}
+
+_iwork() {
+  local cur prev seen_r i repos folders cmd
+  COMPREPLY=()
+  cur="${COMP_WORDS[COMP_CWORD]}"
+  prev=""
+  cmd="${COMP_WORDS[1]:-}"
+
+  if (( COMP_CWORD > 0 )); then
+    prev="${COMP_WORDS[COMP_CWORD-1]}"
+  fi
+
+  case "$cmd" in
+    cd|claude|codex|add-repo)
+      if (( COMP_CWORD == 2 )); then
+        folders="$("$_iwork_bin" --complete-worktree-folders "$cur" 2>/dev/null)" || return 0
+        COMPREPLY=( $(compgen -W "$folders" -- "$cur") )
+      fi
+      return 0
+      ;;
+    park)
+      return 0
+      ;;
+    list)
+      return 0
+      ;;
+  esac
+
+  seen_r=""
+  for ((i = 1; i < COMP_CWORD; i++)); do
+    if [[ "${COMP_WORDS[i]}" == "-r" ]]; then
+      seen_r=1
+      break
+    fi
+  done
+
+  if [[ "$prev" == "-r" || -n "$seen_r" ]]; then
+    repos="$("$_iwork_bin" --complete-repos "$cur" 2>/dev/null)" || return 0
+    COMPREPLY=( $(compgen -W "$repos" -- "$cur") )
+    return 0
+  fi
+
+  if (( COMP_CWORD == 1 )); then
+    COMPREPLY=( $(compgen -W "add-repo park list cd claude codex -h --help --completion" -- "$cur") )
+    return 0
+  fi
+
+  if [[ "$cur" == -* ]]; then
+    COMPREPLY=( $(compgen -W "-r -h --help --completion" -- "$cur") )
+    return 0
+  fi
+
+  if (( COMP_CWORD >= 2 )); then
+    COMPREPLY=( $(compgen -W "-r" -- "$cur") )
+  fi
+}
+
+complete -o nospace -F _iwork iwork
+EOF
+}
+
+print_zsh_completion() {
+  local self_path_q=""
+
+  printf -v self_path_q '%q' "$SELF_PATH"
+
+  printf '_iwork_bin=%s\n\n' "$self_path_q"
+  cat <<'EOF'
+iwork() {
+  local cmd="${1:-}"
+  local folder=""
+  local target=""
+
+  case "$cmd" in
+    park)
+      if (( $# < 2 )); then
+        command "$_iwork_bin" park
+        return $?
+      fi
+
+      folder="$2"
+      target="$(command "$_iwork_bin" --resolve-park-target-path "$folder")" || return $?
+      command "$_iwork_bin" "$@" || return $?
+      builtin cd "$target" || return $?
+      ;;
+    cd)
+      if (( $# < 2 )); then
+        command "$_iwork_bin" cd
+        return $?
+      fi
+
+      folder="$2"
+      shift 2
+      target="$(command "$_iwork_bin" --resolve-worktree-folder "$folder")" || return $?
+      builtin cd "$target" || return $?
+      ;;
+    claude|codex)
+      if (( $# < 2 )); then
+        command "$_iwork_bin" "$cmd"
+        return $?
+      fi
+
+      folder="$2"
+      shift 2
+      target="$(command "$_iwork_bin" --resolve-worktree-folder "$folder")" || return $?
+      builtin cd "$target" || return $?
+      "$cmd" "$@"
+      ;;
+    *)
+      command "$_iwork_bin" "$@"
+      ;;
+  esac
+}
+
+#compdef iwork
+
+_iwork() {
+  local -a repos folders
+  local cmd="${words[2]:-}"
+
+  if (( CURRENT == 2 )); then
+    _values 'command' \
+      'add-repo[add repos to an existing worktree folder]' \
+      'park[move the current repo branch into a worktree folder]' \
+      'list[list worktree folders]' \
+      'cd[cd into a worktree folder]' \
+      'claude[cd into a worktree folder and run claude]' \
+      'codex[cd into a worktree folder and run codex]' \
+      '--completion[print shell integration]'
+    return 0
+  fi
+
+  case "$cmd" in
+    cd|claude|codex|add-repo)
+      if (( CURRENT == 3 )); then
+        folders=("${(@f)$("$_iwork_bin" --complete-worktree-folders "$PREFIX" 2>/dev/null)}")
+        _describe -t folders 'worktree folder' folders
+      fi
+      return 0
+      ;;
+    park)
+      return 0
+      ;;
+    list)
+      return 0
+      ;;
+  esac
+
+  if (( CURRENT == 3 )); then
+    _values 'option' '-r[repos to create worktrees for]'
+    return 0
+  fi
+
+  if (( ${words[(I)-r]} <= CURRENT )); then
+    repos=("${(@f)$("$_iwork_bin" --complete-repos "$PREFIX" 2>/dev/null)}")
+    _describe -t repos 'repo' repos
+  fi
+}
+
+if typeset -f compdef >/dev/null 2>&1; then
+  compdef _iwork iwork
+fi
+EOF
+}
+
+resolve_base_ref() {
+  local repo_path="$1"
+  local ref=""
+  local candidate=""
+
+  if ref=$(git -C "$repo_path" symbolic-ref --quiet --short refs/remotes/origin/HEAD 2>/dev/null); then
+    printf '%s\n' "$ref"
+    return 0
+  fi
+
+  for candidate in main master trunk; do
+    if git -C "$repo_path" show-ref --verify --quiet "refs/remotes/origin/$candidate" 2>/dev/null; then
+      printf 'origin/%s\n' "$candidate"
+      return 0
+    fi
+  done
+
+  for candidate in main master trunk; do
+    if git -C "$repo_path" show-ref --verify --quiet "refs/heads/$candidate" 2>/dev/null; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+  done
+
+  return 1
+}
+
+is_registered_worktree_path() {
+  local repo_path="$1"
+  local wt_path="$2"
+
+  git -C "$repo_path" worktree list --porcelain 2>/dev/null | grep -F -x "worktree $wt_path" >/dev/null 2>&1
+}
+
+if [[ $# -eq 0 ]]; then
+  usage 0
+fi
+
+case "${1:-}" in
+  -h|--help)
+    usage 0
+    ;;
+  --completion)
+    case "${2:-}" in
+      bash)
+        print_bash_completion
+        exit 0
+        ;;
+      zsh)
+        print_zsh_completion
+        exit 0
+        ;;
+      *)
+        die "expected 'bash' or 'zsh' after --completion"
+        ;;
+    esac
+    ;;
+  --complete-repos)
+    list_repos "${2:-}"
+    exit 0
+    ;;
+  --complete-worktree-folders)
+    list_worktree_folders "${2:-}"
+    exit 0
+    ;;
+  --resolve-worktree-folder)
+    resolve_worktree_folder "${2:-}"
+    exit 0
+    ;;
+  --resolve-park-target-path)
+    resolve_park_target_path "${2:-}"
+    exit 0
+    ;;
+esac
+
+if [[ "${1:-}" == "list" && $# -eq 1 ]]; then
+  list_worktree_folders
+  exit 0
+fi
+
+if [[ "${1:-}" == "park" ]]; then
+  if [[ $# -ne 2 ]]; then
+    die "usage: iwork park <folder-name-in-AAWORKTREES>"
+  fi
+
+  park_current_repo "$2"
+  exit 0
+fi
+
+if [[ "${1:-}" == "add-repo" ]]; then
+  if [[ $# -lt 4 ]]; then
+    die "usage: iwork add-repo <folder-name-in-AAWORKTREES> -r <repo1> [repo2 ...]"
+  fi
+
+  folder_name="$2"
+  validate_worktree_folder_name "$folder_name"
+
+  parse_repos_flag "expected -r <repos> after folder name" "${@:3}"
+
+  branch="$(detect_branch_from_worktree_folder "$folder_name")"
+  branch_slug="${branch//\//-}"
+
+  create_worktrees "$branch" "$folder_name" "$branch_slug" "${repos[@]}"
+  exit 0
+fi
+
+if [[ "${1:-}" == "cd" && "${2:-}" != "-r" ]]; then
+  if [[ $# -ne 2 ]]; then
+    die "usage: iwork cd <folder-name-in-AAWORKTREES>"
+  fi
+
+  die "'iwork cd' must be run through sourced shell integration. Run: source <(iwork --completion bash) or source <(iwork --completion zsh)"
+fi
+
+if [[ "${1:-}" == "claude" && "${2:-}" != "-r" ]]; then
+  if [[ $# -lt 2 ]]; then
+    die "usage: iwork claude <folder-name-in-AAWORKTREES> [claude-args...]"
+  fi
+
+  run_tool_in_worktree claude "$2" "${@:3}"
+fi
+
+if [[ "${1:-}" == "codex" && "${2:-}" != "-r" ]]; then
+  if [[ $# -lt 2 ]]; then
+    die "usage: iwork codex <folder-name-in-AAWORKTREES> [codex-args...]"
+  fi
+
+  run_tool_in_worktree codex "$2" "${@:3}"
+fi
+
+branch="$1"
+shift
+
+validate_branch "$branch"
+
+parse_repos_flag "expected -r <repos> after branch name" "$@"
+
+# Folder name: replace / with -
+folder_name="${branch//\//-}"
+branch_slug="$folder_name"
+
+create_worktrees "$branch" "$folder_name" "$branch_slug" "${repos[@]}"
