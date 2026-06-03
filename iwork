@@ -1,9 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-IGLOO_DIR="$HOME/dev/igloo"
+IGLOO_DIR="${IGLOO_DIR:-$HOME/dev/igloo}"
 WORKTREES_DIR="$IGLOO_DIR/AAWORKTREES"
 SELF_PATH="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)/$(basename "${BASH_SOURCE[0]:-$0}")"
+TASKS_SESSION="${IWORK_TMUX_SESSION:-tasks}"
+IWORK_NO_TMUX=""
 
 usage() {
   cat <<'EOF'
@@ -684,8 +686,79 @@ is_registered_worktree_path() {
   git -C "$repo_path" worktree list --porcelain 2>/dev/null | grep -F -x "worktree $wt_path" >/dev/null 2>&1
 }
 
+in_tmux() {
+  [[ -n "${TMUX:-}" ]]
+}
+
+tmux_enabled() {
+  in_tmux && [[ -z "$IWORK_NO_TMUX" ]]
+}
+
+find_task_window() {
+  local folder="$1"
+  local window_id=""
+  local window_name=""
+
+  while IFS=' ' read -r window_id window_name; do
+    if [[ "${window_name#[*!]}" == "$folder" ]]; then
+      printf '%s\n' "$window_id"
+      return 0
+    fi
+  done < <(tmux list-windows -t "=$TASKS_SESSION" -F '#{window_id} #{window_name}' 2>/dev/null)
+
+  return 1
+}
+
+open_task_window() {
+  local folder="$1"
+  local tool="$2"
+  shift 2
+  local folder_path="$WORKTREES_DIR/$folder"
+  local window_id=""
+  local pane_id=""
+  local tool_cmd=""
+
+  tmux_enabled || return 0
+  [[ -d "$folder_path" ]] || return 0
+
+  if window_id="$(find_task_window "$folder")"; then
+    tmux select-window -t "$window_id" 2>/dev/null || warn "could not select tmux window '$folder'"
+    tmux switch-client -t "=$TASKS_SESSION" 2>/dev/null || true
+    return 0
+  fi
+
+  if tmux has-session -t "=$TASKS_SESSION" 2>/dev/null; then
+    if ! IFS=' ' read -r window_id pane_id < <(tmux new-window -t "=$TASKS_SESSION" -n "$folder" -c "$folder_path" -P -F '#{window_id} #{pane_id}' 2>/dev/null); then
+      warn "could not create tmux window '$folder'"
+      return 0
+    fi
+  else
+    if ! IFS=' ' read -r window_id pane_id < <(tmux new-session -d -s "$TASKS_SESSION" -n "$folder" -c "$folder_path" -P -F '#{window_id} #{pane_id}' 2>/dev/null); then
+      warn "could not create tmux session '$TASKS_SESSION'"
+      return 0
+    fi
+  fi
+
+  tmux split-window -h -t "$pane_id" -c "$folder_path" 2>/dev/null || warn "could not split tmux window '$folder'"
+  tmux select-pane -t "$pane_id" 2>/dev/null || true
+
+  printf -v tool_cmd '%q ' "$tool" "$@"
+  tmux send-keys -t "$pane_id" "$tool_cmd" Enter 2>/dev/null || warn "could not start $tool in tmux window '$folder'"
+
+  tmux select-window -t "$window_id" 2>/dev/null || true
+  tmux switch-client -t "=$TASKS_SESSION" 2>/dev/null || true
+}
+
 if [[ $# -eq 0 ]]; then
   usage 0
+fi
+
+if [[ "${1:-}" == "--no-tmux" ]]; then
+  IWORK_NO_TMUX=1
+  shift
+  if [[ $# -eq 0 ]]; then
+    usage 1
+  fi
 fi
 
 case "${1:-}" in
@@ -721,6 +794,14 @@ case "${1:-}" in
     ;;
   --resolve-park-target-path)
     resolve_park_target_path "${2:-}"
+    exit 0
+    ;;
+  --switch-task-window)
+    tmux_enabled || exit 1
+    validate_worktree_folder_name "${2:-}"
+    switch_window_id="$(find_task_window "${2:-}")" || exit 1
+    tmux select-window -t "$switch_window_id" 2>/dev/null || exit 1
+    tmux switch-client -t "=$TASKS_SESSION" 2>/dev/null || true
     exit 0
     ;;
 esac
