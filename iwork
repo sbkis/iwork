@@ -11,9 +11,9 @@ CONTEXT_TEMPLATE="${IWORK_CONTEXT_TEMPLATE:-$HOME/.config/iwork/task-context.md.
 
 usage() {
   cat <<'EOF'
-Usage: iwork [--no-tmux] <branch-name> -r <repo1> [repo2 ...]
+Usage: iwork [--no-tmux] [--no-context] <branch-name> -r <repo1> [repo2 ...]
        iwork add-repo <folder-name-in-AAWORKTREES> -r <repo1> [repo2 ...]
-       iwork [--no-tmux] park <folder-name-in-AAWORKTREES>
+       iwork [--no-tmux] [--no-context] park <folder-name-in-AAWORKTREES>
        iwork [--no-tmux] list
        iwork [--no-tmux] cd <folder-name-in-AAWORKTREES>
        iwork [--no-tmux] claude <folder-name-in-AAWORKTREES> [claude-args...]
@@ -30,6 +30,11 @@ window (claude starts in the left pane, a shell in the right);
 claude/codex/cd switch to it if it exists. Claude Code hooks (see
 install-hooks) mark the window name with the agent state:
 *task = busy, !task = waiting for you.
+
+On creation and park, iwork writes CLAUDE.md and AGENTS.md into the task
+folder from a template (~/.config/iwork/task-context.md.tmpl, override with
+IWORK_CONTEXT_TEMPLATE), seeding a default template on first use. Existing
+files are never overwritten.
 
 Subcommands:
   add-repo       Add one or more repos to an existing worktree folder
@@ -54,9 +59,10 @@ Examples:
   iwork install-hooks
 
 Options:
-  --no-tmux  Skip all tmux window handling (must be the first argument)
-  -r         Repos to create worktrees for (required, at least one)
-  -h         Show this help
+  --no-tmux     Skip all tmux window handling (leading flag)
+  --no-context  Skip writing CLAUDE.md/AGENTS.md task context (leading flag)
+  -r            Repos to create worktrees for (required, at least one)
+  -h            Show this help
 
 Completion:
   source <(iwork --completion bash)
@@ -623,12 +629,12 @@ _iwork() {
   fi
 
   if (( COMP_CWORD == 1 )); then
-    COMPREPLY=( $(compgen -W "add-repo park list cd claude codex install-hooks --no-tmux -h --help --completion" -- "$cur") )
+    COMPREPLY=( $(compgen -W "add-repo park list cd claude codex install-hooks --no-tmux --no-context -h --help --completion" -- "$cur") )
     return 0
   fi
 
   if [[ "$cur" == -* ]]; then
-    COMPREPLY=( $(compgen -W "-r -h --help --completion --no-tmux" -- "$cur") )
+    COMPREPLY=( $(compgen -W "-r -h --help --completion --no-tmux --no-context" -- "$cur") )
     return 0
   fi
 
@@ -727,6 +733,7 @@ _iwork() {
       'codex[open the task tmux window and run codex]' \
       'install-hooks[install Claude Code status hooks]' \
       '--no-tmux[skip tmux window handling]' \
+      '--no-context[skip writing task context files]' \
       '--completion[print shell integration]'
     return 0
   fi
