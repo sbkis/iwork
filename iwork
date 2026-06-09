@@ -6,6 +6,8 @@ WORKTREES_DIR="$IGLOO_DIR/AAWORKTREES"
 SELF_PATH="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)/$(basename "${BASH_SOURCE[0]:-$0}")"
 TASKS_SESSION="${IWORK_TMUX_SESSION:-tasks}"
 IWORK_NO_TMUX=""
+IWORK_NO_CONTEXT="${IWORK_NO_CONTEXT:-}"
+CONTEXT_TEMPLATE="${IWORK_CONTEXT_TEMPLATE:-$HOME/.config/iwork/task-context.md.tmpl}"
 
 usage() {
   cat <<'EOF'
@@ -356,6 +358,7 @@ park_current_repo() {
   echo "Done! Worktree parked at:"
   echo "  $wt_path"
 
+  write_task_context "$folder_name" "$branch"
   open_task_window "$folder_name" claude
 }
 
@@ -821,6 +824,78 @@ find_task_window() {
   return 1
 }
 
+DEFAULT_CONTEXT_TEMPLATE='# Task: {{TASK}}
+
+You are working in an iwork task directory. It contains git worktrees of
+the repositories relevant to this task, all on branch `{{BRANCH}}`:
+
+{{REPOS}}
+
+## Scope
+
+- Stay within this task directory. Do not read, edit, or run commands in
+  repositories outside the worktrees listed above — they are scoped here
+  deliberately.
+- Each subdirectory is a real git worktree; commit within it as normal.
+- Each repo may have its own CLAUDE.md / AGENTS.md — read it before working
+  in that repo and follow its conventions.'
+
+seed_context_template() {
+  local template_dir=""
+
+  [[ -f "$CONTEXT_TEMPLATE" ]] && return 0
+
+  template_dir="$(dirname "$CONTEXT_TEMPLATE")"
+  if ! mkdir -p "$template_dir" 2>/dev/null; then
+    warn "could not create template directory $template_dir"
+    return 1
+  fi
+  if ! printf '%s\n' "$DEFAULT_CONTEXT_TEMPLATE" > "$CONTEXT_TEMPLATE" 2>/dev/null; then
+    warn "could not write default template $CONTEXT_TEMPLATE"
+    return 1
+  fi
+  return 0
+}
+
+write_task_context() {
+  local folder="$1"
+  local branch="$2"
+  local folder_path="$WORKTREES_DIR/$folder"
+  local template=""
+  local repos_list=""
+  local rendered=""
+  local child=""
+  local target=""
+
+  [[ -n "$IWORK_NO_CONTEXT" ]] && return 0
+  [[ -d "$folder_path" ]] || return 0
+
+  seed_context_template || return 0
+
+  template="$(cat "$CONTEXT_TEMPLATE" 2>/dev/null || true)"
+  [[ -n "$template" ]] || { warn "task context template is empty: $CONTEXT_TEMPLATE"; return 0; }
+
+  for child in "$folder_path"/*; do
+    [[ -d "$child" ]] || continue
+    if [[ -n "$repos_list" ]]; then
+      repos_list="$repos_list
+${child##*/}"
+    else
+      repos_list="${child##*/}"
+    fi
+  done
+
+  rendered="$template"
+  rendered="${rendered//\{\{TASK\}\}/$folder}"
+  rendered="${rendered//\{\{BRANCH\}\}/$branch}"
+  rendered="${rendered//\{\{REPOS\}\}/$repos_list}"
+
+  for target in "$folder_path/CLAUDE.md" "$folder_path/AGENTS.md"; do
+    [[ -e "$target" ]] && continue
+    printf '%s\n' "$rendered" > "$target" 2>/dev/null || warn "could not write $target"
+  done
+}
+
 open_task_window() {
   local folder="$1"
   local tool="$2"
@@ -1106,4 +1181,5 @@ folder_name="${branch//\//-}"
 branch_slug="$folder_name"
 
 create_worktrees "$branch" "$folder_name" "$branch_slug" "${repos[@]}"
+write_task_context "$folder_name" "$branch"
 open_task_window "$folder_name" claude
