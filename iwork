@@ -1045,13 +1045,16 @@ if [[ $# -eq 0 ]]; then
   usage 0
 fi
 
-if [[ "${1:-}" == "--no-tmux" ]]; then
-  IWORK_NO_TMUX=1
+while [[ "${1:-}" == "--no-tmux" || "${1:-}" == "--no-context" ]]; do
+  case "$1" in
+    --no-tmux) IWORK_NO_TMUX=1 ;;
+    --no-context) IWORK_NO_CONTEXT=1 ;;
+  esac
   shift
   if [[ $# -eq 0 ]]; then
     usage 1
   fi
-fi
+done
 
 case "${1:-}" in
   -h|--help)
