@@ -1,28 +1,66 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-IGLOO_DIR="${IGLOO_DIR:-$HOME/dev/igloo}"
-WORKTREES_DIR="$IGLOO_DIR/AAWORKTREES"
 SELF_PATH="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)/$(basename "${BASH_SOURCE[0]:-$0}")"
+IWORK_CONFIG_FILE="${IWORK_CONFIG_FILE:-${XDG_CONFIG_HOME:-$HOME/.config}/iwork/config}"
+IWORK_CONFIG_VARS=(IWORK_REPO_DIR IWORK_TASKS_DIR IWORK_TMUX_SESSION IWORK_CONTEXT_TEMPLATE IWORK_NO_TMUX IWORK_NO_CONTEXT IWORK_ASSUME_YES)
+
+load_config() {
+  local var="" restore=""
+
+  [[ -f "$IWORK_CONFIG_FILE" ]] || return 0
+
+  # Environment variables win over the config file: remember what came from
+  # the environment, source the config, then put those values back.
+  for var in "${IWORK_CONFIG_VARS[@]}"; do
+    if [[ -n "${!var+x}" ]]; then
+      restore="$restore $var=$(printf '%q' "${!var}");"
+    fi
+  done
+
+  # shellcheck source=/dev/null
+  . "$IWORK_CONFIG_FILE"
+
+  eval "$restore"
+}
+
+load_config
+
+REPO_DIR="${IWORK_REPO_DIR:-}"
+TASKS_DIR="${IWORK_TASKS_DIR:-${REPO_DIR:+$REPO_DIR/tasks}}"
 TASKS_SESSION="${IWORK_TMUX_SESSION:-tasks}"
-IWORK_NO_TMUX=""
+IWORK_NO_TMUX="${IWORK_NO_TMUX:-}"
 IWORK_NO_CONTEXT="${IWORK_NO_CONTEXT:-}"
 CONTEXT_TEMPLATE="${IWORK_CONTEXT_TEMPLATE:-$HOME/.config/iwork/task-context.md.tmpl}"
+
+require_config() {
+  if [[ -z "$REPO_DIR" ]]; then
+    die "IWORK_REPO_DIR is not set. Run 'iwork init', or add it to $IWORK_CONFIG_FILE:
+  IWORK_REPO_DIR=\"\$HOME/dev/projects\""
+  fi
+  [[ -d "$REPO_DIR" ]] || die "IWORK_REPO_DIR is not a directory: $REPO_DIR"
+}
 
 usage() {
   cat <<'EOF'
 Usage: iwork [--no-tmux] [--no-context] <branch-name> -r <repo1> [repo2 ...]
-       iwork add-repo <folder-name-in-AAWORKTREES> -r <repo1> [repo2 ...]
-       iwork [--no-tmux] [--no-context] park <folder-name-in-AAWORKTREES>
+       iwork add-repo <task> -r <repo1> [repo2 ...]
+       iwork [--no-tmux] [--no-context] park <task>
        iwork [--no-tmux] list
-       iwork [--no-tmux] cd <folder-name-in-AAWORKTREES>
-       iwork [--no-tmux] claude <folder-name-in-AAWORKTREES> [claude-args...]
-       iwork [--no-tmux] codex <folder-name-in-AAWORKTREES> [codex-args...]
+       iwork [--no-tmux] cd <task>
+       iwork [--no-tmux] claude <task> [claude-args...]
+       iwork [--no-tmux] codex <task> [codex-args...]
+       iwork init
        iwork install-hooks [settings-path]
        iwork --completion <bash|zsh>
 
-Create a worktree folder in AAWORKTREES and set up git worktrees for the
-specified repos, all on the given branch.
+Create a task folder in the tasks directory and set up git worktrees for
+the specified repos, all on the given branch.
+
+Configuration lives in ~/.config/iwork/config (run 'iwork init' to create
+it). IWORK_REPO_DIR must point at the directory whose direct children are
+your git repositories; task folders go in IWORK_TASKS_DIR (default:
+$IWORK_REPO_DIR/tasks). Environment variables override the config file.
 
 Inside tmux, each task maps to a window in a dedicated 'tasks' session
 (override the name with IWORK_TMUX_SESSION). Creation and park open the
@@ -37,10 +75,11 @@ IWORK_CONTEXT_TEMPLATE), seeding a default template on first use. Existing
 files are never overwritten.
 
 Subcommands:
-  add-repo       Add one or more repos to an existing worktree folder
-  park           Move the current repo/branch into a worktree folder
-  list           List folders under AAWORKTREES (with window status in tmux)
-  cd             Switch to the task window, or cd into the worktree folder
+  init           Interactively create the config file
+  add-repo       Add one or more repos to an existing task folder
+  park           Move the current repo/branch into a task folder
+  list           List task folders (with window status in tmux)
+  cd             Switch to the task window, or cd into the task folder
                  Requires sourced shell integration from --completion
   claude         Open/switch to the task window and run claude there
   codex          Open/switch to the task window and run codex there
@@ -48,14 +87,14 @@ Subcommands:
                  tmux window names in sync with agent status
 
 Examples:
-  iwork feat/bla -r rent-api accounting-api
-  iwork fix/login-bug -r auth-api rent-frontend-v2
-  iwork add-repo feat-contract-status-improvements -r auth-api
+  iwork feat/bla -r backend-api frontend
+  iwork fix/login-bug -r auth-service web-app
+  iwork add-repo feat-bla -r shared-lib
   iwork park task-billing-followup
   iwork list
-  iwork cd feat-contract-status-improvements
-  iwork claude feat-contract-status-improvements
-  iwork --no-tmux claude feat-contract-status-improvements
+  iwork cd feat-bla
+  iwork claude feat-bla
+  iwork --no-tmux claude feat-bla
   iwork install-hooks
 
 Options:
@@ -102,7 +141,7 @@ validate_repo_name() {
 
   case "$repo" in
     ""|.|..|*/*|*\\*|*:* )
-      die "repo '$repo' must be a repo name directly under $IGLOO_DIR"
+      die "repo '$repo' must be a repo name directly under $REPO_DIR"
       ;;
   esac
 
@@ -116,7 +155,7 @@ validate_worktree_folder_name() {
 
   case "$folder" in
     ""|.|..|*/*|*\\* )
-      die "folder '$folder' must be a direct child of $WORKTREES_DIR"
+      die "folder '$folder' must be a direct child of $TASKS_DIR"
       ;;
     \**|!* )
       die "folder '$folder' must not start with '*' or '!'"
@@ -129,10 +168,10 @@ list_repos() {
   local path=""
   local name=""
 
-  for path in "$IGLOO_DIR"/*; do
+  for path in "$REPO_DIR"/*; do
     [[ -d "$path" ]] || continue
     name="${path##*/}"
-    [[ "$name" == "AAWORKTREES" ]] && continue
+    [[ -n "$TASKS_DIR" && "$path" -ef "$TASKS_DIR" ]] && continue
 
     if is_git_repo "$path" && [[ "$name" == "$prefix"* ]]; then
       printf '%s\n' "$name"
@@ -145,9 +184,9 @@ list_worktree_folders() {
   local path=""
   local name=""
 
-  [[ -d "$WORKTREES_DIR" ]] || return 0
+  [[ -d "$TASKS_DIR" ]] || return 0
 
-  for path in "$WORKTREES_DIR"/*; do
+  for path in "$TASKS_DIR"/*; do
     [[ -d "$path" ]] || continue
     name="${path##*/}"
 
@@ -210,7 +249,7 @@ resolve_worktree_folder() {
 
   validate_worktree_folder_name "$folder"
 
-  folder_path="$WORKTREES_DIR/$folder"
+  folder_path="$TASKS_DIR/$folder"
   [[ -d "$folder_path" ]] || die "worktree folder not found: $folder"
 
   printf '%s\n' "$folder_path"
@@ -222,6 +261,7 @@ run_tool_in_worktree() {
   local folder_path=""
 
   shift 2
+  require_config
   folder_path="$(resolve_worktree_folder "$folder")"
 
   if tmux_enabled; then
@@ -235,21 +275,21 @@ run_tool_in_worktree() {
 
 validate_primary_repo_root() {
   local repo_root="$1"
-  local expected_prefix="$IGLOO_DIR/"
+  local expected_prefix="$REPO_DIR/"
 
   case "$repo_root" in
-    "$WORKTREES_DIR"|"$WORKTREES_DIR"/*)
-      die "park must be run from a primary repo under $IGLOO_DIR, not from AAWORKTREES"
+    "$TASKS_DIR"|"$TASKS_DIR"/*)
+      die "park must be run from a primary repo under $REPO_DIR, not from the tasks directory"
       ;;
     "$expected_prefix"*)
       ;;
     *)
-      die "repo '$repo_root' must live directly under $IGLOO_DIR"
+      die "repo '$repo_root' must live directly under $REPO_DIR"
       ;;
   esac
 
-  if [[ "$(dirname "$repo_root")" != "$IGLOO_DIR" ]]; then
-    die "repo '$repo_root' must be a direct child of $IGLOO_DIR"
+  if [[ "$(dirname "$repo_root")" != "$REPO_DIR" ]]; then
+    die "repo '$repo_root' must be a direct child of $REPO_DIR"
   fi
 }
 
@@ -302,7 +342,7 @@ resolve_park_target_path() {
   branch="$(current_branch_name "$repo_root")"
   branch_slug="${branch//\//-}"
 
-  printf '%s\n' "$WORKTREES_DIR/$folder_name/${repo_name}--${branch_slug}"
+  printf '%s\n' "$TASKS_DIR/$folder_name/${repo_name}--${branch_slug}"
 }
 
 park_current_repo() {
@@ -324,7 +364,7 @@ park_current_repo() {
   repo_name="$(current_repo_name "$repo_root")"
   branch="$(current_branch_name "$repo_root")"
   branch_slug="${branch//\//-}"
-  folder_path="$WORKTREES_DIR/$folder_name"
+  folder_path="$TASKS_DIR/$folder_name"
   wt_path="$folder_path/${repo_name}--${branch_slug}"
 
   case "$branch" in
@@ -428,7 +468,7 @@ create_worktrees() {
   local branch="$1"
   local folder_name="$2"
   local branch_slug="$3"
-  local folder_path="$WORKTREES_DIR/$folder_name"
+  local folder_path="$TASKS_DIR/$folder_name"
   local seen_repos=""
   local base_refs=()
   local repo=""
@@ -454,7 +494,7 @@ create_worktrees() {
     esac
     seen_repos="$seen_repos $repo"
 
-    repo_path="$IGLOO_DIR/$repo"
+    repo_path="$REPO_DIR/$repo"
     if ! is_git_repo "$repo_path"; then
       die "$repo_path is not a git repository"
     fi
@@ -490,7 +530,7 @@ create_worktrees() {
 
   for i in "${!repos[@]}"; do
     repo="${repos[$i]}"
-    repo_path="$IGLOO_DIR/$repo"
+    repo_path="$REPO_DIR/$repo"
     wt_name="${repo}--${branch_slug}"
     wt_path="$folder_path/$wt_name"
     base_ref="${base_refs[$i]}"
@@ -609,6 +649,9 @@ _iwork() {
     list)
       return 0
       ;;
+    init)
+      return 0
+      ;;
     install-hooks)
       return 0
       ;;
@@ -629,7 +672,7 @@ _iwork() {
   fi
 
   if (( COMP_CWORD == 1 )); then
-    COMPREPLY=( $(compgen -W "add-repo park list cd claude codex install-hooks --no-tmux --no-context -h --help --completion" -- "$cur") )
+    COMPREPLY=( $(compgen -W "add-repo park list cd claude codex init install-hooks --no-tmux --no-context -h --help --completion" -- "$cur") )
     return 0
   fi
 
@@ -731,6 +774,7 @@ _iwork() {
       'cd[cd into a worktree folder or switch to its tmux window]' \
       'claude[open the task tmux window and run claude]' \
       'codex[open the task tmux window and run codex]' \
+      'init[create the iwork config file]' \
       'install-hooks[install Claude Code status hooks]' \
       '--no-tmux[skip tmux window handling]' \
       '--no-context[skip writing task context files]' \
@@ -750,6 +794,9 @@ _iwork() {
       return 0
       ;;
     list)
+      return 0
+      ;;
+    init)
       return 0
       ;;
     install-hooks)
@@ -867,7 +914,7 @@ seed_context_template() {
 write_task_context() {
   local folder="$1"
   local branch="$2"
-  local folder_path="$WORKTREES_DIR/$folder"
+  local folder_path="$TASKS_DIR/$folder"
   local template=""
   local repos_list=""
   local rendered=""
@@ -907,7 +954,7 @@ open_task_window() {
   local folder="$1"
   local tool="$2"
   shift 2
-  local folder_path="$WORKTREES_DIR/$folder"
+  local folder_path="$TASKS_DIR/$folder"
   local window_id=""
   local pane_id=""
   local tool_cmd=""
@@ -951,6 +998,7 @@ handle_claude_hook() {
   local marker=""
 
   [[ -n "${TMUX:-}" && -n "${TMUX_PANE:-}" ]] || exit 0
+  [[ -n "$TASKS_DIR" ]] || exit 0
 
   input="$(cat 2>/dev/null || true)"
   event="$(printf '%s' "$input" | sed -n 's/.*"hook_event_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' || true)"
@@ -958,7 +1006,7 @@ handle_claude_hook() {
 
   window_name="$(tmux display-message -p -t "$TMUX_PANE" '#{window_name}' 2>/dev/null)" || exit 0
   base="${window_name#[*!]}"
-  [[ -n "$base" && -d "$WORKTREES_DIR/$base" ]] || exit 0
+  [[ -n "$base" && -d "$TASKS_DIR/$base" ]] || exit 0
 
   case "$event" in
     UserPromptSubmit)
@@ -977,6 +1025,56 @@ handle_claude_hook() {
   fi
 
   exit 0
+}
+
+run_init() {
+  local repo_dir="" tasks_dir="" answer="" config_dir=""
+
+  if ! { : </dev/tty; } 2>/dev/null; then
+    die "iwork init needs an interactive terminal"
+  fi
+
+  if [[ -f "$IWORK_CONFIG_FILE" ]]; then
+    printf 'Config already exists: %s\nOverwrite? [y/N] ' "$IWORK_CONFIG_FILE"
+    IFS= read -r answer </dev/tty
+    case "$answer" in
+      y|Y) ;;
+      *) die "aborted" ;;
+    esac
+  fi
+
+  printf 'Directory that holds your repos (e.g. ~/dev/projects): '
+  IFS= read -r repo_dir </dev/tty
+  repo_dir="${repo_dir/#\~/$HOME}"
+  [[ -n "$repo_dir" ]] || die "a repo directory is required"
+  [[ -d "$repo_dir" ]] || die "not a directory: $repo_dir"
+  repo_dir="$(cd "$repo_dir" && pwd)"
+
+  printf 'Directory for task folders [%s/tasks]: ' "$repo_dir"
+  IFS= read -r tasks_dir </dev/tty
+  if [[ -n "$tasks_dir" ]]; then
+    tasks_dir="${tasks_dir/#\~/$HOME}"
+  fi
+
+  config_dir="$(dirname "$IWORK_CONFIG_FILE")"
+  mkdir -p "$config_dir" || die "could not create $config_dir"
+
+  {
+    echo '# iwork configuration. Plain shell, sourced by iwork.'
+    echo '# Environment variables override values set here.'
+    printf 'IWORK_REPO_DIR=%q\n' "$repo_dir"
+    if [[ -n "$tasks_dir" ]]; then
+      printf 'IWORK_TASKS_DIR=%q\n' "$tasks_dir"
+    else
+      echo '# IWORK_TASKS_DIR="$IWORK_REPO_DIR/tasks"'
+    fi
+    echo '# IWORK_TMUX_SESSION=tasks'
+    echo '# IWORK_CONTEXT_TEMPLATE="$HOME/.config/iwork/task-context.md.tmpl"'
+  } > "$IWORK_CONFIG_FILE" || die "could not write $IWORK_CONFIG_FILE"
+
+  echo "Wrote $IWORK_CONFIG_FILE"
+  echo "  repo dir:  $repo_dir"
+  echo "  tasks dir: ${tasks_dir:-$repo_dir/tasks}"
 }
 
 install_claude_hooks() {
@@ -1083,18 +1181,22 @@ case "${1:-}" in
     esac
     ;;
   --complete-repos)
+    require_config
     list_repos "${2:-}"
     exit 0
     ;;
   --complete-worktree-folders)
+    require_config
     list_worktree_folders "${2:-}"
     exit 0
     ;;
   --resolve-worktree-folder)
+    require_config
     resolve_worktree_folder "${2:-}"
     exit 0
     ;;
   --resolve-park-target-path)
+    require_config
     resolve_park_target_path "${2:-}"
     exit 0
     ;;
@@ -1111,7 +1213,17 @@ case "${1:-}" in
     ;;
 esac
 
+if [[ "${1:-}" == "init" ]]; then
+  if [[ $# -ne 1 ]]; then
+    die "usage: iwork init"
+  fi
+
+  run_init
+  exit 0
+fi
+
 if [[ "${1:-}" == "list" && $# -eq 1 ]]; then
+  require_config
   if tmux_enabled; then
     list_worktree_folders_with_status
   else
@@ -1122,9 +1234,10 @@ fi
 
 if [[ "${1:-}" == "park" ]]; then
   if [[ $# -ne 2 ]]; then
-    die "usage: iwork park <folder-name-in-AAWORKTREES>"
+    die "usage: iwork park <task>"
   fi
 
+  require_config
   park_current_repo "$2"
   exit 0
 fi
@@ -1140,9 +1253,10 @@ fi
 
 if [[ "${1:-}" == "add-repo" ]]; then
   if [[ $# -lt 4 ]]; then
-    die "usage: iwork add-repo <folder-name-in-AAWORKTREES> -r <repo1> [repo2 ...]"
+    die "usage: iwork add-repo <task> -r <repo1> [repo2 ...]"
   fi
 
+  require_config
   folder_name="$2"
   validate_worktree_folder_name "$folder_name"
 
@@ -1157,7 +1271,7 @@ fi
 
 if [[ "${1:-}" == "cd" && "${2:-}" != "-r" ]]; then
   if [[ $# -ne 2 ]]; then
-    die "usage: iwork cd <folder-name-in-AAWORKTREES>"
+    die "usage: iwork cd <task>"
   fi
 
   die "'iwork cd' must be run through sourced shell integration. Run: source <(iwork --completion bash) or source <(iwork --completion zsh)"
@@ -1165,7 +1279,7 @@ fi
 
 if [[ "${1:-}" == "claude" && "${2:-}" != "-r" ]]; then
   if [[ $# -lt 2 ]]; then
-    die "usage: iwork claude <folder-name-in-AAWORKTREES> [claude-args...]"
+    die "usage: iwork claude <task> [claude-args...]"
   fi
 
   run_tool_in_worktree claude "$2" "${@:3}"
@@ -1173,7 +1287,7 @@ fi
 
 if [[ "${1:-}" == "codex" && "${2:-}" != "-r" ]]; then
   if [[ $# -lt 2 ]]; then
-    die "usage: iwork codex <folder-name-in-AAWORKTREES> [codex-args...]"
+    die "usage: iwork codex <task> [codex-args...]"
   fi
 
   run_tool_in_worktree codex "$2" "${@:3}"
@@ -1182,6 +1296,7 @@ fi
 branch="$1"
 shift
 
+require_config
 validate_branch "$branch"
 
 parse_repos_flag "expected -r <repos> after branch name" "$@"
