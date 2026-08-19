@@ -64,6 +64,10 @@ Create a task folder in the tasks directory and set up git worktrees for
 the specified repos, all on the given branch. Each worktree lives in a
 subdirectory named after the repo it comes from.
 
+New branches start from the base branch but get no upstream, so status and
+prompts do not report them as ahead of/behind origin/main before they are
+pushed. Use 'git push -u origin HEAD' to set a real upstream.
+
 Configuration lives in ~/.config/iwork/config (run 'iwork init' to create
 it). IWORK_REPO_DIR must point at the directory whose direct children are
 your git repositories; task folders go in IWORK_TASKS_DIR (default:
@@ -878,7 +882,11 @@ create_worktrees() {
     fi
 
     if [[ -n "$base_ref" ]]; then
-      git -C "$repo_path" worktree add -b "$branch" "$wt_path" "$base_ref"
+      # --no-track: branching from origin/main would otherwise make it the
+      # upstream, so status and prompts would report the fresh branch as
+      # ahead/behind a branch it has nothing to do with. Push with
+      # 'git push -u origin HEAD' to set a real upstream.
+      git -C "$repo_path" worktree add --no-track -b "$branch" "$wt_path" "$base_ref"
     else
       git -C "$repo_path" worktree add "$wt_path" "$branch"
     fi

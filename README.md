@@ -166,6 +166,33 @@ iwork park task-billing-followup
 iwork list
 ```
 
+## Branch tracking
+
+A task branch is created from `origin/main` (or whatever `origin/HEAD` points at),
+but **without** an upstream. Git's default would make `origin/main` the upstream of
+the new branch, so every `git status` and shell prompt would report the branch as
+ahead of — and behind — a branch it has nothing to do with, before it has ever been
+pushed:
+
+```
+## feat/login-bug...origin/main [ahead 1]     # git's default
+## feat/login-bug                             # what iwork creates
+```
+
+The branch still *starts* from the base branch; only the upstream link is skipped.
+Push as usual when you're ready, and that sets a real upstream:
+
+```bash
+git push -u origin HEAD        # -> origin/feat/login-bug
+```
+
+Worktrees created before this change still carry the old upstream. Clear it from
+inside the worktree:
+
+```bash
+git branch --unset-upstream
+```
+
 ## Detached mode
 
 `--detach` spins a task up without dragging you to it. The window is still
