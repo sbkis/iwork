@@ -105,8 +105,12 @@ Subcommands:
   init           Interactively create the config file
   add-repo       Add one or more repos to an existing task folder
   rm             Remove worktrees from a task; without -r, remove every
-                 worktree and the task folder (and its tmux window).
-                 Branches are always left intact.
+                 worktree, the generated context files (CLAUDE.md,
+                 AGENTS.md, .claude/), the task folder and its tmux
+                 window/session. Branches are always left intact. A
+                 directory whose worktree registration is gone is reported
+                 as orphaned and needs -f, since git can no longer say
+                 whether it holds uncommitted work.
   park           Move the current repo/branch into a task folder
   list           List task folders (with window status in tmux)
   cd             Switch to the task window, or cd into the task folder
@@ -142,8 +146,8 @@ Options:
   --big         Give the task its own tmux session, with a window per repo
                 (editor + shell) alongside the agent window (leading flag)
   -r            Repos to create worktrees for (required, at least one)
-  -f            rm only: remove worktrees with uncommitted changes and
-                skip the confirmation prompt
+  -f            rm only: remove worktrees with uncommitted changes or
+                orphaned directories, and skip the confirmation prompt
   -h            Show this help
 
 Completion:
@@ -544,6 +548,22 @@ list_task_worktrees() {
   done
 }
 
+# Directories that were worktrees but whose registration is gone: they still
+# carry a .git that no longer resolves, usually because the directory was
+# renamed with plain mv and git later pruned the missing path. git can tell us
+# nothing about these, so removing one is a plain directory delete.
+list_task_orphans() {
+  local folder_path="$1"
+  local child=""
+
+  for child in "$folder_path"/*; do
+    [[ -d "$child" ]] || continue
+    [[ -e "$child/.git" ]] || continue
+    is_worktree_root "$child" && continue
+    printf '%s\n' "$child"
+  done
+}
+
 confirm() {
   local prompt="$1"
   local answer=""
@@ -603,7 +623,9 @@ remove_worktrees() {
   local repos=("$@")
   local folder_path=""
   local worktrees=()
+  local orphans=()
   local targets=()
+  local orphan_targets=()
   local dirty=()
   local repo=""
   local wt=""
@@ -622,7 +644,11 @@ remove_worktrees() {
     [[ -n "$wt" ]] && worktrees+=("$wt")
   done < <(list_task_worktrees "$folder_path")
 
-  if (( ${#worktrees[@]} == 0 )); then
+  while IFS= read -r wt; do
+    [[ -n "$wt" ]] && orphans+=("$wt")
+  done < <(list_task_orphans "$folder_path")
+
+  if (( ${#worktrees[@]} == 0 && ${#orphans[@]} == 0 )); then
     if [[ -z "$remove_all" ]]; then
       die "no git worktrees found in $folder_path"
     fi
@@ -631,16 +657,24 @@ remove_worktrees() {
 
   if [[ -n "$remove_all" ]]; then
     targets=("${worktrees[@]+${worktrees[@]}}")
+    orphan_targets=("${orphans[@]+${orphans[@]}}")
   else
     for repo in "${repos[@]}"; do
       validate_repo_name "$repo"
       matched=""
-      for wt in "${worktrees[@]}"; do
+      # Current layout names the worktree after the repo; older ones used
+      # repo--branch-slug.
+      for wt in "${worktrees[@]+${worktrees[@]}}"; do
         name="${wt##*/}"
-        # Current layout names the worktree after the repo; older ones used
-        # repo--branch-slug.
         if [[ "$name" == "$repo" || "$name" == "$repo"--* ]]; then
           targets+=("$wt")
+          matched=1
+        fi
+      done
+      for wt in "${orphans[@]+${orphans[@]}}"; do
+        name="${wt##*/}"
+        if [[ "$name" == "$repo" || "$name" == "$repo"--* ]]; then
+          orphan_targets+=("$wt")
           matched=1
         fi
       done
@@ -658,6 +692,9 @@ remove_worktrees() {
   for wt in "${targets[@]+${targets[@]}}"; do
     echo "  - ${wt##*/}"
   done
+  for wt in "${orphan_targets[@]+${orphan_targets[@]}}"; do
+    echo "  - ${wt##*/}  (orphaned: registration gone, deleted as a plain directory)"
+  done
 
   if [[ -n "$remove_all" ]]; then
     echo "  - the task folder itself"
@@ -673,6 +710,11 @@ remove_worktrees() {
     echo ""
     echo "Uncommitted changes in: ${dirty[*]}"
     [[ -n "$force" ]] || die "refusing to remove worktrees with uncommitted changes; re-run with -f"
+  fi
+
+  if (( ${#orphan_targets[@]} > 0 )) && [[ -z "$force" ]]; then
+    echo ""
+    die "orphaned directories cannot be checked for uncommitted work; re-run with -f to delete them"
   fi
 
   echo ""
@@ -700,26 +742,43 @@ remove_worktrees() {
     git -C "$repo_root" worktree prune 2>/dev/null || true
   done
 
+  # Only reachable with -f, which the orphan check above enforces.
+  for wt in "${orphan_targets[@]+${orphan_targets[@]}}"; do
+    name="${wt##*/}"
+
+    if rm -rf "$wt"; then
+      echo "  -> deleted orphaned $name"
+    else
+      warn "could not delete $wt; left in place"
+      failed=1
+    fi
+  done
+
   if [[ -z "$remove_all" ]]; then
     echo ""
     echo "Done! Branches were left untouched."
     return 0
   fi
 
+  # The task is gone either way, so its window/session goes too — and killing
+  # it first stops any editor from writing the folder back up under us.
+  kill_task_tmux "$folder"
+
   if [[ -n "$failed" ]]; then
     die "some worktrees could not be removed; kept $folder_path"
   fi
 
-  for target in "$folder_path/CLAUDE.md" "$folder_path/AGENTS.md"; do
+  # Generated for the agent that ran here, so they go with the task.
+  for target in "$folder_path/CLAUDE.md" "$folder_path/AGENTS.md" "$folder_path/.claude"; do
     [[ -e "$target" ]] || continue
-    rm -f "$target" || warn "could not remove $target"
+    rm -rf "$target" || warn "could not remove $target"
   done
 
   if rmdir "$folder_path" 2>/dev/null; then
     echo "  -> removed ${folder_path##*/}"
-    kill_task_tmux "$folder"
   else
     warn "$folder_path is not empty; kept it (worktrees are gone)"
+    warn "  remaining: $(ls -A "$folder_path" 2>/dev/null | tr '\n' ' ')"
   fi
 
   echo ""

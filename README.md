@@ -236,9 +236,9 @@ iwork rm -f feat-login-bug               # don't ask, and drop uncommitted work
 ```
 
 `rm` removes git worktrees (via `git worktree remove`, then a prune in the parent
-repo) and, when no `-r` is given, the generated `CLAUDE.md`/`AGENTS.md`, the task
-folder, and its tmux window. It shows what it is about to do and asks for
-confirmation first.
+repo) and, when no `-r` is given, the generated agent context (`CLAUDE.md`,
+`AGENTS.md`, `.claude/`), the task folder, and the task's tmux window or session.
+It shows what it is about to do and asks for confirmation first.
 
 Things it will not do:
 
@@ -246,8 +246,25 @@ Things it will not do:
   goes away.
 - **Throw away uncommitted work.** If any target worktree is dirty, `rm` names it
   and stops. Pass `-f` to remove it anyway (which also skips the prompt).
-- **Delete files it didn't create.** If anything besides the worktrees and the
-  generated context files is left in the task folder, the folder is kept.
+- **Delete files it didn't create.** Anything in the task folder other than the
+  worktrees and that generated agent context keeps the folder alive; `rm` warns
+  and lists what stayed behind.
+
+### Orphaned worktrees
+
+If a worktree directory is renamed with plain `mv` instead of `git worktree move`,
+git eventually prunes the registration it can no longer find, leaving a directory
+with a dangling `.git`. git can tell you nothing about such a directory — not even
+whether it holds uncommitted work — so `rm` reports it as orphaned and refuses
+without `-f`:
+
+```
+  - accounting-api  (orphaned: registration gone, deleted as a plain directory)
+Error: orphaned directories cannot be checked for uncommitted work; re-run with -f to delete them
+```
+
+With `-f` it is deleted as a plain directory. To rename a worktree without
+creating one of these, use `git worktree move` (see the migration snippet above).
 
 Removing the task you are currently in is fine — with the shell integration
 sourced, your shell is moved up to the tasks directory afterwards. If the tmux
