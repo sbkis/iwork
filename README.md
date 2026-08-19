@@ -131,9 +131,13 @@ setw -g automatic-rename off        # let iwork own the task window names
 bind Tab switch-client -l           # prefix+Tab: toggle last session
 bind T switch-client -t tasks       # prefix+T: jump to tasks session
 
-# Waiting-agent counter in the status bar
-set -g status-right '!#(tmux list-windows -t tasks -F "#W" 2>/dev/null | grep -c "^!")  %Y-%m-%d %H:%M:%S'
+# Waiting-agent counter in the status bar. -a covers every session, so it also
+# counts agents inside per-task `tasks-*` sessions (see Big tasks below).
+set -g status-right '!#(tmux list-windows -a -F "#W" 2>/dev/null | grep -c "^!")  %Y-%m-%d %H:%M:%S'
 ```
+
+Only `iwork` marks window names with `!`, so counting across all sessions is safe.
+With `--big` in play, `prefix + s` lists the `tasks-` sessions together.
 
 ## Quick start
 
@@ -181,6 +185,48 @@ Pick the task up whenever you like with `iwork cd <task>`, or watch it from
 `iwork list` — the `*` / `!` markers report whether the agent is busy or waiting
 for you. Set `IWORK_DETACH=1` in your config to make this the default.
 
+## Big tasks: a session per task
+
+One window is thin for a task spanning four repos. `--big` gives the task a whole
+tmux session instead, named `<tmux-session>-<task>` — `tasks-feat-x` by default,
+so all of them sort and grep together:
+
+```bash
+iwork --big feat/big-thing -r backend-api frontend shared-lib admin
+```
+
+```
+session tasks-feat-big-thing
+├── window "feat-big-thing"   claude | shell          — at the task root
+├── window "admin"            nvim . | shell          — inside tasks/…/admin
+├── window "backend-api"      nvim . | shell
+├── window "frontend"         nvim . | shell
+└── window "shared-lib"       nvim . | shell
+```
+
+The editor is `IWORK_EDITOR` (default `nvim`), run as a command line with the
+worktree appended — so `IWORK_EDITOR="code -n"` or `IWORK_EDITOR=hx` both work.
+You land on the agent window; the repo windows are built behind it.
+
+How it fits with everything else:
+
+- **The agent window keeps the task name**, so the Claude Code status hooks still
+  rename it `*task` / `!task`, and `iwork list` reports it — tagged `(session)` so
+  you can see which tasks own one.
+- **`cd`, `claude`, `codex`** find a task in its own session or in the shared one,
+  whether or not you pass `--big` again.
+- **`add-repo`** adds a window for the new repo to a live session.
+- **`rm`** kills the whole session, and says so before it does — anything unsaved
+  in those editors goes with it.
+- **`--big --detach`** builds the session without moving you into it, and works
+  from outside tmux entirely.
+
+If a task is already open as a plain window in the shared session, `--big` will
+not start a second agent for it in a new session; close that window first.
+
+Set `IWORK_BIG=1` in your config to make every task work this way.
+
+
 ## Cleaning up
 
 ```bash
@@ -224,13 +270,15 @@ overrides.
 | `IWORK_TASKS_DIR` | `$IWORK_REPO_DIR/tasks` | Where task folders are created |
 | `IWORK_TMUX_SESSION` | `tasks` | tmux session that holds task windows |
 | `IWORK_CONTEXT_TEMPLATE` | `~/.config/iwork/task-context.md.tmpl` | Template for the generated `CLAUDE.md`/`AGENTS.md` (seeded with a default on first use, then yours to edit) |
+| `IWORK_EDITOR` | `nvim` | Editor started in each repo window under `--big`; run as a command line with the worktree appended |
 | `IWORK_NO_TMUX` | unset | Set to skip all tmux handling (same as the `--no-tmux` flag) |
 | `IWORK_NO_CONTEXT` | unset | Set to skip writing task context files (same as `--no-context`) |
 | `IWORK_DETACH` | unset | Set to never switch to the task window (same as `--detach`) |
+| `IWORK_BIG` | unset | Set to give every task its own session (same as `--big`) |
 | `IWORK_ASSUME_YES` | unset | Set to `1` to skip confirmation prompts (`install-hooks`, `rm`) |
 
-Leading flags `--no-tmux`, `--no-context` and `--detach` apply per-invocation,
-e.g. `iwork --no-tmux claude feat-login-bug`.
+Leading flags `--no-tmux`, `--no-context`, `--detach` and `--big` apply
+per-invocation, e.g. `iwork --no-tmux claude feat-login-bug`.
 
 ## Updating
 
