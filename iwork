@@ -3,7 +3,7 @@ set -euo pipefail
 
 SELF_PATH="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)/$(basename "${BASH_SOURCE[0]:-$0}")"
 IWORK_CONFIG_FILE="${IWORK_CONFIG_FILE:-${XDG_CONFIG_HOME:-$HOME/.config}/iwork/config}"
-IWORK_CONFIG_VARS=(IWORK_REPO_DIR IWORK_TASKS_DIR IWORK_TMUX_SESSION IWORK_CONTEXT_TEMPLATE IWORK_EDITOR IWORK_NO_TMUX IWORK_NO_CONTEXT IWORK_DETACH IWORK_BIG IWORK_ASSUME_YES)
+IWORK_CONFIG_VARS=(IWORK_REPO_DIR IWORK_TASKS_DIR IWORK_PROJECTS_DIR IWORK_TMUX_SESSION IWORK_CONTEXT_TEMPLATE IWORK_PROJECT_TEMPLATE IWORK_EDITOR IWORK_NO_TMUX IWORK_NO_CONTEXT IWORK_DETACH IWORK_BIG IWORK_ASSUME_YES IWORK_PROJECT IWORK_SHOW_LOG_LINES)
 
 load_config() {
   local var="" restore=""
@@ -28,6 +28,7 @@ load_config
 
 REPO_DIR="${IWORK_REPO_DIR:-}"
 TASKS_DIR="${IWORK_TASKS_DIR:-${REPO_DIR:+$REPO_DIR/tasks}}"
+PROJECTS_DIR="${IWORK_PROJECTS_DIR:-${REPO_DIR:+$REPO_DIR/projects}}"
 TASKS_SESSION="${IWORK_TMUX_SESSION:-tasks}"
 IWORK_NO_TMUX="${IWORK_NO_TMUX:-}"
 IWORK_NO_CONTEXT="${IWORK_NO_CONTEXT:-}"
@@ -37,6 +38,9 @@ IWORK_EDITOR="${IWORK_EDITOR:-nvim}"
 # Per-invocation only (--from): the task or branch new branches start from.
 BASE_SPEC=""
 CONTEXT_TEMPLATE="${IWORK_CONTEXT_TEMPLATE:-$HOME/.config/iwork/task-context.md.tmpl}"
+PROJECT_TEMPLATE="${IWORK_PROJECT_TEMPLATE:-$HOME/.config/iwork/project-context.md.tmpl}"
+SHOW_LOG_LINES="${IWORK_SHOW_LOG_LINES:-12}"
+CHECKPOINT_NUDGE_AFTER=40
 
 require_config() {
   if [[ -z "$REPO_DIR" ]]; then
@@ -49,9 +53,10 @@ require_config() {
 usage() {
   cat <<'EOF'
 Usage: iwork [flags] <branch-name> [--from <task|branch>] -r <repo1> [repo2 ...]
+                                   [-p <project>]
        iwork add-repo <task> [--from <task|branch>] -r <repo1> [repo2 ...]
        iwork [--no-tmux] rm [-f] <task> [-r <repo1> [repo2 ...]]
-       iwork [flags] park <task>
+       iwork [flags] park <task> [-p <project>]
        iwork [--no-tmux] list
        iwork [--no-tmux] cd <task>
        iwork [flags] claude <task> [claude-args...]
@@ -59,6 +64,20 @@ Usage: iwork [flags] <branch-name> [--from <task|branch>] -r <repo1> [repo2 ...]
        iwork init
        iwork install-hooks [settings-path]
        iwork --completion <bash|zsh>
+
+       iwork project list
+       iwork project show [-n <count>] [<project>]
+       iwork project grep [-p <project>] <pattern> [ripgrep-args...]
+       iwork project cat [-p <project>] <path-inside-the-project>
+       iwork project add <project> <task>
+       iwork project rm <project> <task>
+       iwork project delete [-f] <project>
+
+       iwork todo "<what needs doing>" [-p <project>]
+       iwork log [--decision|--shipped|--note] "<what>" [-p <project>]
+       iwork decided "<what and why>" [-p <project>]
+       iwork done <todo-id> [-p <project>]
+       iwork drop <todo-id> [-p <project>]
 
        flags: [--no-tmux] [--no-context] [--detach] [--big]
 
@@ -143,8 +162,58 @@ Subcommands:
                  Requires sourced shell integration from --completion
   claude         Open/switch to the task window and run claude there
   codex          Open/switch to the task window and run codex there
-  install-hooks  Add Claude Code hooks to ~/.claude/settings.json that keep
-                 tmux window names in sync with agent status
+  install-hooks  Add Claude Code hooks to ~/.claude/settings.json: keep tmux
+                 window names in sync with agent status, inject the project
+                 brief at session start, log PRs, and prompt for a flush before
+                 a compaction. Safe to re-run; it only adds what is missing
+  project        Manage projects: the memory shared by the tasks of one
+                 longer-horizon effort (see Projects below)
+  todo           Capture something that needs doing but not in this PR
+  log            Append one line to the project log (--decision, --shipped,
+                 --note; default --note)
+  decided        Shorthand for 'log --decision'
+  done / drop    Close or abandon a captured todo by id
+
+Projects:
+  A project is a directory of markdown outside the tasks tree that outlives any
+  one task, so an effort spanning weeks and many PRs does not have to be
+  re-explained to a fresh agent every time.
+
+      iwork feat/token-api -r auth-service -p auth-rewrite
+
+  creates the project on first use (after confirming) and, in the task folder,
+  a '.project' symlink pointing at it. The symlink is deliberate: it puts the
+  shared memory inside the task directory, so the agent's usual "stay in this
+  directory" scope still holds. Project memory is never touched by 'iwork rm' —
+  the same guarantee branches get.
+
+      <project>/PROJECT.md     curated brief: goal, where we are, constraints
+      <project>/LOG.md         append-only, one line per entry
+      <project>/TODO.md        captured-not-now, with the task it surfaced in
+      <project>/history.tsv    append-only task events (opened, closed)
+      <project>/notes/         anything that outlives one task
+
+  Live state is never cached: which tasks exist and what they are doing is read
+  from the filesystem and tmux on every call, exactly as 'iwork list' does.
+  history.tsv only records what cannot be derived once a task folder is gone.
+
+  The CLI is the only interface to a project, deliberately: the agent is told
+  '.project' is out of scope like anything else outside the task, so the atomic
+  appends and the append-only log stop being rules it is asked to respect and
+  become rules it cannot break. Reads go through 'project show' (one bounded
+  summary rather than files that grow without limit), 'project grep' and
+  'project cat'; writes go through 'todo' / 'log' / 'decided'.
+
+  With the hooks installed (see install-hooks) most of it happens unprompted:
+  the project brief is injected at session start, PRs are logged when 'gh pr
+  create' runs, and a compaction prompts the agent to record what it worked out
+  before the context is dropped. Nothing forces a log entry — a padded log is
+  worse than a short one.
+
+  'iwork project add <project> <task>' attaches a task that already exists, so
+  work already in flight can join a project. A task belongs to exactly one
+  project; attach again with a different name and it refuses rather than
+  silently relinking.
 
 Examples:
   iwork feat/bla -r backend-api frontend
@@ -177,6 +246,9 @@ Options:
   --from        Start the new branches from this task or branch instead of
                 origin/main; accepted before or after the branch name
   -r            Repos to create worktrees for (required, at least one)
+  -p            Project this task is part of, created on first use. Also
+                selects the project for todo/log/decided/done/drop and
+                'project show|grep' when you are not inside the task
   -f            rm only: remove worktrees with uncommitted changes or
                 orphaned directories, and skip the confirmation prompt
   -h            Show this help
@@ -250,6 +322,9 @@ list_repos() {
     [[ -d "$path" ]] || continue
     name="${path##*/}"
     [[ -n "$TASKS_DIR" && "$path" -ef "$TASKS_DIR" ]] && continue
+    # Phase 3 gives project dirs a git repo of their own, which would otherwise
+    # make them selectable with -r.
+    [[ -n "$PROJECTS_DIR" && "$path" -ef "$PROJECTS_DIR" ]] && continue
 
     if is_git_repo "$path" && [[ "$name" == "$prefix"* ]]; then
       printf '%s\n' "$name"
@@ -377,20 +452,24 @@ run_tool_in_worktree() {
 
 validate_primary_repo_root() {
   local repo_root="$1"
-  local expected_prefix="$REPO_DIR/"
+  local parent=""
+
+  parent="$(dirname "$repo_root")"
+
+  if [[ -n "$TASKS_DIR" && -d "$TASKS_DIR" && -d "$parent" ]] && [[ "$parent" -ef "$TASKS_DIR" ]]; then
+    die "park must be run from a primary repo under $REPO_DIR, not from the tasks directory"
+  fi
 
   case "$repo_root" in
     "$TASKS_DIR"|"$TASKS_DIR"/*)
       die "park must be run from a primary repo under $REPO_DIR, not from the tasks directory"
       ;;
-    "$expected_prefix"*)
-      ;;
-    *)
-      die "repo '$repo_root' must live directly under $REPO_DIR"
-      ;;
   esac
 
-  if [[ "$(dirname "$repo_root")" != "$REPO_DIR" ]]; then
+  # -ef rather than a string compare: git reports the physical path, so any
+  # symlink in IWORK_REPO_DIR (/var -> /private/var on macOS, or a symlinked
+  # dev directory) would otherwise fail a prefix match that is actually correct.
+  if [[ ! -d "$parent" ]] || [[ ! "$parent" -ef "$REPO_DIR" ]]; then
     die "repo '$repo_root' must be a direct child of $REPO_DIR"
   fi
 }
@@ -448,6 +527,7 @@ resolve_park_target_path() {
 
 park_current_repo() {
   local folder_name="$1"
+  local project="${2:-}"
   local repo_root=""
   local repo_name=""
   local branch=""
@@ -504,6 +584,11 @@ park_current_repo() {
   echo "  $wt_path"
 
   write_task_context "$folder_name" "$branch"
+
+  if [[ -n "$project" ]]; then
+    attach_task_to_project "$folder_name" "$project" "$branch"
+  fi
+
   open_task "$folder_name" claude
 }
 
@@ -667,9 +752,22 @@ remove_worktrees() {
   local remove_all=""
   local target=""
   local session=""
+  local project=""
+  local project_branch=""
+  local project_repos=""
 
   folder_path="$(resolve_worktree_folder "$folder")"
   (( ${#repos[@]} == 0 )) && remove_all=1
+
+  # Read the task's shape before anything is deleted: this is the last moment
+  # the branch and repo list can still be recovered.
+  project="$(task_project_name "$folder" || true)"
+  if [[ -n "$project" ]] && project_exists "$project"; then
+    project_branch="$(detect_branch_from_worktree_folder "$folder" 2>/dev/null || true)"
+    project_repos="$(task_repos_csv "$folder")"
+  else
+    project=""
+  fi
 
   while IFS= read -r wt; do
     [[ -n "$wt" ]] && worktrees+=("$wt")
@@ -786,6 +884,8 @@ remove_worktrees() {
   done
 
   if [[ -z "$remove_all" ]]; then
+    # The task survives with fewer repos, so its context files need to say so.
+    refresh_task_blocks "$folder" "$project_branch"
     echo ""
     echo "Done! Branches were left untouched."
     return 0
@@ -799,9 +899,18 @@ remove_worktrees() {
     die "some worktrees could not be removed; kept $folder_path"
   fi
 
-  # Generated for the agent that ran here, so they go with the task.
-  for target in "$folder_path/CLAUDE.md" "$folder_path/AGENTS.md" "$folder_path/.claude"; do
-    [[ -e "$target" ]] || continue
+  # rm is the one moment iwork is guaranteed to be called and the knowledge is
+  # guaranteed to be destroyed, so the record gets written here.
+  if [[ -n "$project" ]]; then
+    append_history "$project" closed "$folder" "$project_repos" "$project_branch" ""
+    echo "  -> recorded in project '$project'"
+  fi
+
+  # Generated for the agent that ran here, so they go with the task. No trailing
+  # slash on .project: it is a symlink into the project dir, and 'rm -rf link/'
+  # would delete the project memory instead of the link.
+  for target in "$folder_path/CLAUDE.md" "$folder_path/AGENTS.md" "$folder_path/.claude" "$folder_path/.project"; do
+    [[ -e "$target" || -L "$target" ]] || continue
     rm -rf "$target" || warn "could not remove $target"
   done
 
@@ -987,8 +1096,9 @@ iwork() {
       fi
 
       folder="$2"
+      shift 2
       target="$(command "$_iwork_bin" --resolve-park-target-path "$folder")" || return $?
-      command "$_iwork_bin" ${notmux:+--no-tmux} park "$folder" || return $?
+      command "$_iwork_bin" ${notmux:+--no-tmux} park "$folder" "$@" || return $?
       if [[ -z "${TMUX:-}" || -n "$notmux" ]]; then
         builtin cd "$target" || return $?
       fi
@@ -1030,7 +1140,7 @@ iwork() {
 }
 
 _iwork() {
-  local cur prev seen_r i repos folders folder cmd
+  local cur prev seen_r i repos folders folder cmd projects sub
   COMPREPLY=()
   cur="${COMP_WORDS[COMP_CWORD]}"
   prev=""
@@ -1040,7 +1150,49 @@ _iwork() {
     prev="${COMP_WORDS[COMP_CWORD-1]}"
   fi
 
+  # -p takes a project name wherever it appears.
+  if [[ "$prev" == "-p" || "$prev" == "--project" ]]; then
+    projects="$("$_iwork_bin" --complete-projects "$cur" 2>/dev/null)" || return 0
+    COMPREPLY=( $(compgen -W "$projects" -- "$cur") )
+    return 0
+  fi
+
   case "$cmd" in
+    project)
+      sub="${COMP_WORDS[2]:-}"
+      if (( COMP_CWORD == 2 )); then
+        COMPREPLY=( $(compgen -W "list show grep cat add rm delete" -- "$cur") )
+        return 0
+      fi
+      case "$sub" in
+        show|grep|cat|delete)
+          if (( COMP_CWORD == 3 )); then
+            projects="$("$_iwork_bin" --complete-projects "$cur" 2>/dev/null)" || return 0
+            COMPREPLY=( $(compgen -W "$projects" -- "$cur") )
+          fi
+          ;;
+        add|rm)
+          if (( COMP_CWORD == 3 )); then
+            projects="$("$_iwork_bin" --complete-projects "$cur" 2>/dev/null)" || return 0
+            COMPREPLY=( $(compgen -W "$projects" -- "$cur") )
+          elif (( COMP_CWORD == 4 )); then
+            folders="$("$_iwork_bin" --complete-worktree-folders "$cur" 2>/dev/null)" || return 0
+            COMPREPLY=( $(compgen -W "$folders" -- "$cur") )
+          fi
+          ;;
+      esac
+      return 0
+      ;;
+    todo|log|decided|done|drop)
+      if [[ "$cur" == -* ]]; then
+        if [[ "$cmd" == "log" ]]; then
+          COMPREPLY=( $(compgen -W "-p --project --decision --shipped --note" -- "$cur") )
+        else
+          COMPREPLY=( $(compgen -W "-p --project" -- "$cur") )
+        fi
+      fi
+      return 0
+      ;;
     cd|claude|codex)
       if (( COMP_CWORD == 2 )); then
         folders="$("$_iwork_bin" --complete-worktree-folders "$cur" 2>/dev/null)" || return 0
@@ -1106,21 +1258,23 @@ _iwork() {
   fi
 
   if (( COMP_CWORD == 1 )); then
-    COMPREPLY=( $(compgen -W "add-repo rm park list cd claude codex init install-hooks --no-tmux --no-context --detach --big --from -h --help --completion" -- "$cur") )
+    COMPREPLY=( $(compgen -W "add-repo rm park list cd claude codex project todo log decided done drop init install-hooks --no-tmux --no-context --detach --big --from -h --help --completion" -- "$cur") )
     return 0
   fi
 
   if [[ "$cur" == -* ]]; then
     if [[ "$cmd" == "rm" ]]; then
       COMPREPLY=( $(compgen -W "-r -f" -- "$cur") )
+    elif [[ "$cmd" == "park" ]]; then
+      COMPREPLY=( $(compgen -W "-p --project" -- "$cur") )
     else
-      COMPREPLY=( $(compgen -W "-r --from -h --help --completion --no-tmux --no-context --detach --big" -- "$cur") )
+      COMPREPLY=( $(compgen -W "-r -p --project --from -h --help --completion --no-tmux --no-context --detach --big" -- "$cur") )
     fi
     return 0
   fi
 
   if (( COMP_CWORD >= 2 )); then
-    COMPREPLY=( $(compgen -W "-r" -- "$cur") )
+    COMPREPLY=( $(compgen -W "-r -p" -- "$cur") )
   fi
 }
 
@@ -1182,8 +1336,9 @@ iwork() {
       fi
 
       folder="$2"
+      shift 2
       target="$(command "$_iwork_bin" --resolve-park-target-path "$folder")" || return $?
-      command "$_iwork_bin" ${notmux:+--no-tmux} park "$folder" || return $?
+      command "$_iwork_bin" ${notmux:+--no-tmux} park "$folder" "$@" || return $?
       if [[ -z "${TMUX:-}" || -n "$notmux" ]]; then
         builtin cd "$target" || return $?
       fi
@@ -1227,9 +1382,9 @@ iwork() {
 #compdef iwork
 
 _iwork() {
-  local -a repos folders
+  local -a repos folders projects
   local cmd="${words[2]:-}"
-  local folder="" word=""
+  local folder="" word="" sub=""
 
   if (( CURRENT == 2 )); then
     _values 'command' \
@@ -1240,6 +1395,12 @@ _iwork() {
       'cd[cd into a worktree folder or switch to its tmux window]' \
       'claude[open the task tmux window and run claude]' \
       'codex[open the task tmux window and run codex]' \
+      'project[manage the memory shared across a project'\''s tasks]' \
+      'todo[capture something that needs doing, but not in this PR]' \
+      'log[append one line to the project log]' \
+      'decided[record a decision in the project log]' \
+      'done[close a captured todo by id]' \
+      'drop[abandon a captured todo by id]' \
       'init[create the iwork config file]' \
       'install-hooks[install Claude Code status hooks]' \
       '--no-tmux[skip tmux window handling]' \
@@ -1251,7 +1412,58 @@ _iwork() {
     return 0
   fi
 
+  # -p takes a project name wherever it appears.
+  if [[ "${words[CURRENT-1]:-}" == "-p" || "${words[CURRENT-1]:-}" == "--project" ]]; then
+    projects=("${(@f)$("$_iwork_bin" --complete-projects "$PREFIX" 2>/dev/null)}")
+    _describe -t projects 'project' projects
+    return 0
+  fi
+
   case "$cmd" in
+    project)
+      sub="${words[3]:-}"
+      if (( CURRENT == 3 )); then
+        _values 'subcommand' \
+          'list[list projects]' \
+          'show[print goal, open todos, recent log and live tasks]' \
+          'grep[search the project memory]' \
+          'cat[print one file from the project memory]' \
+          'add[attach an existing task to a project]' \
+          'rm[detach a task, keeping the project memory]' \
+          'delete[delete a project and its memory]'
+        return 0
+      fi
+      case "$sub" in
+        show|grep|cat|delete)
+          if (( CURRENT == 4 )); then
+            projects=("${(@f)$("$_iwork_bin" --complete-projects "$PREFIX" 2>/dev/null)}")
+            _describe -t projects 'project' projects
+          fi
+          ;;
+        add|rm)
+          if (( CURRENT == 4 )); then
+            projects=("${(@f)$("$_iwork_bin" --complete-projects "$PREFIX" 2>/dev/null)}")
+            _describe -t projects 'project' projects
+          elif (( CURRENT == 5 )); then
+            folders=("${(@f)$("$_iwork_bin" --complete-worktree-folders "$PREFIX" 2>/dev/null)}")
+            _describe -t folders 'worktree folder' folders
+          fi
+          ;;
+      esac
+      return 0
+      ;;
+    todo|decided|done|drop)
+      _values 'option' '-p[project to write to]'
+      return 0
+      ;;
+    log)
+      _values 'option' \
+        '-p[project to write to]' \
+        '--decision[record a decision]' \
+        '--shipped[record something shipped]' \
+        '--note[record a plain note]'
+      return 0
+      ;;
     cd|claude|codex)
       if (( CURRENT == 3 )); then
         folders=("${(@f)$("$_iwork_bin" --complete-worktree-folders "$PREFIX" 2>/dev/null)}")
@@ -1308,7 +1520,9 @@ _iwork() {
   fi
 
   if (( CURRENT == 3 )); then
-    _values 'option' '-r[repos to create worktrees for]'
+    _values 'option' \
+      '-r[repos to create worktrees for]' \
+      '-p[project this task is part of]'
     return 0
   fi
 
@@ -1559,7 +1773,9 @@ You are working in an iwork task directory. It contains git worktrees of
 the repositories relevant to this task, all on branch `{{BRANCH}}`,
 branched from {{BASE}}:
 
+<!-- iwork:repos -->
 {{REPOS}}
+<!-- /iwork:repos -->
 
 ## Scope
 
@@ -1646,6 +1862,894 @@ commits on top."
     [[ -e "$target" ]] && continue
     printf '%s\n' "$rendered" > "$target" 2>/dev/null || warn "could not write $target"
   done
+}
+
+DEFAULT_PROJECT_TEMPLATE='## Project: {{PROJECT}}
+
+{{GOAL}}
+
+This task is one step in a longer effort spanning several tasks, repos and PRs.
+{{SEED}}
+**Run `iwork project show` first.** Before reading code, before answering, even
+when the request looks self-contained. It prints the goal, the open todos, what
+the sibling tasks are doing, and the decisions earlier tasks already made — so
+you do not re-litigate a settled question or redo finished work. The git log
+cannot tell you this: the reasoning was never committed.
+
+The project memory lives outside this task directory, and the scope rule above
+applies to it unchanged: **do not read, edit, search or `cd` into `.project/`.**
+It is a marker telling iwork which project this task belongs to, not a door.
+Everything you need from the project comes through these commands, which read a
+bounded view and append atomically even while sibling tasks are writing:
+
+- `iwork project show [-n N]` — goal, open todos, recent log, sibling tasks
+- `iwork project grep <pattern>` — search the whole project memory
+- `iwork project cat <path>` — read one file grep turned up, e.g. notes/api.md
+
+### Record as you go
+
+Single-line appends, cheap to run. Do them mid-task rather than at the end: by
+the end the reasoning is gone, and the reasoning is the part worth keeping.
+
+- Picked one approach over another? `iwork decided "chose X over Y because Z"`
+- Worked out *why* existing code is the way it is? `iwork decided "..."`
+- Changed how something works? `iwork decided "..."` before the turn ends
+- Hit something broken or missing that does not belong in this PR?
+  `iwork todo "..."` — capture it and move on, do not fix it here
+- Opened a PR? The URL is recorded for you. Use `iwork log --shipped "..."` only
+  to add what the URL alone does not say.
+
+PROJECT.md is curated by hand and is not yours to rewrite. If it has gone stale,
+say so instead of fixing it.'
+
+require_projects_dir() {
+  if [[ -z "$PROJECTS_DIR" ]]; then
+    die "IWORK_PROJECTS_DIR is not set and could not be derived. Add it to $IWORK_CONFIG_FILE:
+  IWORK_PROJECTS_DIR=\"\$IWORK_REPO_DIR/projects\""
+  fi
+}
+
+validate_project_name() {
+  local project="$1"
+
+  case "$project" in
+    -*)
+      # The name regex below allows '-', so without this '-p --from x' would
+      # quietly create a project called '--from'.
+      die "a project name is expected, got the flag '$project'"
+      ;;
+    ""|.|..|*/*|*\\*|*:* )
+      die "project '$project' must be a single directory name under ${PROJECTS_DIR:-the projects directory}"
+      ;;
+    \**|!* )
+      die "project '$project' must not start with '*' or '!'"
+      ;;
+  esac
+
+  if [[ ! "$project" =~ ^[A-Za-z0-9._-]+$ ]]; then
+    die "project '$project' contains unsupported characters"
+  fi
+}
+
+project_path() {
+  printf '%s\n' "$PROJECTS_DIR/$1"
+}
+
+project_exists() {
+  [[ -n "$PROJECTS_DIR" && -d "$PROJECTS_DIR/$1" ]]
+}
+
+list_projects() {
+  local prefix="${1:-}"
+  local path=""
+  local name=""
+
+  [[ -n "$PROJECTS_DIR" && -d "$PROJECTS_DIR" ]] || return 0
+
+  for path in "$PROJECTS_DIR"/*; do
+    [[ -d "$path" ]] || continue
+    name="${path##*/}"
+
+    if [[ "$name" == "$prefix"* ]]; then
+      printf '%s\n' "$name"
+    fi
+  done | sort
+}
+
+# A project and a task must not share a name: they would compete for the same
+# tmux window name, and the status hook would not know which directory it means.
+assert_project_name_free() {
+  local project="$1"
+
+  if [[ -n "$TASKS_DIR" && -d "$TASKS_DIR/$project" ]]; then
+    die "'$project' is already a task folder; a project cannot share a name with a task (rename one of them)"
+  fi
+}
+
+seed_project_template() {
+  local template_dir=""
+
+  [[ -f "$PROJECT_TEMPLATE" ]] && return 0
+
+  template_dir="$(dirname "$PROJECT_TEMPLATE")"
+  if ! mkdir -p "$template_dir" 2>/dev/null; then
+    warn "could not create template directory $template_dir"
+    return 1
+  fi
+  if ! printf '%s\n' "$DEFAULT_PROJECT_TEMPLATE" > "$PROJECT_TEMPLATE" 2>/dev/null; then
+    warn "could not write default template $PROJECT_TEMPLATE"
+    return 1
+  fi
+  return 0
+}
+
+create_project() {
+  local project="$1"
+  local dir=""
+
+  validate_project_name "$project"
+  require_projects_dir
+  assert_project_name_free "$project"
+
+  dir="$PROJECTS_DIR/$project"
+  mkdir -p "$dir/notes" || die "could not create $dir"
+
+  if [[ ! -f "$dir/PROJECT.md" ]]; then
+    cat > "$dir/PROJECT.md" <<EOF || die "could not write $dir/PROJECT.md"
+# $project
+
+One line on what this project is for — replace this.
+
+## Where we are
+
+_Nothing recorded yet._
+
+## Constraints and decisions that stick
+
+-
+EOF
+  fi
+
+  if [[ ! -f "$dir/LOG.md" ]]; then
+    cat > "$dir/LOG.md" <<EOF || die "could not write $dir/LOG.md"
+# Log — $project
+
+Append-only, one line per entry, written by \`iwork log\` / \`iwork decided\` and
+by task lifecycle events. Do not rewrite past entries; add a new one.
+EOF
+  fi
+
+  if [[ ! -f "$dir/TODO.md" ]]; then
+    cat > "$dir/TODO.md" <<EOF || die "could not write $dir/TODO.md"
+# Todo — $project
+
+Captured with \`iwork todo\` from inside a task, so each line records where it
+surfaced. Close with \`iwork done <id>\`, abandon with \`iwork drop <id>\`.
+EOF
+  fi
+
+  if [[ ! -f "$dir/history.tsv" ]]; then
+    printf '# timestamp\tevent\ttask\trepos\tref\tnote\n' > "$dir/history.tsv" ||
+      die "could not write $dir/history.tsv"
+  fi
+
+  if [[ ! -f "$dir/notes/.keep" ]]; then
+    : > "$dir/notes/.keep" 2>/dev/null || true
+  fi
+}
+
+ensure_project() {
+  local project="$1"
+
+  validate_project_name "$project"
+  require_projects_dir
+
+  project_exists "$project" && return 0
+
+  assert_project_name_free "$project"
+  confirm_new_project "$project" || die "aborted"
+  create_project "$project"
+  echo "Created project '$project' at $PROJECTS_DIR/$project"
+}
+
+confirm_new_project() {
+  local project="$1"
+  local existing=""
+  local name=""
+
+  existing="$(list_projects)"
+
+  echo "Project '$project' does not exist yet."
+  if [[ -n "$existing" ]]; then
+    echo "Existing projects:"
+    while IFS= read -r name; do
+      [[ -n "$name" ]] && echo "  $name"
+    done <<< "$existing"
+  fi
+
+  confirm "Create project '$project'?"
+}
+
+project_goal() {
+  local file=""
+  local line=""
+
+  file="$PROJECTS_DIR/$1/PROJECT.md"
+  [[ -f "$file" ]] || return 0
+
+  while IFS= read -r line; do
+    [[ -n "$line" ]] || continue
+    case "$line" in \#*) continue ;; esac
+    printf '%s\n' "$line"
+    return 0
+  done < "$file"
+}
+
+# The task folder we are standing in, if any: a direct child of TASKS_DIR on the
+# way up from $PWD. -ef rather than string comparison, so a symlinked TMPDIR or
+# tasks dir still matches.
+task_root_from_cwd() {
+  local dir="$PWD"
+  local parent=""
+
+  [[ -n "$TASKS_DIR" && -d "$TASKS_DIR" ]] || return 1
+
+  while [[ -n "$dir" && "$dir" != "/" ]]; do
+    parent="${dir%/*}"
+    [[ -n "$parent" ]] || parent="/"
+
+    if [[ -d "$parent" && "$parent" -ef "$TASKS_DIR" ]]; then
+      printf '%s\n' "${dir##*/}"
+      return 0
+    fi
+
+    dir="$parent"
+  done
+
+  return 1
+}
+
+task_project_name() {
+  local task="$1"
+  local link="$TASKS_DIR/$task/.project"
+  local target=""
+
+  [[ -L "$link" ]] || return 1
+  target="$(readlink "$link" 2>/dev/null)" || return 1
+  target="${target%/}"
+  [[ -n "$target" ]] || return 1
+
+  printf '%s\n' "${target##*/}"
+}
+
+task_repos_csv() {
+  local task="$1"
+  local wt=""
+  local csv=""
+
+  while IFS= read -r wt; do
+    [[ -n "$wt" ]] || continue
+    csv="${csv:+$csv,}${wt##*/}"
+  done < <(list_task_worktrees "$TASKS_DIR/$task")
+
+  printf '%s\n' "$csv"
+}
+
+RESOLVED_PROJECT=""
+RESOLVED_TASK=""
+
+# Project resolution order: explicit flag, then IWORK_PROJECT, then the .project
+# link of the task we are standing in. The last one is what lets an agent run
+# 'iwork todo "..."' with no arguments at all.
+resolve_project_context() {
+  local explicit="${1:-}"
+
+  require_config
+  require_projects_dir
+
+  RESOLVED_PROJECT=""
+  RESOLVED_TASK="$(task_root_from_cwd || true)"
+
+  if [[ -n "$explicit" ]]; then
+    validate_project_name "$explicit"
+    RESOLVED_PROJECT="$explicit"
+  elif [[ -n "${IWORK_PROJECT:-}" ]]; then
+    validate_project_name "$IWORK_PROJECT"
+    RESOLVED_PROJECT="$IWORK_PROJECT"
+  else
+    if [[ -z "$RESOLVED_TASK" ]]; then
+      die "not inside an iwork task; pass -p <project> or set IWORK_PROJECT"
+    fi
+    RESOLVED_PROJECT="$(task_project_name "$RESOLVED_TASK" || true)"
+    if [[ -z "$RESOLVED_PROJECT" ]]; then
+      die "task '$RESOLVED_TASK' is not attached to a project.
+  Attach it:  iwork project add <project> $RESOLVED_TASK
+  Or target one explicitly with -p <project>"
+    fi
+  fi
+
+  project_exists "$RESOLVED_PROJECT" ||
+    die "no such project: $RESOLVED_PROJECT (see 'iwork project list')"
+}
+
+link_task_project() {
+  local task="$1"
+  local project="$2"
+  local link="$TASKS_DIR/$task/.project"
+  local existing=""
+
+  if [[ -L "$link" ]]; then
+    existing="$(task_project_name "$task" || true)"
+    [[ "$existing" == "$project" ]] && return 0
+    die "task '$task' is already attached to project '${existing:-unknown}'; a task belongs to one project.
+  Detach it first:  iwork project rm ${existing:-<project>} $task"
+  fi
+
+  [[ -e "$link" ]] && die "$link already exists and is not a symlink"
+
+  ln -s "$PROJECTS_DIR/$project" "$link" || die "could not create $link"
+}
+
+# Replaces the <!-- iwork:MARKER --> ... <!-- /iwork:MARKER --> block in $file
+# with $content, appending it if absent and removing it when $content is empty.
+# Everything outside the markers is preserved byte for byte, which is what lets
+# one code path serve creation, retrofit, refresh and detach.
+replace_marked_block() {
+  local file="$1"
+  local marker="$2"
+  local content="$3"
+  local open="<!-- iwork:$marker -->"
+  local close="<!-- /iwork:$marker -->"
+  local tmp="$file.iwork.$$"
+  local line=""
+  local inside=""
+  local replaced=""
+
+  [[ -f "$file" ]] || return 1
+  : > "$tmp" 2>/dev/null || return 1
+
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    if [[ -z "$inside" && "$line" == "$open" ]]; then
+      inside=1
+      replaced=1
+      continue
+    fi
+    if [[ -n "$inside" ]]; then
+      if [[ "$line" == "$close" ]]; then
+        inside=""
+        [[ -n "$content" ]] && printf '%s\n%s\n%s\n' "$open" "$content" "$close" >> "$tmp"
+      fi
+      continue
+    fi
+    printf '%s\n' "$line" >> "$tmp"
+  done < "$file"
+
+  # An unterminated open marker means the rest of the file was inside the block.
+  if [[ -n "$inside" && -n "$content" ]]; then
+    printf '%s\n%s\n%s\n' "$open" "$content" "$close" >> "$tmp"
+  fi
+
+  if [[ -z "$replaced" && -n "$content" ]]; then
+    printf '\n%s\n%s\n%s\n' "$open" "$content" "$close" >> "$tmp"
+  fi
+
+  mv "$tmp" "$file" 2>/dev/null || { rm -f "$tmp"; return 1; }
+}
+
+strip_marked_block() {
+  replace_marked_block "$1" "$2" ""
+}
+
+render_project_block() {
+  local project="$1"
+  local task="$2"
+  local branch="$3"
+  local seed="${4:-}"
+  local template=""
+  local goal=""
+  local rendered=""
+
+  template="$(cat "$PROJECT_TEMPLATE" 2>/dev/null || true)"
+  [[ -n "$template" ]] || return 1
+
+  goal="$(project_goal "$project")"
+  [[ -n "$seed" ]] && seed="
+$seed
+"
+
+  rendered="$template"
+  rendered="${rendered//\{\{PROJECT\}\}/$project}"
+  rendered="${rendered//\{\{GOAL\}\}/$goal}"
+  rendered="${rendered//\{\{TASK\}\}/$task}"
+  rendered="${rendered//\{\{BRANCH\}\}/$branch}"
+  rendered="${rendered//\{\{SEED\}\}/$seed}"
+
+  printf '%s\n' "$rendered"
+}
+
+write_project_block() {
+  local task="$1"
+  local project="$2"
+  local branch="$3"
+  local seed="${4:-}"
+  local content=""
+  local target=""
+  local wrote=""
+
+  seed_project_template || return 0
+
+  if ! content="$(render_project_block "$project" "$task" "$branch" "$seed")"; then
+    warn "project context template is empty: $PROJECT_TEMPLATE"
+    return 0
+  fi
+
+  for target in "$TASKS_DIR/$task/CLAUDE.md" "$TASKS_DIR/$task/AGENTS.md"; do
+    [[ -f "$target" ]] || continue
+    if replace_marked_block "$target" project "$content"; then
+      wrote=1
+    else
+      warn "could not update $target"
+    fi
+  done
+
+  if [[ -z "$wrote" ]]; then
+    warn "no CLAUDE.md/AGENTS.md in task '$task'; the agent will not be told about project '$project'"
+    warn "  (created with --no-context? drop the flag, or write the files yourself)"
+  fi
+}
+
+# Regenerates the generated blocks in a task's context files. Called after any
+# change to the task's shape, which is also the long-standing bug this fixes:
+# add-repo used to leave the repo list in CLAUDE.md stale forever.
+refresh_task_blocks() {
+  local task="$1"
+  local branch="$2"
+  local folder_path="$TASKS_DIR/$task"
+  local repos_list=""
+  local child=""
+  local target=""
+  local project=""
+
+  [[ -d "$folder_path" ]] || return 0
+
+  for child in "$folder_path"/*; do
+    [[ -d "$child" ]] || continue
+    repos_list="${repos_list:+$repos_list
+}${child##*/}"
+  done
+
+  for target in "$folder_path/CLAUDE.md" "$folder_path/AGENTS.md"; do
+    [[ -f "$target" ]] || continue
+    # Templates seeded before markers existed have nothing to refresh.
+    grep -q "<!-- iwork:repos -->" "$target" 2>/dev/null || continue
+    replace_marked_block "$target" repos "$repos_list" || warn "could not refresh $target"
+  done
+
+  project="$(task_project_name "$task" || true)"
+  if [[ -n "$project" ]] && project_exists "$project"; then
+    write_project_block "$task" "$project" "$branch"
+  fi
+}
+
+attach_task_to_project() {
+  local task="$1"
+  local project="$2"
+  local branch="$3"
+  local seed="${4:-}"
+  local already=""
+
+  validate_worktree_folder_name "$task"
+  validate_project_name "$project"
+  require_projects_dir
+  [[ -d "$TASKS_DIR/$task" ]] || die "no such task: $task"
+
+  ensure_project "$project"
+
+  already="$(task_project_name "$task" || true)"
+  link_task_project "$task" "$project"
+  write_project_block "$task" "$project" "$branch" "$seed"
+
+  if [[ -z "$already" ]]; then
+    append_history "$project" opened "$task" "$(task_repos_csv "$task")" "$branch" ""
+    echo "Task '$task' joined project '$project'"
+  else
+    echo "Task '$task' is already in project '$project' (context refreshed)"
+  fi
+}
+
+detach_task_from_project() {
+  local project="$1"
+  local task="$2"
+  local attached=""
+  local target=""
+
+  validate_worktree_folder_name "$task"
+  validate_project_name "$project"
+  [[ -d "$TASKS_DIR/$task" ]] || die "no such task: $task"
+
+  attached="$(task_project_name "$task" || true)"
+  [[ -n "$attached" ]] || die "task '$task' is not attached to any project"
+  [[ "$attached" == "$project" ]] ||
+    die "task '$task' is attached to project '$attached', not '$project'"
+
+  rm -f "$TASKS_DIR/$task/.project" || die "could not remove $TASKS_DIR/$task/.project"
+
+  for target in "$TASKS_DIR/$task/CLAUDE.md" "$TASKS_DIR/$task/AGENTS.md"; do
+    [[ -f "$target" ]] || continue
+    strip_marked_block "$target" project || warn "could not update $target"
+  done
+
+  echo "Detached '$task' from project '$project'. Project memory was left intact."
+}
+
+delete_project() {
+  local project="$1"
+  local force="$2"
+  local attached=""
+  local task=""
+
+  validate_project_name "$project"
+  project_exists "$project" || die "no such project: $project"
+
+  while IFS= read -r task; do
+    [[ -n "$task" ]] || continue
+    [[ "$(task_project_name "$task" || true)" == "$project" ]] && attached="${attached:+$attached }$task"
+  done < <(list_worktree_folders)
+
+  if [[ -n "$attached" ]]; then
+    die "project '$project' still has tasks attached: $attached
+  Detach them first, or remove those tasks."
+  fi
+
+  if [[ -z "$force" ]]; then
+    die "refusing to delete the memory for '$project'; re-run with -f if you mean it"
+  fi
+
+  echo "This deletes $PROJECTS_DIR/$project and everything in it:"
+  echo "  PROJECT.md, LOG.md, TODO.md, history.tsv, notes/"
+  confirm "Proceed?" || die "aborted"
+
+  rm -rf "${PROJECTS_DIR:?}/${project:?}" || die "could not remove $PROJECTS_DIR/$project"
+  echo "Deleted project '$project'"
+}
+
+# --- capture -----------------------------------------------------------------
+
+oneline() {
+  local text="$1"
+
+  text="${text//$'\r'/ }"
+  text="${text//$'\n'/ }"
+  text="${text//$'\t'/ }"
+  printf '%s' "$text"
+}
+
+# Derived from the text, the clock and the pid rather than from scanning
+# TODO.md: that is what keeps capture a pure append with no read and no lock.
+new_todo_id() {
+  local text="$1"
+  local sum=""
+
+  sum="$(printf '%s|%s|%s' "$text" "$(date +%s)" "$$" | cksum | awk '{print $1}')"
+  printf 't%04x' "$(( sum % 65536 ))"
+}
+
+validate_todo_id() {
+  [[ "$1" =~ ^t[0-9a-f]{1,8}$ ]] || die "'$1' is not a todo id (expected something like t1a2f)"
+}
+
+PROJECT_LOCK_DIR=""
+
+# Only the rewrite paths take this. mkdir is the atomic primitive available
+# everywhere; flock(1) is not on macOS.
+project_lock() {
+  local project="$1"
+  local dir="$PROJECTS_DIR/$project/.lock"
+  local waited=0
+  local pid=""
+
+  while ! mkdir "$dir" 2>/dev/null; do
+    pid="$(cat "$dir/pid" 2>/dev/null || true)"
+
+    # A killed agent leaves the lockdir behind; its pid is the tell.
+    if [[ -n "$pid" ]] && ! kill -0 "$pid" 2>/dev/null; then
+      rm -rf "$dir" 2>/dev/null || true
+      continue
+    fi
+
+    waited=$((waited + 1))
+
+    # No pid after a second: the holder died between mkdir and writing it.
+    if [[ -z "$pid" ]] && (( waited > 10 )); then
+      rm -rf "$dir" 2>/dev/null || true
+      continue
+    fi
+
+    if (( waited > 40 )); then
+      warn "could not acquire the lock for project '$project' after 4s"
+      return 1
+    fi
+
+    sleep 0.1
+  done
+
+  printf '%s\n' "$$" > "$dir/pid" 2>/dev/null || true
+  PROJECT_LOCK_DIR="$dir"
+  trap 'project_unlock' EXIT
+  return 0
+}
+
+project_unlock() {
+  [[ -n "$PROJECT_LOCK_DIR" ]] || return 0
+  rm -rf "$PROJECT_LOCK_DIR" 2>/dev/null || true
+  PROJECT_LOCK_DIR=""
+}
+
+append_log() {
+  local project="$1"
+  local task="$2"
+  local kind="$3"
+  local text="$4"
+
+  text="$(oneline "$text")"
+  [[ -n "$text" ]] || die "nothing to log"
+
+  # One short line, one printf: O_APPEND makes this atomic, so parallel agents
+  # cannot interleave and capture never waits on a lock.
+  printf -- '- %s  %s  %s: %s\n' "$(date +%Y-%m-%d)" "${task:-unknown}" "$kind" "$text" \
+    >> "$PROJECTS_DIR/$project/LOG.md" || die "could not append to LOG.md"
+}
+
+append_todo() {
+  local project="$1"
+  local task="$2"
+  local text="$3"
+  local id=""
+
+  text="$(oneline "$text")"
+  [[ -n "$text" ]] || die "nothing to capture"
+
+  id="$(new_todo_id "$text")"
+  printf -- '- [ ] (%s) %s — from %s, %s\n' \
+    "$id" "$text" "${task:-unknown}" "$(date +%Y-%m-%d)" \
+    >> "$PROJECTS_DIR/$project/TODO.md" || die "could not append to TODO.md"
+
+  printf '%s\n' "$id"
+}
+
+append_history() {
+  local project="$1"
+  local event="$2"
+  local task="$3"
+  # Not 'repos': that name is the global array the worktree code fills.
+  local repos_csv="$4"
+  local ref="$5"
+  local note="$6"
+
+  printf '%s\t%s\t%s\t%s\t%s\t%s\n' \
+    "$(date +%Y-%m-%dT%H:%M:%S%z)" "$event" "$(oneline "$task")" \
+    "$(oneline "$repos_csv")" "$(oneline "$ref")" "$(oneline "$note")" \
+    >> "$PROJECTS_DIR/$project/history.tsv" || warn "could not append to history.tsv"
+}
+
+flip_todo() {
+  local project="$1"
+  local id="$2"
+  local mark="$3"
+  local file="$PROJECTS_DIR/$project/TODO.md"
+  local matches=()
+  local match=""
+  local target=0
+  local tmp=""
+  local line=""
+  local rest=""
+  local n=0
+
+  [[ -f "$file" ]] || die "no TODO.md in project '$project'"
+  validate_todo_id "$id"
+
+  while IFS= read -r match; do
+    [[ -n "$match" ]] && matches+=("$match")
+  done < <(grep -n "^- \[.\] ($id)" "$file" 2>/dev/null || true)
+
+  if (( ${#matches[@]} == 0 )); then
+    while IFS= read -r match; do
+      [[ -n "$match" ]] && matches+=("$match")
+    done < <(grep -n "^- \[.\] (${id}[0-9a-f]*)" "$file" 2>/dev/null || true)
+  fi
+
+  (( ${#matches[@]} > 0 )) || die "no todo with id '$id' in project '$project'"
+  (( ${#matches[@]} == 1 )) ||
+    die "id '$id' matches ${#matches[@]} todos; use the full id"
+
+  target="${matches[0]%%:*}"
+
+  project_lock "$project" || die "project '$project' is locked; nothing was changed"
+
+  tmp="$file.iwork.$$"
+  : > "$tmp" || { project_unlock; die "could not write $tmp"; }
+
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    n=$((n + 1))
+    if (( n == target )); then
+      rest="${line#*\]}"
+      printf -- '- [%s]%s\n' "$mark" "$rest" >> "$tmp"
+    else
+      printf '%s\n' "$line" >> "$tmp"
+    fi
+  done < "$file"
+
+  if ! mv "$tmp" "$file" 2>/dev/null; then
+    rm -f "$tmp"
+    project_unlock
+    die "could not update $file"
+  fi
+
+  project_unlock
+}
+
+project_tasks_live() {
+  local project="$1"
+  local folder=""
+
+  while IFS= read -r folder; do
+    [[ -n "$folder" ]] || continue
+    [[ "$(task_project_name "$folder" || true)" == "$project" ]] && printf '%s\n' "$folder"
+  done < <(list_worktree_folders)
+}
+
+# Tasks known only from history.tsv: last event per task, in the order they
+# first appear, minus the ones that still exist on disk. A task deleted outside
+# iwork stops being live but must not stop being remembered.
+project_history_tasks() {
+  local project="$1"
+  local dir="$PROJECTS_DIR/$project"
+  local live=""
+  local folder=""
+
+  while IFS= read -r folder; do
+    [[ -n "$folder" ]] && live="$live $folder "
+  done < <(project_tasks_live "$project")
+
+  awk -F'\t' -v live="$live" '
+    /^#/ { next }
+    NF >= 5 && $3 != "" {
+      event[$3] = $2
+      ref[$3] = $5
+      if (!($3 in seen)) { seen[$3] = 1; order[++n] = $3 }
+    }
+    END {
+      for (i = 1; i <= n; i++) {
+        t = order[i]
+        if (index(live, " " t " ") > 0) continue
+        printf "%s\t%s\t%s\n", t, event[t], ref[t]
+      }
+    }
+  ' "$dir/history.tsv" 2>/dev/null
+}
+
+project_show() {
+  local project="$1"
+  local dir="$PROJECTS_DIR/$project"
+  local goal=""
+  local line=""
+  local status=""
+  local found=""
+  local total=0
+  local since=0
+
+  goal="$(project_goal "$project")"
+
+  echo "Project: $project"
+  echo "  $dir"
+  if [[ -n "$goal" ]]; then
+    echo ""
+    echo "  $goal"
+  fi
+
+  echo ""
+  echo "Tasks (live):"
+  found=""
+  while IFS= read -r line; do
+    [[ -n "$line" ]] || continue
+    found=1
+    status=""
+    tmux_enabled && status="$(task_status "$line")"
+    if [[ -n "$status" ]]; then
+      printf '  %s  %s\n' "$line" "$status"
+    else
+      printf '  %s\n' "$line"
+    fi
+  done < <(project_tasks_live "$project")
+  [[ -n "$found" ]] || echo "  (none)"
+
+  echo ""
+  echo "Open todos:"
+  found=""
+  while IFS= read -r line; do
+    [[ -n "$line" ]] || continue
+    found=1
+    printf '  %s\n' "${line#- \[ \] }"
+  done < <(grep '^- \[ \] ' "$dir/TODO.md" 2>/dev/null || true)
+  [[ -n "$found" ]] || echo "  (none)"
+
+  total="$(grep -c '^- ' "$dir/LOG.md" 2>/dev/null || true)"
+  total="${total:-0}"
+  echo ""
+  if (( total > SHOW_LOG_LINES )); then
+    echo "Log (last $SHOW_LOG_LINES of $total):"
+  else
+    echo "Log:"
+  fi
+  found=""
+  while IFS= read -r line; do
+    [[ -n "$line" ]] || continue
+    found=1
+    printf '  %s\n' "${line#- }"
+  done < <(grep '^- ' "$dir/LOG.md" 2>/dev/null | tail -n "$SHOW_LOG_LINES" || true)
+  [[ -n "$found" ]] || echo "  (nothing recorded yet)"
+
+  echo ""
+  echo "Past tasks:"
+  found=""
+  while IFS=$'\t' read -r line status rest; do
+    [[ -n "$line" ]] || continue
+    found=1
+    printf '  %s  %s  %s\n' "$line" "$status" "$rest"
+  done < <(project_history_tasks "$project" | tail -n "$SHOW_LOG_LINES")
+  [[ -n "$found" ]] || echo "  (none yet)"
+  echo "  full history: $dir/history.tsv"
+
+  # Entries since the last checkpoint. Without a nudge, a long project quietly
+  # pushes its early decisions out of the window this command prints.
+  since="$(awk '/^- .*checkpoint:/ { n = 0; next } /^- / { n++ } END { print n + 0 }' \
+    "$dir/LOG.md" 2>/dev/null || true)"
+  since="${since:-0}"
+  if (( since > CHECKPOINT_NUDGE_AFTER )); then
+    echo ""
+    echo "  Note: $since log entries since the last checkpoint. Consider condensing"
+    echo "  the older ones into PROJECT.md's 'Where we are' so they stay visible here."
+  fi
+}
+
+# The read counterpart to project_grep. Without it an agent that is told not to
+# touch .project/ has no way to open a file grep just pointed it at.
+project_cat() {
+  local project="$1"
+  local rel="$2"
+  local target=""
+
+  [[ -n "$rel" ]] || die "usage: iwork project cat <path-inside-the-project>"
+
+  # /$rel/ makes both leading-slash and any '..' component a single glob test,
+  # without rejecting an innocent name like 'v1..2.md'.
+  case "/$rel/" in
+    *//*|*/../*)
+      die "path must be relative to the project directory and must not contain '..': $rel"
+      ;;
+  esac
+
+  target="$PROJECTS_DIR/$project/$rel"
+  [[ -f "$target" ]] || die "no such file in project '$project': $rel"
+
+  cat "$target"
+}
+
+project_grep() {
+  local project="$1"
+  local dir="$PROJECTS_DIR/$project"
+
+  shift
+  (( $# > 0 )) || die "usage: iwork project grep <pattern> [ripgrep-args...]"
+
+  # cd into the real directory rather than going through the task's .project
+  # link: that link is both hidden and a symlink, so recursive search from a
+  # task root skips it twice over. This is the whole reason this verb exists.
+  if command -v rg >/dev/null 2>&1; then
+    ( cd "$dir" && rg --hidden --glob '!.lock' --glob '!.git' -n -- "$@" . )
+  else
+    ( cd "$dir" && grep -RIn --exclude-dir=.lock --exclude-dir=.git -- "$@" . )
+  fi
 }
 
 open_task_window() {
@@ -1824,23 +2928,90 @@ extend_task_session() {
   return 0
 }
 
-handle_claude_hook() {
-  local input=""
-  local event=""
+HOOK_TASK=""
+HOOK_PROJECT=""
+
+# Which task and project the hook fired in, from its working directory. Silent
+# and non-fatal throughout: a hook must never break a session, so every path out
+# of here is a plain 'return 1' that the callers treat as "nothing to do".
+hook_project_context() {
+  HOOK_TASK=""
+  HOOK_PROJECT=""
+
+  [[ -n "$TASKS_DIR" && -n "$PROJECTS_DIR" ]] || return 1
+
+  HOOK_TASK="$(task_root_from_cwd 2>/dev/null || true)"
+  [[ -n "$HOOK_TASK" ]] || return 1
+
+  HOOK_PROJECT="$(task_project_name "$HOOK_TASK" 2>/dev/null || true)"
+  [[ -n "$HOOK_PROJECT" ]] || return 1
+
+  project_exists "$HOOK_PROJECT" || return 1
+  return 0
+}
+
+# Stdout becomes context, so the agent starts already knowing the project state
+# instead of having to decide to go and look.
+hook_session_start() {
+  hook_project_context || return 0
+
+  echo "iwork: this task belongs to project '$HOOK_PROJECT'. Its shared memory:"
+  echo ""
+  project_show "$HOOK_PROJECT" 2>/dev/null || true
+  echo ""
+  echo "Do not read, edit or search .project/ directly; it is outside this task."
+  echo "Use 'iwork project show|grep|cat' to read it, and record as you work:"
+  echo "  iwork decided \"<what you settled and why>\""
+  echo "  iwork todo \"<needs doing, but not in this PR>\""
+}
+
+# Fires exactly when the reasoning is about to be dropped, which is the one
+# moment a reminder to write it down is unambiguously worth its noise.
+hook_pre_compact() {
+  hook_project_context || return 0
+
+  echo "iwork: this context is about to be compacted. Anything you worked out in"
+  echo "project '$HOOK_PROJECT' that is not in the log yet will be lost with it."
+  echo "  iwork decided \"<what you settled and why>\""
+  echo "  iwork todo \"<needs doing, but not in this PR>\""
+  echo "Nothing worth keeping? Then record nothing — a padded log is worse."
+}
+
+# A PR URL is a fact, not a judgement call, so it does not need the agent to
+# remember anything.
+hook_post_tool_use() {
+  local input="$1"
+  local url=""
+
+  case "$input" in
+    *"pr create"*) ;;
+    *) return 0 ;;
+  esac
+
+  url="$(printf '%s' "$input" |
+    grep -o 'https://github\.com/[A-Za-z0-9._-]*/[A-Za-z0-9._-]*/pull/[0-9][0-9]*' |
+    head -1 || true)"
+  [[ -n "$url" ]] || return 0
+
+  hook_project_context || return 0
+
+  # The payload can be seen more than once; never log the same PR twice.
+  if grep -qF "$url" "$PROJECTS_DIR/$HOOK_PROJECT/LOG.md" 2>/dev/null; then
+    return 0
+  fi
+
+  append_log "$HOOK_PROJECT" "$HOOK_TASK" shipped "$url" 2>/dev/null || return 0
+  echo "iwork: recorded $url in project '$HOOK_PROJECT'"
+}
+
+mark_task_window() {
+  local event="$1"
   local window_name=""
   local base=""
   local marker=""
 
-  [[ -n "${TMUX:-}" && -n "${TMUX_PANE:-}" ]] || exit 0
-  [[ -n "$TASKS_DIR" ]] || exit 0
-
-  input="$(cat 2>/dev/null || true)"
-  event="$(printf '%s' "$input" | sed -n 's/.*"hook_event_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' || true)"
-  [[ -n "$event" ]] || exit 0
-
-  window_name="$(tmux display-message -p -t "$TMUX_PANE" '#{window_name}' 2>/dev/null)" || exit 0
-  base="${window_name#[*!]}"
-  [[ -n "$base" && -d "$TASKS_DIR/$base" ]] || exit 0
+  [[ -n "${TMUX:-}" && -n "${TMUX_PANE:-}" ]] || return 0
+  [[ -n "$TASKS_DIR" ]] || return 0
 
   case "$event" in
     UserPromptSubmit)
@@ -1850,14 +3021,48 @@ handle_claude_hook() {
       marker='!'
       ;;
     *)
-      exit 0
+      return 0
       ;;
   esac
+
+  window_name="$(tmux display-message -p -t "$TMUX_PANE" '#{window_name}' 2>/dev/null)" || return 0
+  base="${window_name#[*!]}"
+  [[ -n "$base" ]] || return 0
+  if [[ ! -d "$TASKS_DIR/$base" ]]; then
+    [[ -n "$PROJECTS_DIR" && -d "$PROJECTS_DIR/$base" ]] || return 0
+  fi
 
   if [[ "$window_name" != "${marker}${base}" ]]; then
     tmux rename-window -t "$TMUX_PANE" "${marker}${base}" 2>/dev/null || true
   fi
+}
 
+handle_claude_hook() {
+  local input=""
+  local event=""
+
+  input="$(cat 2>/dev/null || true)"
+  event="$(printf '%s' "$input" |
+    sed -n 's/.*"hook_event_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' |
+    head -1 || true)"
+  [[ -n "$event" ]] || exit 0
+
+  case "$event" in
+    SessionStart)
+      hook_session_start || true
+      exit 0
+      ;;
+    PreCompact)
+      hook_pre_compact || true
+      exit 0
+      ;;
+    PostToolUse)
+      hook_post_tool_use "$input" || true
+      exit 0
+      ;;
+  esac
+
+  mark_task_window "$event" || true
   exit 0
 }
 
@@ -1924,7 +3129,17 @@ import sys
 
 settings_path = sys.argv[1]
 cmd = sys.argv[2]
-events = ["UserPromptSubmit", "Stop", "Notification"]
+
+# (event, matcher). The first three keep tmux window names in sync; the rest
+# feed project memory to the agent and record PRs without being asked.
+events = [
+    ("UserPromptSubmit", None),
+    ("Stop", None),
+    ("Notification", None),
+    ("SessionStart", None),
+    ("PreCompact", None),
+    ("PostToolUse", "Bash"),
+]
 
 data = {}
 if os.path.exists(settings_path):
@@ -1933,7 +3148,7 @@ if os.path.exists(settings_path):
 
 hooks = data.setdefault("hooks", {})
 to_add = []
-for ev in events:
+for ev, matcher in events:
     entries = hooks.setdefault(ev, [])
     present = any(
         h.get("command") == cmd
@@ -1941,15 +3156,16 @@ for ev in events:
         for h in entry.get("hooks", [])
     )
     if not present:
-        to_add.append(ev)
+        to_add.append((ev, matcher))
 
 if not to_add:
     print(f"iwork hook already installed for all events in {settings_path}")
     sys.exit(0)
 
 print(f"Will add to {settings_path}:")
-for ev in to_add:
-    print(f'  {ev}: {{"type": "command", "command": "{cmd}"}}')
+for ev, matcher in to_add:
+    where = f' (matcher: {matcher})' if matcher else ""
+    print(f'  {ev}{where}: {{"type": "command", "command": "{cmd}"}}')
 
 if os.environ.get("IWORK_ASSUME_YES") != "1":
     try:
@@ -1961,8 +3177,11 @@ if os.environ.get("IWORK_ASSUME_YES") != "1":
     if answer != "y":
         sys.exit("aborted")
 
-for ev in to_add:
-    hooks[ev].append({"hooks": [{"type": "command", "command": cmd}]})
+for ev, matcher in to_add:
+    entry = {"hooks": [{"type": "command", "command": cmd}]}
+    if matcher:
+        entry["matcher"] = matcher
+    hooks[ev].append(entry)
 
 settings_dir = os.path.dirname(settings_path)
 if settings_dir:
@@ -1978,6 +3197,220 @@ else:
 os.replace(tmp_path, settings_path)
 print(f"Updated {settings_path}")
 PY
+}
+
+PROJECT_FLAG=""
+
+# Accepts -p/--project in any position, so both of these work:
+#   iwork feat/x -r api web -p myproj
+#   iwork feat/x -p myproj -r api web
+parse_task_args() {
+  local seen_r=""
+
+  repos=()
+  PROJECT_FLAG=""
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -r)
+        seen_r=1
+        shift
+        ;;
+      -p|--project)
+        [[ $# -ge 2 ]] || die "expected a project name after $1"
+        PROJECT_FLAG="$2"
+        validate_project_name "$PROJECT_FLAG"
+        shift 2
+        ;;
+      --from)
+        # Handled here rather than stripped before the parser, so --from, -p and
+        # -r can appear in any order and there is one parser rather than two.
+        [[ $# -ge 2 ]] || die "--from needs a task or branch name"
+        BASE_SPEC="$2"
+        validate_base_spec "$BASE_SPEC"
+        shift 2
+        ;;
+      -*)
+        die "unknown option '$1'"
+        ;;
+      *)
+        [[ -n "$seen_r" ]] || die "expected -r <repos> after the branch name"
+        repos+=("$1")
+        shift
+        ;;
+    esac
+  done
+
+  [[ -n "$seen_r" ]] || die "expected -r <repos> after the branch name"
+  (( ${#repos[@]} > 0 )) || die "specify at least one repo after -r"
+}
+
+cmd_project() {
+  local sub="${1:-}"
+  local proj=""
+  local task=""
+  local branch=""
+  local force=""
+  local count=""
+  local rc=0
+
+  shift || true
+
+  case "$sub" in
+    list)
+      require_config
+      require_projects_dir
+      list_projects
+      ;;
+    show)
+      while [[ $# -gt 0 ]]; do
+        case "$1" in
+          -n)
+            count="${2:-}"
+            [[ "$count" =~ ^[1-9][0-9]*$ ]] || die "-n needs a positive number"
+            shift 2
+            ;;
+          -*) die "unknown option '$1'" ;;
+          *)
+            [[ -z "$proj" ]] || die "usage: iwork project show [-n <count>] [<project>]"
+            proj="$1"
+            shift
+            ;;
+        esac
+      done
+      resolve_project_context "$proj"
+      [[ -n "$count" ]] && SHOW_LOG_LINES="$count"
+      project_show "$RESOLVED_PROJECT"
+      ;;
+    cat)
+      if [[ "${1:-}" == "-p" || "${1:-}" == "--project" ]]; then
+        proj="${2:-}"
+        [[ -n "$proj" ]] || die "expected a project name after $1"
+        shift 2
+      fi
+      [[ $# -eq 1 ]] || die "usage: iwork project cat [-p <project>] <path-inside-the-project>"
+      resolve_project_context "$proj"
+      project_cat "$RESOLVED_PROJECT" "$1"
+      ;;
+    grep)
+      if [[ "${1:-}" == "-p" || "${1:-}" == "--project" ]]; then
+        proj="${2:-}"
+        [[ -n "$proj" ]] || die "expected a project name after $1"
+        shift 2
+      fi
+      resolve_project_context "$proj"
+      project_grep "$RESOLVED_PROJECT" "$@" || rc=$?
+      return "$rc"
+      ;;
+    add)
+      [[ $# -eq 2 ]] || die "usage: iwork project add <project> <task>"
+      require_config
+      require_projects_dir
+      task="$2"
+      validate_worktree_folder_name "$task"
+      [[ -d "$TASKS_DIR/$task" ]] || die "no such task: $task"
+      branch="$(detect_branch_from_worktree_folder "$task")"
+      attach_task_to_project "$task" "$1" "$branch"
+      ;;
+    rm)
+      [[ $# -eq 2 ]] || die "usage: iwork project rm <project> <task>"
+      require_config
+      require_projects_dir
+      detach_task_from_project "$1" "$2"
+      ;;
+    delete)
+      while [[ $# -gt 0 ]]; do
+        case "$1" in
+          -f|--force) force=1; shift ;;
+          -*) die "unknown option '$1'" ;;
+          *)
+            [[ -z "$proj" ]] || die "usage: iwork project delete [-f] <project>"
+            proj="$1"
+            shift
+            ;;
+        esac
+      done
+      [[ -n "$proj" ]] || die "usage: iwork project delete [-f] <project>"
+      require_config
+      require_projects_dir
+      delete_project "$proj" "$force"
+      ;;
+    *)
+      die "usage: iwork project <list|show|grep|add|rm|delete> ..."
+      ;;
+  esac
+}
+
+cmd_capture() {
+  local verb="$1"
+  local proj=""
+  local kind=""
+  local text=""
+  local nargs=0
+  local id=""
+
+  shift
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -p|--project)
+        proj="${2:-}"
+        [[ -n "$proj" ]] || die "expected a project name after $1"
+        shift 2
+        ;;
+      --decision) kind="decision"; shift ;;
+      --shipped) kind="shipped"; shift ;;
+      --note) kind="note"; shift ;;
+      --)
+        shift
+        while [[ $# -gt 0 ]]; do
+          text="${text:+$text }$1"
+          nargs=$((nargs + 1))
+          shift
+        done
+        ;;
+      -*)
+        die "unknown option '$1'"
+        ;;
+      *)
+        text="${text:+$text }$1"
+        nargs=$((nargs + 1))
+        shift
+        ;;
+    esac
+  done
+
+  resolve_project_context "$proj"
+
+  case "$verb" in
+    todo)
+      [[ -z "$kind" ]] || die "iwork todo takes no --decision/--shipped/--note"
+      (( nargs > 0 )) || die "usage: iwork todo \"<what needs doing>\""
+      id="$(append_todo "$RESOLVED_PROJECT" "$RESOLVED_TASK" "$text")"
+      echo "Captured $id in project '$RESOLVED_PROJECT'"
+      ;;
+    log)
+      (( nargs > 0 )) || die "usage: iwork log [--decision|--shipped|--note] \"<what>\""
+      append_log "$RESOLVED_PROJECT" "$RESOLVED_TASK" "${kind:-note}" "$text"
+      echo "Logged to project '$RESOLVED_PROJECT'"
+      ;;
+    decided)
+      [[ -z "$kind" ]] || die "iwork decided is already --decision"
+      (( nargs > 0 )) || die "usage: iwork decided \"<what and why>\""
+      append_log "$RESOLVED_PROJECT" "$RESOLVED_TASK" decision "$text"
+      echo "Recorded a decision in project '$RESOLVED_PROJECT'"
+      ;;
+    done)
+      (( nargs == 1 )) || die "usage: iwork done <todo-id>"
+      flip_todo "$RESOLVED_PROJECT" "$text" x
+      echo "Closed $text in project '$RESOLVED_PROJECT'"
+      ;;
+    drop)
+      (( nargs == 1 )) || die "usage: iwork drop <todo-id>"
+      flip_todo "$RESOLVED_PROJECT" "$text" -
+      echo "Dropped $text in project '$RESOLVED_PROJECT'"
+      ;;
+  esac
 }
 
 if [[ $# -eq 0 ]]; then
@@ -2037,6 +3470,11 @@ case "${1:-}" in
     list_task_worktree_names "${2:-}" "${3:-}"
     exit 0
     ;;
+  --complete-projects)
+    require_config
+    list_projects "${2:-}"
+    exit 0
+    ;;
   --resolve-worktree-folder)
     require_config
     resolve_worktree_folder "${2:-}"
@@ -2068,6 +3506,21 @@ if [[ "${1:-}" == "init" ]]; then
   exit 0
 fi
 
+if [[ "${1:-}" == "project" ]]; then
+  shift
+  cmd_project "$@"
+  exit $?
+fi
+
+case "${1:-}" in
+  todo|log|decided|done|drop)
+    capture_verb="$1"
+    shift
+    cmd_capture "$capture_verb" "$@"
+    exit 0
+    ;;
+esac
+
 if [[ "${1:-}" == "list" && $# -eq 1 ]]; then
   require_config
   if tmux_enabled; then
@@ -2079,12 +3532,45 @@ if [[ "${1:-}" == "list" && $# -eq 1 ]]; then
 fi
 
 if [[ "${1:-}" == "park" ]]; then
-  if [[ $# -ne 2 ]]; then
-    die "usage: iwork park <task>"
-  fi
+  shift
+  park_folder=""
+  park_project=""
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -p|--project)
+        park_project="${2:-}"
+        [[ -n "$park_project" ]] || die "expected a project name after $1"
+        shift 2
+        ;;
+      -*)
+        die "unknown option '$1'"
+        ;;
+      *)
+        [[ -z "$park_folder" ]] || die "usage: iwork park <task> [-p <project>]"
+        park_folder="$1"
+        shift
+        ;;
+    esac
+  done
+
+  [[ -n "$park_folder" ]] || die "usage: iwork park <task> [-p <project>]"
 
   require_config
-  park_current_repo "$2"
+
+  if [[ -n "$park_project" ]]; then
+    require_projects_dir
+    validate_project_name "$park_project"
+
+    if project_exists "$park_folder"; then
+      die "'$park_folder' is already a project; a task cannot share a name with a project"
+    fi
+
+    # park stashes and moves a real branch, so confirm before any of that.
+    ensure_project "$park_project"
+  fi
+
+  park_current_repo "$park_folder" "$park_project"
   exit 0
 fi
 
@@ -2158,6 +3644,7 @@ if [[ "${1:-}" == "add-repo" ]]; then
   branch="$(detect_branch_from_worktree_folder "$folder_name")"
 
   create_worktrees "$branch" "$folder_name" "${repos[@]}"
+  refresh_task_blocks "$folder_name" "$branch"
   extend_task_session "$folder_name"
   exit 0
 fi
@@ -2192,20 +3679,31 @@ shift
 require_config
 validate_branch "$branch"
 
-# --from also reads naturally after the branch name: iwork feat/y --from feat-x
-if [[ "${1:-}" == "--from" ]]; then
-  shift
-  [[ $# -gt 0 ]] || die "--from needs a task or branch name"
-  BASE_SPEC="$1"
-  validate_base_spec "$BASE_SPEC"
-  shift
-fi
-
-parse_repos_flag "expected -r <repos> after branch name" "$@"
+parse_task_args "$@"
 
 # Folder name: replace / with -
 folder_name="${branch//\//-}"
 
+# Fail before creating anything: a task and a project that share a name would
+# compete for the same tmux window, and the status hook could not tell them
+# apart.
+if [[ -n "$PROJECT_FLAG" ]]; then
+  require_projects_dir
+  validate_project_name "$PROJECT_FLAG"
+
+  if project_exists "$folder_name"; then
+    die "'$folder_name' is already a project; a task cannot share a name with a project"
+  fi
+
+  # Prompt and create up front: aborting here must leave nothing behind.
+  ensure_project "$PROJECT_FLAG"
+fi
+
 create_worktrees "$branch" "$folder_name" "${repos[@]}"
 write_task_context "$folder_name" "$branch"
+
+if [[ -n "$PROJECT_FLAG" ]]; then
+  attach_task_to_project "$folder_name" "$PROJECT_FLAG" "$branch"
+fi
+
 open_task "$folder_name" claude

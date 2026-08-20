@@ -18,6 +18,7 @@ directory (`IWORK_REPO_DIR`). Task folders are collected in a tasks directory
 ~/dev/projects/                  # IWORK_REPO_DIR (you choose this)
 ├── backend-api/                 # your repos (real git repos, direct children)
 ├── frontend/
+├── projects/                    # IWORK_PROJECTS_DIR — memory spanning many tasks
 └── tasks/                       # IWORK_TASKS_DIR — task folders live here
     └── feat-login/              # one task folder
         ├── backend-api/         # a git worktree, named after its repo
@@ -164,7 +165,147 @@ iwork park task-billing-followup
 
 # See your tasks (with live agent status inside tmux)
 iwork list
+
+# Make the task part of a longer-horizon project (created on first use)
+iwork feat/token-api -r auth-service -p auth-rewrite
+
+# From inside a task: orient, capture, record — no flags needed
+iwork project show
+iwork todo "auth-service retries need backoff"
+iwork decided "cursor pagination, not offset — offset was O(n) at 100k rows"
 ```
+
+## Projects: memory across many tasks
+
+Some work is bigger than one task. A migration spans weeks, a dozen branches and
+several repos, and each new `iwork` invocation used to start an agent that knew
+none of it — so you re-explained the effort every time, and anything that surfaced
+mid-session but didn't belong in the current PR lived only in your head until you
+remembered to act on it.
+
+A **project** is a directory of markdown that outlives any one task:
+
+```bash
+iwork feat/token-api -r auth-service -p auth-rewrite
+```
+
+The project is created on first use (after confirming), and the task folder gets a
+`.project` symlink pointing at it:
+
+```
+~/dev/projects/
+├── projects/                          # IWORK_PROJECTS_DIR
+│   └── auth-rewrite/
+│       ├── PROJECT.md                 # curated brief: goal, where we are, constraints
+│       ├── LOG.md                     # append-only, one line per entry
+│       ├── TODO.md                    # captured-not-now, tagged with where it surfaced
+│       ├── history.tsv                # append-only task events (opened, closed)
+│       └── notes/                     # anything that outlives one task
+└── tasks/
+    └── feat-token-api/
+        ├── auth-service/
+        ├── .project -> ../../projects/auth-rewrite
+        ├── CLAUDE.md                  # now carries an <!-- iwork:project --> block
+        └── AGENTS.md
+```
+
+Project memory is never touched by `iwork rm`, the same guarantee branches already
+get. The `.project` symlink is how iwork knows which project a task belongs to —
+it is what makes `iwork todo` work with no arguments from any depth inside the
+task. It is **not** an access path.
+
+### The CLI is the only way in
+
+The generated `CLAUDE.md` / `AGENTS.md` gain a marker-delimited block naming the
+project and its goal, and it tells the agent that `.project/` is out of scope
+exactly like any other path outside the task. Everything goes through iwork:
+
+```bash
+iwork project show [-n N]     # goal, live tasks, open todos, recent log, past tasks
+iwork project grep <pattern>  # search the whole memory
+iwork project cat notes/x.md  # read one file grep turned up
+```
+
+This is a design choice, not tidiness. If the agent never opens those files
+directly, the atomic-append behaviour and the append-only log stop being rules it
+is *asked* to respect and become rules it has no way to break — and the fact that
+`.project` is invisible to a recursive `rg` (hidden *and* a symlink) stops being a
+problem, because nothing is expected to search it that way.
+
+`PROJECT.md` is yours. The block tells the agent to report staleness rather than
+fix it, so the curated brief stays curated.
+
+Because the block is marker-delimited, one code path serves a new task, a retrofit
+and a refresh, and your own edits to the rest of the file survive untouched.
+
+### Capturing without derailing the session
+
+From inside a task — or any directory under it — no flags are needed; the project
+is read from the `.project` link:
+
+```bash
+iwork decided "cursor pagination, not offset — offset was O(n) at 100k rows"
+iwork todo    "auth-service retries need backoff, hit this while wiring the client"
+iwork log --shipped "auth-service#412 opened"
+```
+
+That is the answer to "something came up that doesn't belong in this PR": one
+command, no context switch, and it is waiting for whichever task picks it up.
+
+```bash
+iwork done t7dc4      # close a captured todo
+iwork drop t7dc4      # abandon one
+```
+
+### What happens without you asking
+
+Instructions in `CLAUDE.md` only fire if the agent decides to act on them, and
+`iwork decided` has no natural moment to fire on — decisions feel like part of the
+work, not an event. So three of the four paths are hooks instead (installed by
+`iwork install-hooks`, which is safe to re-run and only adds what is missing):
+
+| Hook | What it does | Judgement needed |
+|---|---|---|
+| `SessionStart` | Runs `iwork project show` and injects the output as context | none — the agent cannot start without it |
+| `PostToolUse` (Bash) | Spots `gh pr create` and logs the PR URL itself | none — a URL is a fact |
+| `PreCompact` | Prompts a flush right before the reasoning is discarded | the agent's, but at the right moment |
+| `Stop` / `UserPromptSubmit` / `Notification` | tmux window markers, as before | n/a |
+
+Deliberately absent: anything that *forces* a log entry. A hook that demands one
+every session produces filler, and filler degrades the exact file every future
+session reads. `PreCompact` says as much to the agent — record nothing if there is
+nothing worth keeping.
+
+Outside a project task every one of these prints nothing and exits clean, so
+installing them globally is safe.
+
+Each of these appends a single line with one `printf`, which is atomic — so agents
+working in parallel tasks cannot clobber each other, and capture never waits on a
+lock. Only the rewrite operations (`done`, `drop`) take one.
+
+### Live state is never cached
+
+Which tasks exist, what branch they are on and what their agents are doing is read
+from the filesystem and tmux on every call, exactly as `iwork list` does. Nothing
+about it is stored, so nothing about it can go stale: delete a task folder by hand
+and `project show` simply stops listing it as live.
+
+`history.tsv` records only what *cannot* be derived once a task folder is gone —
+the branch, the repos, when it opened and closed. It is append-only, one line per
+event, so it never needs rewriting and two tasks closing at once cannot corrupt it.
+
+### Joining work already in flight
+
+```bash
+iwork project add auth-rewrite feat-existing-task    # attach a task that exists
+iwork project rm  auth-rewrite feat-existing-task    # detach; memory kept
+iwork project list
+iwork project delete -f auth-rewrite                 # deletes the memory, asks first
+```
+
+A task belongs to exactly one project. Attaching it to a second one refuses rather
+than silently relinking, which would leave its history stranded in the first.
+`iwork park <task> -p <project>` works too.
 
 ## Branch tracking
 
@@ -368,17 +509,41 @@ overrides.
 |---|---|---|
 | `IWORK_REPO_DIR` | — (required) | Directory whose direct children are your git repos |
 | `IWORK_TASKS_DIR` | `$IWORK_REPO_DIR/tasks` | Where task folders are created |
+| `IWORK_PROJECTS_DIR` | `$IWORK_REPO_DIR/projects` | Where project memory lives (see [Projects](#projects-memory-across-many-tasks)) |
 | `IWORK_TMUX_SESSION` | `tasks` | tmux session that holds task windows |
 | `IWORK_CONTEXT_TEMPLATE` | `~/.config/iwork/task-context.md.tmpl` | Template for the generated `CLAUDE.md`/`AGENTS.md` (seeded with a default on first use, then yours to edit) |
+| `IWORK_PROJECT_TEMPLATE` | `~/.config/iwork/project-context.md.tmpl` | Template for the project block injected into those files (same deal: seeded once, then yours) |
+| `IWORK_PROJECT` | unset | Default project for `todo`/`log`/`decided`/`done`/`drop` when you are not inside a task |
+| `IWORK_SHOW_LOG_LINES` | `12` | How many log entries and past tasks `iwork project show` prints |
 | `IWORK_EDITOR` | `nvim` | Editor started in each repo window under `--big`; run as a command line with the worktree appended |
 | `IWORK_NO_TMUX` | unset | Set to skip all tmux handling (same as the `--no-tmux` flag) |
 | `IWORK_NO_CONTEXT` | unset | Set to skip writing task context files (same as `--no-context`) |
 | `IWORK_DETACH` | unset | Set to never switch to the task window (same as `--detach`) |
 | `IWORK_BIG` | unset | Set to give every task its own session (same as `--big`) |
-| `IWORK_ASSUME_YES` | unset | Set to `1` to skip confirmation prompts (`install-hooks`, `rm`) |
+| `IWORK_ASSUME_YES` | unset | Set to `1` to skip confirmation prompts (`install-hooks`, `rm`, creating a project) |
 
 Leading flags `--no-tmux`, `--no-context`, `--detach` and `--big` apply
 per-invocation, e.g. `iwork --no-tmux claude feat-login-bug`.
+
+## Tests
+
+```bash
+tests/run.sh            # everything
+tests/run.sh todo       # only tests whose name matches 'todo'
+KEEP=1 tests/run.sh     # leave the sandbox behind to poke at
+```
+
+Every test builds a throwaway tree under `$TMPDIR`: fake repos with local
+`origin` remotes, a fake tasks dir, a fake projects dir, a fake `HOME`, and — for
+the tmux tests — a tmux server on its own socket via `TMUX_TMPDIR`. Nothing can
+reach your real `IWORK_REPO_DIR`, your real `~/.config`, or a live tmux session,
+and the harness refuses to start if any sandbox path resolves outside `$TMPDIR`.
+
+No test framework, no dependencies: it is the same bash the tool is written in.
+The whole suite takes about 25 seconds. A watchdog turns a hang into a named
+failure (`SUITE_TIMEOUT` to tune it), which matters because `confirm()` reads
+`/dev/tty` — a test that forgets `-f` or `IWORK_ASSUME_YES` would otherwise block
+your terminal with no clue which one did it.
 
 ## Updating
 
