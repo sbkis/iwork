@@ -3,7 +3,7 @@ set -euo pipefail
 
 SELF_PATH="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)/$(basename "${BASH_SOURCE[0]:-$0}")"
 IWORK_CONFIG_FILE="${IWORK_CONFIG_FILE:-${XDG_CONFIG_HOME:-$HOME/.config}/iwork/config}"
-IWORK_CONFIG_VARS=(IWORK_REPO_DIR IWORK_TASKS_DIR IWORK_TMUX_SESSION IWORK_CONTEXT_TEMPLATE IWORK_NO_TMUX IWORK_NO_CONTEXT IWORK_ASSUME_YES)
+IWORK_CONFIG_VARS=(IWORK_REPO_DIR IWORK_TASKS_DIR IWORK_TMUX_SESSION IWORK_CONTEXT_TEMPLATE IWORK_EDITOR IWORK_NO_TMUX IWORK_NO_CONTEXT IWORK_DETACH IWORK_BIG IWORK_ASSUME_YES)
 
 load_config() {
   local var="" restore=""
@@ -31,6 +31,9 @@ TASKS_DIR="${IWORK_TASKS_DIR:-${REPO_DIR:+$REPO_DIR/tasks}}"
 TASKS_SESSION="${IWORK_TMUX_SESSION:-tasks}"
 IWORK_NO_TMUX="${IWORK_NO_TMUX:-}"
 IWORK_NO_CONTEXT="${IWORK_NO_CONTEXT:-}"
+IWORK_DETACH="${IWORK_DETACH:-}"
+IWORK_BIG="${IWORK_BIG:-}"
+IWORK_EDITOR="${IWORK_EDITOR:-nvim}"
 CONTEXT_TEMPLATE="${IWORK_CONTEXT_TEMPLATE:-$HOME/.config/iwork/task-context.md.tmpl}"
 
 require_config() {
@@ -43,19 +46,27 @@ require_config() {
 
 usage() {
   cat <<'EOF'
-Usage: iwork [--no-tmux] [--no-context] <branch-name> -r <repo1> [repo2 ...]
+Usage: iwork [flags] <branch-name> -r <repo1> [repo2 ...]
        iwork add-repo <task> -r <repo1> [repo2 ...]
-       iwork [--no-tmux] [--no-context] park <task>
+       iwork [--no-tmux] rm [-f] <task> [-r <repo1> [repo2 ...]]
+       iwork [flags] park <task>
        iwork [--no-tmux] list
        iwork [--no-tmux] cd <task>
-       iwork [--no-tmux] claude <task> [claude-args...]
-       iwork [--no-tmux] codex <task> [codex-args...]
+       iwork [flags] claude <task> [claude-args...]
+       iwork [flags] codex <task> [codex-args...]
        iwork init
        iwork install-hooks [settings-path]
        iwork --completion <bash|zsh>
 
+       flags: [--no-tmux] [--no-context] [--detach] [--big]
+
 Create a task folder in the tasks directory and set up git worktrees for
-the specified repos, all on the given branch.
+the specified repos, all on the given branch. Each worktree lives in a
+subdirectory named after the repo it comes from.
+
+New branches start from the base branch but get no upstream, so status and
+prompts do not report them as ahead of/behind origin/main before they are
+pushed. Use 'git push -u origin HEAD' to set a real upstream.
 
 Configuration lives in ~/.config/iwork/config (run 'iwork init' to create
 it). IWORK_REPO_DIR must point at the directory whose direct children are
@@ -69,6 +80,26 @@ claude/codex/cd switch to it if it exists. Claude Code hooks (see
 install-hooks) mark the window name with the agent state:
 *task = busy, !task = waiting for you.
 
+With --detach the window is still created and the agent still starts in it,
+but your client stays where it is — nothing switches session or window. It
+also works from outside tmux (the tasks session is created in the
+background), so you can spin up a task without leaving what you are doing.
+Use 'iwork cd <task>' or 'iwork list' to pick it up later.
+
+With --big the task gets a whole tmux session of its own, named
+'<tmux-session>-<task>' (so 'tasks-feat-bla' by default), for work that
+spans several repos:
+
+  window '<task>'  the agent, plus a shell, at the task root
+  window '<repo>'  one per worktree: IWORK_EDITOR (default nvim) on the
+                   left, a shell on the right, both inside that worktree
+
+The agent window keeps the task name so the status hooks still apply. Repo
+windows are only added if missing, so 'add-repo' extends a live session.
+list/cd/claude/codex/rm all find a task in its own session or in the shared
+one, and rm kills the whole session. Combine with --detach to build the
+session without being moved into it.
+
 On creation and park, iwork writes CLAUDE.md and AGENTS.md into the task
 folder from a template (~/.config/iwork/task-context.md.tmpl, override with
 IWORK_CONTEXT_TEMPLATE), seeding a default template on first use. Existing
@@ -77,6 +108,13 @@ files are never overwritten.
 Subcommands:
   init           Interactively create the config file
   add-repo       Add one or more repos to an existing task folder
+  rm             Remove worktrees from a task; without -r, remove every
+                 worktree, the generated context files (CLAUDE.md,
+                 AGENTS.md, .claude/), the task folder and its tmux
+                 window/session. Branches are always left intact. A
+                 directory whose worktree registration is gone is reported
+                 as orphaned and needs -f, since git can no longer say
+                 whether it holds uncommitted work.
   park           Move the current repo/branch into a task folder
   list           List task folders (with window status in tmux)
   cd             Switch to the task window, or cd into the task folder
@@ -90,17 +128,30 @@ Examples:
   iwork feat/bla -r backend-api frontend
   iwork fix/login-bug -r auth-service web-app
   iwork add-repo feat-bla -r shared-lib
+  iwork rm feat-bla
+  iwork rm feat-bla -r shared-lib
+  iwork rm -f feat-bla
   iwork park task-billing-followup
   iwork list
   iwork cd feat-bla
   iwork claude feat-bla
+  iwork --detach feat/bla -r backend-api frontend
+  iwork --detach claude feat-bla
+  iwork --big feat/huge-thing -r backend-api frontend shared-lib admin
+  iwork --big --detach feat/huge-thing -r backend-api frontend
   iwork --no-tmux claude feat-bla
   iwork install-hooks
 
 Options:
   --no-tmux     Skip all tmux window handling (leading flag)
   --no-context  Skip writing CLAUDE.md/AGENTS.md task context (leading flag)
+  --detach      Create the task window and start the agent without switching
+                to it (leading flag)
+  --big         Give the task its own tmux session, with a window per repo
+                (editor + shell) alongside the agent window (leading flag)
   -r            Repos to create worktrees for (required, at least one)
+  -f            rm only: remove worktrees with uncommitted changes or
+                orphaned directories, and skip the confirmation prompt
   -h            Show this help
 
 Completion:
@@ -196,18 +247,59 @@ list_worktree_folders() {
   done | sort
 }
 
+list_task_worktree_names() {
+  local folder="${1:-}"
+  local prefix="${2:-}"
+  local folder_path=""
+  local wt=""
+  local name=""
+
+  validate_worktree_folder_name "$folder"
+  folder_path="$TASKS_DIR/$folder"
+  [[ -d "$folder_path" ]] || return 0
+
+  while IFS= read -r wt; do
+    [[ -n "$wt" ]] || continue
+    name="${wt##*/}"
+    if [[ "$name" == "$prefix"* ]]; then
+      printf '%s\n' "$name"
+    fi
+  done < <(list_task_worktrees "$folder_path")
+}
+
+# Agent state for one task, from its window name in whichever session holds it.
+# Tasks with their own session are flagged, since that is where they live.
+task_status() {
+  local folder="$1"
+  local line=""
+  local window_name=""
+  local suffix=""
+
+  if line="$(find_window_in_session "$(task_session_name "$folder")" "$folder")"; then
+    suffix=" (session)"
+  elif line="$(find_window_in_session "$TASKS_SESSION" "$folder")"; then
+    suffix=""
+  else
+    return 0
+  fi
+
+  window_name="${line#* }"
+
+  case "$window_name" in
+    '*'*) printf '*running%s\n' "$suffix" ;;
+    '!'*) printf '!waiting%s\n' "$suffix" ;;
+    *) printf 'open%s\n' "$suffix" ;;
+  esac
+}
+
 list_worktree_folders_with_status() {
   local folders=""
-  local windows=""
   local folder=""
-  local window_name=""
   local status=""
   local width=0
 
   folders="$(list_worktree_folders)"
   [[ -n "$folders" ]] || return 0
-
-  windows="$(tmux list-windows -t "=$TASKS_SESSION" -F '#{window_name}' 2>/dev/null || true)"
 
   while IFS= read -r folder; do
     if (( ${#folder} > width )); then
@@ -216,24 +308,7 @@ list_worktree_folders_with_status() {
   done <<< "$folders"
 
   while IFS= read -r folder; do
-    status=""
-    while IFS= read -r window_name; do
-      [[ -n "$window_name" ]] || continue
-      case "$window_name" in
-        '*'"$folder")
-          status='*running'
-          break
-          ;;
-        '!'"$folder")
-          status='!waiting'
-          break
-          ;;
-        "$folder")
-          status='open'
-          break
-          ;;
-      esac
-    done <<< "$windows"
+    status="$(task_status "$folder")"
 
     if [[ -n "$status" ]]; then
       printf '%-*s  %s\n' "$width" "$folder" "$status"
@@ -265,7 +340,7 @@ run_tool_in_worktree() {
   folder_path="$(resolve_worktree_folder "$folder")"
 
   if tmux_enabled; then
-    open_task_window "$folder" "$tool" "$@"
+    open_task "$folder" "$tool" "$@"
     exit 0
   fi
 
@@ -330,8 +405,6 @@ resolve_park_target_path() {
   local folder_name="$1"
   local repo_root=""
   local repo_name=""
-  local branch=""
-  local branch_slug=""
 
   validate_worktree_folder_name "$folder_name"
 
@@ -339,10 +412,11 @@ resolve_park_target_path() {
   validate_primary_repo_root "$repo_root"
 
   repo_name="$(current_repo_name "$repo_root")"
-  branch="$(current_branch_name "$repo_root")"
-  branch_slug="${branch//\//-}"
+  # The branch no longer shapes the path, but park still refuses a detached
+  # HEAD, so keep failing here before the caller cds anywhere.
+  current_branch_name "$repo_root" >/dev/null
 
-  printf '%s\n' "$TASKS_DIR/$folder_name/${repo_name}--${branch_slug}"
+  printf '%s\n' "$TASKS_DIR/$folder_name/$repo_name"
 }
 
 park_current_repo() {
@@ -350,7 +424,6 @@ park_current_repo() {
   local repo_root=""
   local repo_name=""
   local branch=""
-  local branch_slug=""
   local wt_path=""
   local folder_path=""
   local status_output=""
@@ -363,9 +436,8 @@ park_current_repo() {
   validate_primary_repo_root "$repo_root"
   repo_name="$(current_repo_name "$repo_root")"
   branch="$(current_branch_name "$repo_root")"
-  branch_slug="${branch//\//-}"
   folder_path="$TASKS_DIR/$folder_name"
-  wt_path="$folder_path/${repo_name}--${branch_slug}"
+  wt_path="$folder_path/$repo_name"
 
   case "$branch" in
     main|master|trunk)
@@ -389,7 +461,7 @@ park_current_repo() {
   mkdir -p "$folder_path"
   echo "Using $folder_path"
   git -C "$repo_root" worktree add "$wt_path" "$branch"
-  echo "  -> ${repo_name}--${branch_slug} (branch: $branch)"
+  echo "  -> $repo_name (branch: $branch)"
 
   if [[ -n "$stash_created" ]]; then
     if git -C "$wt_path" stash apply --index "$stash_ref" >/dev/null 2>&1; then
@@ -405,7 +477,7 @@ park_current_repo() {
   echo "  $wt_path"
 
   write_task_context "$folder_name" "$branch"
-  open_task_window "$folder_name" claude
+  open_task "$folder_name" claude
 }
 
 detect_branch_from_worktree_folder() {
@@ -443,6 +515,280 @@ detect_branch_from_worktree_folder() {
   printf '%s\n' "$detected_branch"
 }
 
+is_worktree_root() {
+  local path="$1"
+  local top=""
+
+  top="$(git -C "$path" rev-parse --show-toplevel 2>/dev/null)" || return 1
+  [[ -n "$top" && "$top" -ef "$path" ]]
+}
+
+# The repository a worktree belongs to, derived from its git common dir rather
+# than from the folder name, so worktrees created by older versions of iwork
+# (repo--branch-slug) still resolve.
+worktree_main_repo_dir() {
+  local wt_path="$1"
+  local common_dir=""
+
+  common_dir="$(git -C "$wt_path" rev-parse --git-common-dir 2>/dev/null)" || return 1
+  [[ -n "$common_dir" ]] || return 1
+
+  case "$common_dir" in
+    /*) ;;
+    *) common_dir="$wt_path/$common_dir" ;;
+  esac
+
+  (cd "$common_dir/.." && pwd) 2>/dev/null
+}
+
+list_task_worktrees() {
+  local folder_path="$1"
+  local child=""
+
+  for child in "$folder_path"/*; do
+    [[ -d "$child" ]] || continue
+    is_worktree_root "$child" || continue
+    printf '%s\n' "$child"
+  done
+}
+
+# Directories that were worktrees but whose registration is gone: they still
+# carry a .git that no longer resolves, usually because the directory was
+# renamed with plain mv and git later pruned the missing path. git can tell us
+# nothing about these, so removing one is a plain directory delete.
+list_task_orphans() {
+  local folder_path="$1"
+  local child=""
+
+  for child in "$folder_path"/*; do
+    [[ -d "$child" ]] || continue
+    [[ -e "$child/.git" ]] || continue
+    is_worktree_root "$child" && continue
+    printf '%s\n' "$child"
+  done
+}
+
+confirm() {
+  local prompt="$1"
+  local answer=""
+
+  [[ "${IWORK_ASSUME_YES:-}" == "1" ]] && return 0
+
+  if ! { : </dev/tty; } 2>/dev/null; then
+    die "no TTY available for confirmation; re-run with -f or IWORK_ASSUME_YES=1"
+  fi
+
+  printf '%s [y/N] ' "$prompt"
+  IFS= read -r answer </dev/tty
+  case "$answer" in
+    y|Y) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+kill_task_tmux() {
+  local folder="$1"
+  local session=""
+  local current_session=""
+  local line=""
+  local window_id=""
+  local current_id=""
+
+  tmux_enabled || return 0
+
+  # A --big task owns its session, so the whole session goes.
+  session="$(task_session_name "$folder")"
+  if tmux has-session -t "=$session" 2>/dev/null; then
+    current_session="$(tmux display-message -p '#{session_name}' 2>/dev/null || true)"
+    if [[ -n "$current_session" && "$current_session" == "$session" ]]; then
+      warn "you are attached to tmux session '$session'; close it yourself"
+      return 0
+    fi
+    tmux kill-session -t "=$session" 2>/dev/null || warn "could not kill tmux session '$session'"
+    return 0
+  fi
+
+  line="$(find_window_in_session "$TASKS_SESSION" "$folder")" || return 0
+  window_id="${line%% *}"
+
+  current_id="$(tmux display-message -p '#{window_id}' 2>/dev/null || true)"
+  if [[ -n "$current_id" && "$current_id" == "$window_id" ]]; then
+    warn "tmux window '$folder' is the current window; close it yourself"
+    return 0
+  fi
+
+  tmux kill-window -t "$window_id" 2>/dev/null || warn "could not kill tmux window '$folder'"
+}
+
+remove_worktrees() {
+  local folder="$1"
+  local force="$2"
+  shift 2
+  local repos=("$@")
+  local folder_path=""
+  local worktrees=()
+  local orphans=()
+  local targets=()
+  local orphan_targets=()
+  local dirty=()
+  local repo=""
+  local wt=""
+  local name=""
+  local matched=""
+  local repo_root=""
+  local failed=""
+  local remove_all=""
+  local target=""
+  local session=""
+
+  folder_path="$(resolve_worktree_folder "$folder")"
+  (( ${#repos[@]} == 0 )) && remove_all=1
+
+  while IFS= read -r wt; do
+    [[ -n "$wt" ]] && worktrees+=("$wt")
+  done < <(list_task_worktrees "$folder_path")
+
+  while IFS= read -r wt; do
+    [[ -n "$wt" ]] && orphans+=("$wt")
+  done < <(list_task_orphans "$folder_path")
+
+  if (( ${#worktrees[@]} == 0 && ${#orphans[@]} == 0 )); then
+    if [[ -z "$remove_all" ]]; then
+      die "no git worktrees found in $folder_path"
+    fi
+    warn "no git worktrees found in $folder_path"
+  fi
+
+  if [[ -n "$remove_all" ]]; then
+    targets=("${worktrees[@]+${worktrees[@]}}")
+    orphan_targets=("${orphans[@]+${orphans[@]}}")
+  else
+    for repo in "${repos[@]}"; do
+      validate_repo_name "$repo"
+      matched=""
+      # Current layout names the worktree after the repo; older ones used
+      # repo--branch-slug.
+      for wt in "${worktrees[@]+${worktrees[@]}}"; do
+        name="${wt##*/}"
+        if [[ "$name" == "$repo" || "$name" == "$repo"--* ]]; then
+          targets+=("$wt")
+          matched=1
+        fi
+      done
+      for wt in "${orphans[@]+${orphans[@]}}"; do
+        name="${wt##*/}"
+        if [[ "$name" == "$repo" || "$name" == "$repo"--* ]]; then
+          orphan_targets+=("$wt")
+          matched=1
+        fi
+      done
+      [[ -n "$matched" ]] || die "repo '$repo' has no worktree in task '$folder'"
+    done
+  fi
+
+  for wt in "${targets[@]+${targets[@]}}"; do
+    if [[ -n "$(git -C "$wt" status --porcelain --untracked-files=all 2>/dev/null || true)" ]]; then
+      dirty+=("${wt##*/}")
+    fi
+  done
+
+  echo "Removing from $folder_path:"
+  for wt in "${targets[@]+${targets[@]}}"; do
+    echo "  - ${wt##*/}"
+  done
+  for wt in "${orphan_targets[@]+${orphan_targets[@]}}"; do
+    echo "  - ${wt##*/}  (orphaned: registration gone, deleted as a plain directory)"
+  done
+
+  if [[ -n "$remove_all" ]]; then
+    echo "  - the task folder itself"
+
+    # Worth spelling out: killing the session takes any editors with it.
+    session="$(task_session_name "$folder")"
+    if tmux_enabled && tmux has-session -t "=$session" 2>/dev/null; then
+      echo "  - tmux session '$session' and everything running in it"
+    fi
+  fi
+
+  if (( ${#dirty[@]} > 0 )); then
+    echo ""
+    echo "Uncommitted changes in: ${dirty[*]}"
+    [[ -n "$force" ]] || die "refusing to remove worktrees with uncommitted changes; re-run with -f"
+  fi
+
+  if (( ${#orphan_targets[@]} > 0 )) && [[ -z "$force" ]]; then
+    echo ""
+    die "orphaned directories cannot be checked for uncommitted work; re-run with -f to delete them"
+  fi
+
+  echo ""
+  if [[ -z "$force" ]]; then
+    confirm "Proceed?" || die "aborted"
+  fi
+
+  for wt in "${targets[@]+${targets[@]}}"; do
+    name="${wt##*/}"
+
+    if ! repo_root="$(worktree_main_repo_dir "$wt")" || [[ -z "$repo_root" ]]; then
+      warn "could not determine the repository for $wt; left in place"
+      failed=1
+      continue
+    fi
+
+    if git -C "$repo_root" worktree remove ${force:+--force} "$wt" 2>/dev/null; then
+      echo "  -> removed $name"
+    else
+      warn "git worktree remove failed for $wt; left in place"
+      failed=1
+      continue
+    fi
+
+    git -C "$repo_root" worktree prune 2>/dev/null || true
+  done
+
+  # Only reachable with -f, which the orphan check above enforces.
+  for wt in "${orphan_targets[@]+${orphan_targets[@]}}"; do
+    name="${wt##*/}"
+
+    if rm -rf "$wt"; then
+      echo "  -> deleted orphaned $name"
+    else
+      warn "could not delete $wt; left in place"
+      failed=1
+    fi
+  done
+
+  if [[ -z "$remove_all" ]]; then
+    echo ""
+    echo "Done! Branches were left untouched."
+    return 0
+  fi
+
+  # The task is gone either way, so its window/session goes too — and killing
+  # it first stops any editor from writing the folder back up under us.
+  kill_task_tmux "$folder"
+
+  if [[ -n "$failed" ]]; then
+    die "some worktrees could not be removed; kept $folder_path"
+  fi
+
+  # Generated for the agent that ran here, so they go with the task.
+  for target in "$folder_path/CLAUDE.md" "$folder_path/AGENTS.md" "$folder_path/.claude"; do
+    [[ -e "$target" ]] || continue
+    rm -rf "$target" || warn "could not remove $target"
+  done
+
+  if rmdir "$folder_path" 2>/dev/null; then
+    echo "  -> removed ${folder_path##*/}"
+  else
+    warn "$folder_path is not empty; kept it (worktrees are gone)"
+    warn "  remaining: $(ls -A "$folder_path" 2>/dev/null | tr '\n' ' ')"
+  fi
+
+  echo ""
+  echo "Done! Branches were left untouched."
+}
+
 parse_repos_flag() {
   local missing_flag_message="$1"
   shift
@@ -467,23 +813,20 @@ parse_repos_flag() {
 create_worktrees() {
   local branch="$1"
   local folder_name="$2"
-  local branch_slug="$3"
   local folder_path="$TASKS_DIR/$folder_name"
   local seen_repos=""
   local base_refs=()
   local repo=""
   local repo_path=""
-  local wt_name=""
   local wt_path=""
   local base_ref=""
   local i=""
 
-  shift 3
+  shift 2
   local repos=("$@")
 
   for repo in "${repos[@]}"; do
     repo_path=""
-    wt_name=""
     wt_path=""
     base_ref=""
 
@@ -499,8 +842,7 @@ create_worktrees() {
       die "$repo_path is not a git repository"
     fi
 
-    wt_name="${repo}--${branch_slug}"
-    wt_path="$folder_path/$wt_name"
+    wt_path="$folder_path/$repo"
 
     if [[ -e "$wt_path" ]] && ! is_registered_worktree_path "$repo_path" "$wt_path"; then
       die "destination already exists and is not a registered git worktree: $wt_path"
@@ -531,22 +873,25 @@ create_worktrees() {
   for i in "${!repos[@]}"; do
     repo="${repos[$i]}"
     repo_path="$REPO_DIR/$repo"
-    wt_name="${repo}--${branch_slug}"
-    wt_path="$folder_path/$wt_name"
+    wt_path="$folder_path/$repo"
     base_ref="${base_refs[$i]}"
 
     if [[ -e "$wt_path" ]]; then
-      echo "Skipping $wt_name (already exists)"
+      echo "Skipping $repo (already exists)"
       continue
     fi
 
     if [[ -n "$base_ref" ]]; then
-      git -C "$repo_path" worktree add -b "$branch" "$wt_path" "$base_ref"
+      # --no-track: branching from origin/main would otherwise make it the
+      # upstream, so status and prompts would report the fresh branch as
+      # ahead/behind a branch it has nothing to do with. Push with
+      # 'git push -u origin HEAD' to set a real upstream.
+      git -C "$repo_path" worktree add --no-track -b "$branch" "$wt_path" "$base_ref"
     else
       git -C "$repo_path" worktree add "$wt_path" "$branch"
     fi
 
-    echo "  -> $wt_name (branch: $branch)"
+    echo "  -> $repo (branch: $branch)"
   done
 
   echo ""
@@ -565,6 +910,7 @@ iwork() {
   local cmd=""
   local folder=""
   local target=""
+  local arg=""
   local notmux=""
 
   if [[ "${1:-}" == "--no-tmux" ]]; then
@@ -575,6 +921,31 @@ iwork() {
   cmd="${1:-}"
 
   case "$cmd" in
+    rm)
+      if [[ $# -lt 2 ]]; then
+        command "$_iwork_bin" rm
+        return $?
+      fi
+
+      shift
+      target=""
+      for arg in "$@"; do
+        case "$arg" in
+          -*) ;;
+          *)
+            target="$(command "$_iwork_bin" --resolve-worktree-folder "$arg" 2>/dev/null)"
+            break
+            ;;
+        esac
+      done
+
+      command "$_iwork_bin" ${notmux:+--no-tmux} rm "$@" || return $?
+
+      # The folder we were standing in may be gone now.
+      if [[ -n "$target" && ! -d "$target" && "$PWD" == "$target"* ]]; then
+        builtin cd "${target%/*}" || return $?
+      fi
+      ;;
     park)
       if [[ $# -lt 2 ]]; then
         command "$_iwork_bin" park
@@ -625,7 +996,7 @@ iwork() {
 }
 
 _iwork() {
-  local cur prev seen_r i repos folders cmd
+  local cur prev seen_r i repos folders folder cmd
   COMPREPLY=()
   cur="${COMP_WORDS[COMP_CWORD]}"
   prev=""
@@ -636,12 +1007,19 @@ _iwork() {
   fi
 
   case "$cmd" in
-    cd|claude|codex|add-repo)
+    cd|claude|codex)
       if (( COMP_CWORD == 2 )); then
         folders="$("$_iwork_bin" --complete-worktree-folders "$cur" 2>/dev/null)" || return 0
         COMPREPLY=( $(compgen -W "$folders" -- "$cur") )
       fi
       return 0
+      ;;
+    add-repo|rm)
+      if (( COMP_CWORD == 2 )); then
+        folders="$("$_iwork_bin" --complete-worktree-folders "$cur" 2>/dev/null)" || return 0
+        COMPREPLY=( $(compgen -W "$folders" -- "$cur") )
+        return 0
+      fi
       ;;
     park)
       return 0
@@ -666,18 +1044,37 @@ _iwork() {
   done
 
   if [[ "$prev" == "-r" || -n "$seen_r" ]]; then
-    repos="$("$_iwork_bin" --complete-repos "$cur" 2>/dev/null)" || return 0
+    # For rm, only the repos that actually have a worktree in the task.
+    if [[ "$cmd" == "rm" ]]; then
+      folder=""
+      for ((i = 2; i < COMP_CWORD; i++)); do
+        case "${COMP_WORDS[i]}" in
+          -*) ;;
+          *) folder="${COMP_WORDS[i]}"; break ;;
+        esac
+      done
+    fi
+
+    if [[ "$cmd" == "rm" && -n "$folder" ]]; then
+      repos="$("$_iwork_bin" --complete-task-worktrees "$folder" "$cur" 2>/dev/null)" || return 0
+    else
+      repos="$("$_iwork_bin" --complete-repos "$cur" 2>/dev/null)" || return 0
+    fi
     COMPREPLY=( $(compgen -W "$repos" -- "$cur") )
     return 0
   fi
 
   if (( COMP_CWORD == 1 )); then
-    COMPREPLY=( $(compgen -W "add-repo park list cd claude codex init install-hooks --no-tmux --no-context -h --help --completion" -- "$cur") )
+    COMPREPLY=( $(compgen -W "add-repo rm park list cd claude codex init install-hooks --no-tmux --no-context --detach --big -h --help --completion" -- "$cur") )
     return 0
   fi
 
   if [[ "$cur" == -* ]]; then
-    COMPREPLY=( $(compgen -W "-r -h --help --completion --no-tmux --no-context" -- "$cur") )
+    if [[ "$cmd" == "rm" ]]; then
+      COMPREPLY=( $(compgen -W "-r -f" -- "$cur") )
+    else
+      COMPREPLY=( $(compgen -W "-r -h --help --completion --no-tmux --no-context --detach --big" -- "$cur") )
+    fi
     return 0
   fi
 
@@ -701,6 +1098,7 @@ iwork() {
   local cmd=""
   local folder=""
   local target=""
+  local arg=""
   local notmux=""
 
   if [[ "${1:-}" == "--no-tmux" ]]; then
@@ -711,6 +1109,31 @@ iwork() {
   cmd="${1:-}"
 
   case "$cmd" in
+    rm)
+      if [[ $# -lt 2 ]]; then
+        command "$_iwork_bin" rm
+        return $?
+      fi
+
+      shift
+      target=""
+      for arg in "$@"; do
+        case "$arg" in
+          -*) ;;
+          *)
+            target="$(command "$_iwork_bin" --resolve-worktree-folder "$arg" 2>/dev/null)"
+            break
+            ;;
+        esac
+      done
+
+      command "$_iwork_bin" ${notmux:+--no-tmux} rm "$@" || return $?
+
+      # The folder we were standing in may be gone now.
+      if [[ -n "$target" && ! -d "$target" && "$PWD" == "$target"* ]]; then
+        builtin cd "${target%/*}" || return $?
+      fi
+      ;;
     park)
       if [[ $# -lt 2 ]]; then
         command "$_iwork_bin" park
@@ -765,10 +1188,12 @@ iwork() {
 _iwork() {
   local -a repos folders
   local cmd="${words[2]:-}"
+  local folder="" word=""
 
   if (( CURRENT == 2 )); then
     _values 'command' \
       'add-repo[add repos to an existing worktree folder]' \
+      'rm[remove worktrees from a task, or the whole task]' \
       'park[move the current repo branch into a worktree folder]' \
       'list[list worktree folders]' \
       'cd[cd into a worktree folder or switch to its tmux window]' \
@@ -778,17 +1203,26 @@ _iwork() {
       'install-hooks[install Claude Code status hooks]' \
       '--no-tmux[skip tmux window handling]' \
       '--no-context[skip writing task context files]' \
+      '--detach[create the task window without switching to it]' \
+      '--big[give the task its own tmux session with a window per repo]' \
       '--completion[print shell integration]'
     return 0
   fi
 
   case "$cmd" in
-    cd|claude|codex|add-repo)
+    cd|claude|codex)
       if (( CURRENT == 3 )); then
         folders=("${(@f)$("$_iwork_bin" --complete-worktree-folders "$PREFIX" 2>/dev/null)}")
         _describe -t folders 'worktree folder' folders
       fi
       return 0
+      ;;
+    add-repo|rm)
+      if (( CURRENT == 3 )); then
+        folders=("${(@f)$("$_iwork_bin" --complete-worktree-folders "$PREFIX" 2>/dev/null)}")
+        _describe -t folders 'worktree folder' folders
+        return 0
+      fi
       ;;
     park)
       return 0
@@ -803,6 +1237,27 @@ _iwork() {
       return 0
       ;;
   esac
+
+  if [[ "$cmd" == "rm" ]]; then
+    for word in "${words[@]:2}"; do
+      case "$word" in
+        -*) ;;
+        *) folder="$word"; break ;;
+      esac
+    done
+
+    if (( ${words[(I)-r]} > 0 )); then
+      if [[ -n "$folder" ]]; then
+        repos=("${(@f)$("$_iwork_bin" --complete-task-worktrees "$folder" "$PREFIX" 2>/dev/null)}")
+      else
+        repos=("${(@f)$("$_iwork_bin" --complete-repos "$PREFIX" 2>/dev/null)}")
+      fi
+      _describe -t repos 'repo' repos
+    else
+      _values 'option' '-r[repos whose worktrees to remove]' '-f[force removal, skip prompt]'
+    fi
+    return 0
+  fi
 
   if (( CURRENT == 3 )); then
     _values 'option' '-r[repos to create worktrees for]'
@@ -860,22 +1315,76 @@ in_tmux() {
 }
 
 tmux_enabled() {
-  in_tmux && [[ -z "$IWORK_NO_TMUX" ]]
+  [[ -z "$IWORK_NO_TMUX" ]] || return 1
+
+  # Detached and dedicated-session work can both be done without an attached
+  # client, so they only need tmux to be installed, not to be running us.
+  if [[ -n "$IWORK_DETACH" || -n "$IWORK_BIG" ]]; then
+    command -v tmux >/dev/null 2>&1
+    return
+  fi
+
+  in_tmux
 }
 
-find_task_window() {
+# tmux rejects ':' and '.' in session names.
+task_session_name() {
   local folder="$1"
+  local safe="${folder//:/-}"
+
+  safe="${safe//./-}"
+  printf '%s-%s\n' "$TASKS_SESSION" "$safe"
+}
+
+# Prints "<window-id> <window-name>" for the window called $name in $session,
+# ignoring any leading '*' / '!' status marker.
+find_window_in_session() {
+  local session="$1"
+  local name="$2"
   local window_id=""
   local window_name=""
 
   while IFS=' ' read -r window_id window_name; do
-    if [[ "${window_name#[*!]}" == "$folder" ]]; then
-      printf '%s\n' "$window_id"
+    if [[ "${window_name#[*!]}" == "$name" ]]; then
+      printf '%s %s\n' "$window_id" "$window_name"
       return 0
     fi
-  done < <(tmux list-windows -t "=$TASKS_SESSION" -F '#{window_id} #{window_name}' 2>/dev/null)
+  done < <(tmux list-windows -t "=$session" -F '#{window_id} #{window_name}' 2>/dev/null)
 
   return 1
+}
+
+# A task's agent window lives either in its own session (--big) or in the
+# shared one; check the dedicated session first.
+find_task_window() {
+  local folder="$1"
+  local line=""
+
+  if line="$(find_window_in_session "$(task_session_name "$folder")" "$folder")" ||
+     line="$(find_window_in_session "$TASKS_SESSION" "$folder")"; then
+    printf '%s\n' "${line%% *}"
+    return 0
+  fi
+
+  return 1
+}
+
+# Returns non-zero when the window cannot be selected, so callers that have a
+# fallback (the 'cd' shell wrapper) can take it.
+switch_to_window() {
+  local window_id="$1"
+  local session=""
+
+  session="$(tmux display-message -p -t "$window_id" '#{session_name}' 2>/dev/null || true)"
+
+  if ! tmux select-window -t "$window_id" 2>/dev/null; then
+    warn "could not select tmux window"
+    return 1
+  fi
+
+  if [[ -n "$session" ]]; then
+    tmux switch-client -t "=$session" 2>/dev/null || true
+  fi
 }
 
 DEFAULT_CONTEXT_TEMPLATE='# Task: {{TASK}}
@@ -963,13 +1472,18 @@ open_task_window() {
   [[ -d "$folder_path" ]] || return 0
 
   if window_id="$(find_task_window "$folder")"; then
-    tmux select-window -t "$window_id" 2>/dev/null || warn "could not select tmux window '$folder'"
-    tmux switch-client -t "=$TASKS_SESSION" 2>/dev/null || true
+    if [[ -n "$IWORK_DETACH" ]]; then
+      echo "tmux window '$folder' is already open (not switching)"
+      return 0
+    fi
+    switch_to_window "$window_id" || true
     return 0
   fi
 
   if tmux has-session -t "=$TASKS_SESSION" 2>/dev/null; then
-    if ! IFS=' ' read -r window_id pane_id < <(tmux new-window -t "=$TASKS_SESSION" -n "$folder" -c "$folder_path" -P -F '#{window_id} #{pane_id}' 2>/dev/null); then
+    # -d keeps the new window from becoming the session's active window, which
+    # would move the client if it is already viewing the tasks session.
+    if ! IFS=' ' read -r window_id pane_id < <(tmux new-window ${IWORK_DETACH:+-d} -t "=$TASKS_SESSION" -n "$folder" -c "$folder_path" -P -F '#{window_id} #{pane_id}' 2>/dev/null); then
       warn "could not create tmux window '$folder'"
       return 0
     fi
@@ -986,8 +1500,139 @@ open_task_window() {
   printf -v tool_cmd '%q ' "$tool" "$@"
   tmux send-keys -t "$pane_id" "$tool_cmd" Enter 2>/dev/null || warn "could not start $tool in tmux window '$folder'"
 
-  tmux select-window -t "$window_id" 2>/dev/null || true
-  tmux switch-client -t "=$TASKS_SESSION" 2>/dev/null || true
+  if [[ -n "$IWORK_DETACH" ]]; then
+    echo "Started $tool in detached tmux window '$folder' (session '$TASKS_SESSION')"
+    echo "  attach with: iwork cd $folder"
+    return 0
+  fi
+
+  switch_to_window "$window_id" || true
+}
+
+# One window per repo worktree: editor on the left, shell on the right, both
+# rooted in the worktree. Idempotent, so add-repo can extend a live session.
+add_repo_windows() {
+  local folder="$1"
+  local session="$2"
+  local folder_path="$TASKS_DIR/$folder"
+  local wt=""
+  local name=""
+  local pane_id=""
+  local added=0
+
+  while IFS= read -r wt; do
+    [[ -n "$wt" ]] || continue
+    name="${wt##*/}"
+
+    find_window_in_session "$session" "$name" >/dev/null && continue
+
+    if ! pane_id="$(tmux new-window -d -t "=$session" -n "$name" -c "$wt" -P -F '#{pane_id}' 2>/dev/null)"; then
+      warn "could not create tmux window '$name'"
+      continue
+    fi
+
+    tmux split-window -h -t "$pane_id" -c "$wt" 2>/dev/null || warn "could not split tmux window '$name'"
+    tmux select-pane -t "$pane_id" 2>/dev/null || true
+    # IWORK_EDITOR is a command line from the user's own config, so run it as
+    # written with the worktree appended.
+    tmux send-keys -t "$pane_id" "$IWORK_EDITOR ." Enter 2>/dev/null ||
+      warn "could not start $IWORK_EDITOR in tmux window '$name'"
+    added=$((added + 1))
+  done < <(list_task_worktrees "$folder_path")
+
+  printf '%s\n' "$added"
+}
+
+open_task_session() {
+  local folder="$1"
+  local tool="$2"
+  shift 2
+  local folder_path="$TASKS_DIR/$folder"
+  local session=""
+  local window_id=""
+  local pane_id=""
+  local tool_cmd=""
+  local created=""
+  local added=0
+  local shared_line=""
+
+  tmux_enabled || return 0
+  [[ -d "$folder_path" ]] || return 0
+
+  session="$(task_session_name "$folder")"
+
+  if ! tmux has-session -t "=$session" 2>/dev/null; then
+    # The task may already be open as a plain window in the shared session;
+    # starting a second agent for it in a new session would be a surprise.
+    if shared_line="$(find_window_in_session "$TASKS_SESSION" "$folder")"; then
+      warn "task '$folder' is already open in session '$TASKS_SESSION'; not starting a second agent there"
+      warn "close that window first if you want '$folder' to have its own session"
+      if [[ -z "$IWORK_DETACH" ]] && in_tmux; then
+        switch_to_window "${shared_line%% *}" || true
+      fi
+      return 0
+    fi
+
+    # The agent window keeps the task name so the Claude status hooks still
+    # recognise it (*task busy, !task waiting).
+    if ! IFS=' ' read -r window_id pane_id < <(tmux new-session -d -s "$session" -n "$folder" -c "$folder_path" -P -F '#{window_id} #{pane_id}' 2>/dev/null); then
+      warn "could not create tmux session '$session'"
+      return 0
+    fi
+    created=1
+
+    tmux split-window -h -t "$pane_id" -c "$folder_path" 2>/dev/null || warn "could not split tmux window '$folder'"
+    tmux select-pane -t "$pane_id" 2>/dev/null || true
+
+    printf -v tool_cmd '%q ' "$tool" "$@"
+    tmux send-keys -t "$pane_id" "$tool_cmd" Enter 2>/dev/null || warn "could not start $tool in tmux window '$folder'"
+  fi
+
+  added="$(add_repo_windows "$folder" "$session")"
+
+  if [[ -z "$created" ]]; then
+    echo "tmux session '$session' already exists (added $added repo window(s))"
+  else
+    echo "tmux session '$session': '$folder' running $tool, plus $added repo window(s)"
+  fi
+
+  if [[ -n "$IWORK_DETACH" ]]; then
+    echo "  attach with: tmux switch-client -t $session   (or: tmux attach -t $session)"
+    return 0
+  fi
+
+  if ! in_tmux; then
+    echo "  attach with: tmux attach -t $session"
+    return 0
+  fi
+
+  if ! window_id="$(find_task_window "$folder")"; then
+    return 0
+  fi
+  switch_to_window "$window_id" || true
+}
+
+open_task() {
+  if [[ -n "$IWORK_BIG" ]]; then
+    open_task_session "$@"
+  else
+    open_task_window "$@"
+  fi
+}
+
+# add-repo into a task that already owns a session should get a window too.
+extend_task_session() {
+  local folder="$1"
+  local session=""
+  local added=0
+
+  tmux_enabled || return 0
+  session="$(task_session_name "$folder")"
+  tmux has-session -t "=$session" 2>/dev/null || return 0
+
+  added="$(add_repo_windows "$folder" "$session")"
+  (( added > 0 )) && echo "Added $added window(s) to tmux session '$session'"
+  return 0
 }
 
 handle_claude_hook() {
@@ -1150,10 +1795,12 @@ if [[ $# -eq 0 ]]; then
   usage 0
 fi
 
-while [[ "${1:-}" == "--no-tmux" || "${1:-}" == "--no-context" ]]; do
+while [[ "${1:-}" == "--no-tmux" || "${1:-}" == "--no-context" || "${1:-}" == "--detach" || "${1:-}" == "--big" ]]; do
   case "$1" in
     --no-tmux) IWORK_NO_TMUX=1 ;;
     --no-context) IWORK_NO_CONTEXT=1 ;;
+    --detach) IWORK_DETACH=1 ;;
+    --big) IWORK_BIG=1 ;;
   esac
   shift
   if [[ $# -eq 0 ]]; then
@@ -1190,6 +1837,11 @@ case "${1:-}" in
     list_worktree_folders "${2:-}"
     exit 0
     ;;
+  --complete-task-worktrees)
+    require_config
+    list_task_worktree_names "${2:-}" "${3:-}"
+    exit 0
+    ;;
   --resolve-worktree-folder)
     require_config
     resolve_worktree_folder "${2:-}"
@@ -1204,8 +1856,7 @@ case "${1:-}" in
     tmux_enabled || exit 1
     validate_worktree_folder_name "${2:-}"
     switch_window_id="$(find_task_window "${2:-}")" || exit 1
-    tmux select-window -t "$switch_window_id" 2>/dev/null || exit 1
-    tmux switch-client -t "=$TASKS_SESSION" 2>/dev/null || true
+    switch_to_window "$switch_window_id" || exit 1
     exit 0
     ;;
   --hook)
@@ -1251,6 +1902,44 @@ if [[ "${1:-}" == "install-hooks" ]]; then
   exit 0
 fi
 
+if [[ "${1:-}" == "rm" ]]; then
+  shift
+  rm_force=""
+  rm_positional=()
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -f|--force)
+        rm_force=1
+        shift
+        ;;
+      -r)
+        break
+        ;;
+      *)
+        rm_positional+=("$1")
+        shift
+        ;;
+    esac
+  done
+
+  if [[ ${#rm_positional[@]} -ne 1 ]]; then
+    die "usage: iwork rm [-f] <task> [-r <repo1> [repo2 ...]]"
+  fi
+
+  require_config
+  folder_name="${rm_positional[0]}"
+  validate_worktree_folder_name "$folder_name"
+
+  repos=()
+  if [[ $# -gt 0 ]]; then
+    parse_repos_flag "expected -r <repos> after task name" "$@"
+  fi
+
+  remove_worktrees "$folder_name" "$rm_force" "${repos[@]+${repos[@]}}"
+  exit 0
+fi
+
 if [[ "${1:-}" == "add-repo" ]]; then
   if [[ $# -lt 4 ]]; then
     die "usage: iwork add-repo <task> -r <repo1> [repo2 ...]"
@@ -1263,9 +1952,9 @@ if [[ "${1:-}" == "add-repo" ]]; then
   parse_repos_flag "expected -r <repos> after folder name" "${@:3}"
 
   branch="$(detect_branch_from_worktree_folder "$folder_name")"
-  branch_slug="${branch//\//-}"
 
-  create_worktrees "$branch" "$folder_name" "$branch_slug" "${repos[@]}"
+  create_worktrees "$branch" "$folder_name" "${repos[@]}"
+  extend_task_session "$folder_name"
   exit 0
 fi
 
@@ -1303,8 +1992,7 @@ parse_repos_flag "expected -r <repos> after branch name" "$@"
 
 # Folder name: replace / with -
 folder_name="${branch//\//-}"
-branch_slug="$folder_name"
 
-create_worktrees "$branch" "$folder_name" "$branch_slug" "${repos[@]}"
+create_worktrees "$branch" "$folder_name" "${repos[@]}"
 write_task_context "$folder_name" "$branch"
-open_task_window "$folder_name" claude
+open_task "$folder_name" claude

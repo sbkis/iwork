@@ -20,10 +20,23 @@ directory (`IWORK_REPO_DIR`). Task folders are collected in a tasks directory
 ├── frontend/
 └── tasks/                       # IWORK_TASKS_DIR — task folders live here
     └── feat-login/              # one task folder
-        ├── backend-api--feat-login/   # a git worktree (named repo--branch-slug)
-        ├── frontend--feat-login/      # another worktree, same branch
-        ├── CLAUDE.md             # generated task context (scopes the agent)
-        └── AGENTS.md             # identical content, for Codex
+        ├── backend-api/         # a git worktree, named after its repo
+        ├── frontend/            # another worktree, same branch
+        ├── CLAUDE.md            # generated task context (scopes the agent)
+        └── AGENTS.md            # identical content, for Codex
+```
+
+Each worktree subdirectory carries the same name as the repo it came from, so a
+path inside a task reads like a path inside the repo itself.
+
+Older versions named these `repo--branch-slug`. Existing folders keep working —
+`iwork rm -r <repo>` still finds them — and you can rename them by hand if you
+want the layouts consistent:
+
+```bash
+git -C ~/dev/projects/backend-api worktree move \
+  ~/dev/projects/tasks/feat-login/backend-api--feat-login \
+  ~/dev/projects/tasks/feat-login/backend-api
 ```
 
 The tool itself can live anywhere — it does **not** need to be under `IWORK_REPO_DIR`.
@@ -118,9 +131,13 @@ setw -g automatic-rename off        # let iwork own the task window names
 bind Tab switch-client -l           # prefix+Tab: toggle last session
 bind T switch-client -t tasks       # prefix+T: jump to tasks session
 
-# Waiting-agent counter in the status bar
-set -g status-right '!#(tmux list-windows -t tasks -F "#W" 2>/dev/null | grep -c "^!")  %Y-%m-%d %H:%M:%S'
+# Waiting-agent counter in the status bar. -a covers every session, so it also
+# counts agents inside per-task `tasks-*` sessions (see Big tasks below).
+set -g status-right '!#(tmux list-windows -a -F "#W" 2>/dev/null | grep -c "^!")  %Y-%m-%d %H:%M:%S'
 ```
+
+Only `iwork` marks window names with `!`, so counting across all sessions is safe.
+With `--big` in play, `prefix + s` lists the `tasks-` sessions together.
 
 ## Quick start
 
@@ -130,6 +147,10 @@ iwork feat/login-bug -r backend-api frontend
 
 # Add another repo to that task later
 iwork add-repo feat-login-bug -r shared-lib
+
+# Remove one repo's worktree, or the whole task
+iwork rm feat-login-bug -r shared-lib
+iwork rm feat-login-bug
 
 # Jump back into the task (tmux window if present, else cd)
 iwork cd feat-login-bug
@@ -144,6 +165,138 @@ iwork park task-billing-followup
 # See your tasks (with live agent status inside tmux)
 iwork list
 ```
+
+## Branch tracking
+
+A task branch is created from `origin/main` (or whatever `origin/HEAD` points at),
+but **without** an upstream. Git's default would make `origin/main` the upstream of
+the new branch, so every `git status` and shell prompt would report the branch as
+ahead of — and behind — a branch it has nothing to do with, before it has ever been
+pushed:
+
+```
+## feat/login-bug...origin/main [ahead 1]     # git's default
+## feat/login-bug                             # what iwork creates
+```
+
+The branch still *starts* from the base branch; only the upstream link is skipped.
+Push as usual when you're ready, and that sets a real upstream:
+
+```bash
+git push -u origin HEAD        # -> origin/feat/login-bug
+```
+
+Worktrees created before this change still carry the old upstream. Clear it from
+inside the worktree:
+
+```bash
+git branch --unset-upstream
+```
+
+## Detached mode
+
+`--detach` spins a task up without dragging you to it. The window is still
+created and the agent still starts in it — your client just stays where it is:
+
+```bash
+iwork --detach feat/login-bug -r backend-api frontend   # create, stay put
+iwork --detach claude feat-login-bug                    # start an agent, stay put
+iwork --detach park task-billing-followup               # park, stay put
+```
+
+Useful when you want an agent chewing on something while you keep working, and
+for scripting: because nothing needs a client to switch, `--detach` also works
+from **outside** tmux, creating the tasks session in the background.
+
+Pick the task up whenever you like with `iwork cd <task>`, or watch it from
+`iwork list` — the `*` / `!` markers report whether the agent is busy or waiting
+for you. Set `IWORK_DETACH=1` in your config to make this the default.
+
+## Big tasks: a session per task
+
+One window is thin for a task spanning four repos. `--big` gives the task a whole
+tmux session instead, named `<tmux-session>-<task>` — `tasks-feat-x` by default,
+so all of them sort and grep together:
+
+```bash
+iwork --big feat/big-thing -r backend-api frontend shared-lib admin
+```
+
+```
+session tasks-feat-big-thing
+├── window "feat-big-thing"   claude | shell          — at the task root
+├── window "admin"            nvim . | shell          — inside tasks/…/admin
+├── window "backend-api"      nvim . | shell
+├── window "frontend"         nvim . | shell
+└── window "shared-lib"       nvim . | shell
+```
+
+The editor is `IWORK_EDITOR` (default `nvim`), run as a command line with the
+worktree appended — so `IWORK_EDITOR="code -n"` or `IWORK_EDITOR=hx` both work.
+You land on the agent window; the repo windows are built behind it.
+
+How it fits with everything else:
+
+- **The agent window keeps the task name**, so the Claude Code status hooks still
+  rename it `*task` / `!task`, and `iwork list` reports it — tagged `(session)` so
+  you can see which tasks own one.
+- **`cd`, `claude`, `codex`** find a task in its own session or in the shared one,
+  whether or not you pass `--big` again.
+- **`add-repo`** adds a window for the new repo to a live session.
+- **`rm`** kills the whole session, and says so before it does — anything unsaved
+  in those editors goes with it.
+- **`--big --detach`** builds the session without moving you into it, and works
+  from outside tmux entirely.
+
+If a task is already open as a plain window in the shared session, `--big` will
+not start a second agent for it in a new session; close that window first.
+
+Set `IWORK_BIG=1` in your config to make every task work this way.
+
+
+## Cleaning up
+
+```bash
+iwork rm feat-login-bug                  # every worktree, plus the task folder
+iwork rm feat-login-bug -r shared-lib    # just that repo's worktree
+iwork rm -f feat-login-bug               # don't ask, and drop uncommitted work
+```
+
+`rm` removes git worktrees (via `git worktree remove`, then a prune in the parent
+repo) and, when no `-r` is given, the generated agent context (`CLAUDE.md`,
+`AGENTS.md`, `.claude/`), the task folder, and the task's tmux window or session.
+It shows what it is about to do and asks for confirmation first.
+
+Things it will not do:
+
+- **Delete branches.** The branch survives every removal; only the working copy
+  goes away.
+- **Throw away uncommitted work.** If any target worktree is dirty, `rm` names it
+  and stops. Pass `-f` to remove it anyway (which also skips the prompt).
+- **Delete files it didn't create.** Anything in the task folder other than the
+  worktrees and that generated agent context keeps the folder alive; `rm` warns
+  and lists what stayed behind.
+
+### Orphaned worktrees
+
+If a worktree directory is renamed with plain `mv` instead of `git worktree move`,
+git eventually prunes the registration it can no longer find, leaving a directory
+with a dangling `.git`. git can tell you nothing about such a directory — not even
+whether it holds uncommitted work — so `rm` reports it as orphaned and refuses
+without `-f`:
+
+```
+  - accounting-api  (orphaned: registration gone, deleted as a plain directory)
+Error: orphaned directories cannot be checked for uncommitted work; re-run with -f to delete them
+```
+
+With `-f` it is deleted as a plain directory. To rename a worktree without
+creating one of these, use `git worktree move` (see the migration snippet above).
+
+Removing the task you are currently in is fine — with the shell integration
+sourced, your shell is moved up to the tasks directory afterwards. If the tmux
+window being removed is the one you are sitting in, `iwork` leaves it to you to
+close.
 
 Run `iwork -h` for the full command reference.
 
@@ -161,12 +314,15 @@ overrides.
 | `IWORK_TASKS_DIR` | `$IWORK_REPO_DIR/tasks` | Where task folders are created |
 | `IWORK_TMUX_SESSION` | `tasks` | tmux session that holds task windows |
 | `IWORK_CONTEXT_TEMPLATE` | `~/.config/iwork/task-context.md.tmpl` | Template for the generated `CLAUDE.md`/`AGENTS.md` (seeded with a default on first use, then yours to edit) |
+| `IWORK_EDITOR` | `nvim` | Editor started in each repo window under `--big`; run as a command line with the worktree appended |
 | `IWORK_NO_TMUX` | unset | Set to skip all tmux handling (same as the `--no-tmux` flag) |
 | `IWORK_NO_CONTEXT` | unset | Set to skip writing task context files (same as `--no-context`) |
-| `IWORK_ASSUME_YES` | unset | Set to `1` so `install-hooks` writes without the confirmation prompt |
+| `IWORK_DETACH` | unset | Set to never switch to the task window (same as `--detach`) |
+| `IWORK_BIG` | unset | Set to give every task its own session (same as `--big`) |
+| `IWORK_ASSUME_YES` | unset | Set to `1` to skip confirmation prompts (`install-hooks`, `rm`) |
 
-Leading flags `--no-tmux` and `--no-context` apply per-invocation, e.g.
-`iwork --no-tmux claude feat-login-bug`.
+Leading flags `--no-tmux`, `--no-context`, `--detach` and `--big` apply
+per-invocation, e.g. `iwork --no-tmux claude feat-login-bug`.
 
 ## Updating
 
