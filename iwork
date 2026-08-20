@@ -34,6 +34,8 @@ IWORK_NO_CONTEXT="${IWORK_NO_CONTEXT:-}"
 IWORK_DETACH="${IWORK_DETACH:-}"
 IWORK_BIG="${IWORK_BIG:-}"
 IWORK_EDITOR="${IWORK_EDITOR:-nvim}"
+# Per-invocation only (--from): the task or branch new branches start from.
+BASE_SPEC=""
 CONTEXT_TEMPLATE="${IWORK_CONTEXT_TEMPLATE:-$HOME/.config/iwork/task-context.md.tmpl}"
 
 require_config() {
@@ -46,8 +48,8 @@ require_config() {
 
 usage() {
   cat <<'EOF'
-Usage: iwork [flags] <branch-name> -r <repo1> [repo2 ...]
-       iwork add-repo <task> -r <repo1> [repo2 ...]
+Usage: iwork [flags] <branch-name> [--from <task|branch>] -r <repo1> [repo2 ...]
+       iwork add-repo <task> [--from <task|branch>] -r <repo1> [repo2 ...]
        iwork [--no-tmux] rm [-f] <task> [-r <repo1> [repo2 ...]]
        iwork [flags] park <task>
        iwork [--no-tmux] list
@@ -67,6 +69,21 @@ subdirectory named after the repo it comes from.
 New branches start from the base branch but get no upstream, so status and
 prompts do not report them as ahead of/behind origin/main before they are
 pushed. Use 'git push -u origin HEAD' to set a real upstream.
+
+--from <task|branch> stacks a task on earlier work instead of starting from
+origin/main. Per repo, iwork uses the first of these that exists, and says
+which base each repo got:
+
+  1. the branch checked out in that repo's worktree in the named task
+  2. a local branch of that name
+  3. origin/<name>
+  4. anything else git resolves there: origin/x spelled out, a tag, a SHA
+
+So the base needs no worktree and no live task — 'rm' keeps branches, so a
+task you have already torn down still works as a base, as does any ordinary
+branch you never made a task for. Repos the base does not cover fall back to
+their own base branch with a warning, so a task can be wider than the one it
+builds on.
 
 Configuration lives in ~/.config/iwork/config (run 'iwork init' to create
 it). IWORK_REPO_DIR must point at the directory whose direct children are
@@ -105,6 +122,11 @@ folder from a template (~/.config/iwork/task-context.md.tmpl, override with
 IWORK_CONTEXT_TEMPLATE), seeding a default template on first use. Existing
 files are never overwritten.
 
+A task created with --from records what it was branched from, so the agent
+knows that work is already in its history: the template can place it with a
+{{BASE}} placeholder, and without one iwork appends a short '## Base'
+section instead.
+
 Subcommands:
   init           Interactively create the config file
   add-repo       Add one or more repos to an existing task folder
@@ -128,6 +150,9 @@ Examples:
   iwork feat/bla -r backend-api frontend
   iwork fix/login-bug -r auth-service web-app
   iwork add-repo feat-bla -r shared-lib
+  iwork feat/step-two --from feat-step-one -r backend-api frontend
+  iwork feat/step-two --from feat/step-one -r backend-api
+  iwork add-repo feat-step-two --from feat-step-one -r shared-lib
   iwork rm feat-bla
   iwork rm feat-bla -r shared-lib
   iwork rm -f feat-bla
@@ -149,6 +174,8 @@ Options:
                 to it (leading flag)
   --big         Give the task its own tmux session, with a window per repo
                 (editor + shell) alongside the agent window (leading flag)
+  --from        Start the new branches from this task or branch instead of
+                origin/main; accepted before or after the branch name
   -r            Repos to create worktrees for (required, at least one)
   -f            rm only: remove worktrees with uncommitted changes or
                 orphaned directories, and skip the confirmation prompt
@@ -825,6 +852,12 @@ create_worktrees() {
   shift 2
   local repos=("$@")
 
+  if [[ -n "$BASE_SPEC" ]]; then
+    [[ "$BASE_SPEC" != "$folder_name" ]] || die "a task cannot be based on itself"
+    base_spec_is_resolvable "${repos[@]}" ||
+      die "no task folder or branch named '$BASE_SPEC' to build on"
+  fi
+
   for repo in "${repos[@]}"; do
     repo_path=""
     wt_path=""
@@ -863,7 +896,7 @@ create_worktrees() {
       die "branch '$branch' already exists on origin for $repo"
     fi
 
-    base_ref="$(resolve_base_ref "$repo_path")" || die "could not determine a base branch for $repo"
+    base_ref="$(resolve_task_base_ref "$repo" "$repo_path")" || die "could not determine a base branch for $repo"
     base_refs+=("$base_ref")
   done
 
@@ -887,10 +920,11 @@ create_worktrees() {
       # ahead/behind a branch it has nothing to do with. Push with
       # 'git push -u origin HEAD' to set a real upstream.
       git -C "$repo_path" worktree add --no-track -b "$branch" "$wt_path" "$base_ref"
-    else
-      git -C "$repo_path" worktree add "$wt_path" "$branch"
+      echo "  -> $repo (branch: $branch, from $base_ref)"
+      continue
     fi
 
+    git -C "$repo_path" worktree add "$wt_path" "$branch"
     echo "  -> $repo (branch: $branch)"
   done
 
@@ -1035,6 +1069,13 @@ _iwork() {
       ;;
   esac
 
+  # --from takes an existing task (or a branch, which we cannot complete)
+  if [[ "$prev" == "--from" ]]; then
+    folders="$("$_iwork_bin" --complete-worktree-folders "$cur" 2>/dev/null)" || return 0
+    COMPREPLY=( $(compgen -W "$folders" -- "$cur") )
+    return 0
+  fi
+
   seen_r=""
   for ((i = 1; i < COMP_CWORD; i++)); do
     if [[ "${COMP_WORDS[i]}" == "-r" ]]; then
@@ -1065,7 +1106,7 @@ _iwork() {
   fi
 
   if (( COMP_CWORD == 1 )); then
-    COMPREPLY=( $(compgen -W "add-repo rm park list cd claude codex init install-hooks --no-tmux --no-context --detach --big -h --help --completion" -- "$cur") )
+    COMPREPLY=( $(compgen -W "add-repo rm park list cd claude codex init install-hooks --no-tmux --no-context --detach --big --from -h --help --completion" -- "$cur") )
     return 0
   fi
 
@@ -1073,7 +1114,7 @@ _iwork() {
     if [[ "$cmd" == "rm" ]]; then
       COMPREPLY=( $(compgen -W "-r -f" -- "$cur") )
     else
-      COMPREPLY=( $(compgen -W "-r -h --help --completion --no-tmux --no-context --detach --big" -- "$cur") )
+      COMPREPLY=( $(compgen -W "-r --from -h --help --completion --no-tmux --no-context --detach --big" -- "$cur") )
     fi
     return 0
   fi
@@ -1205,6 +1246,7 @@ _iwork() {
       '--no-context[skip writing task context files]' \
       '--detach[create the task window without switching to it]' \
       '--big[give the task its own tmux session with a window per repo]' \
+      '--from[start the new branches from this task or branch]' \
       '--completion[print shell integration]'
     return 0
   fi
@@ -1237,6 +1279,12 @@ _iwork() {
       return 0
       ;;
   esac
+
+  if [[ "${words[CURRENT-1]}" == "--from" ]]; then
+    folders=("${(@f)$("$_iwork_bin" --complete-worktree-folders "$PREFIX" 2>/dev/null)}")
+    _describe -t folders 'task to build on' folders
+    return 0
+  fi
 
   if [[ "$cmd" == "rm" ]]; then
     for word in "${words[@]:2}"; do
@@ -1301,6 +1349,124 @@ resolve_base_ref() {
   done
 
   return 1
+}
+
+validate_base_spec() {
+  local spec="$1"
+
+  case "$spec" in
+    -*)
+      die "--from needs a task or branch name, got the flag '$spec'"
+      ;;
+    ""|.|..|*\\*)
+      die "invalid --from value '$spec'"
+      ;;
+    */*)
+      # Only a branch can contain '/', so it is never a task folder lookup.
+      validate_branch "$spec"
+      ;;
+    *)
+      validate_worktree_folder_name "$spec"
+      ;;
+  esac
+}
+
+# The worktree for $repo inside task folder $folder, current layout or the
+# older repo--branch-slug one.
+task_repo_worktree() {
+  local folder="$1"
+  local repo="$2"
+  local child=""
+
+  for child in "$TASKS_DIR/$folder/$repo" "$TASKS_DIR/$folder/$repo"--*; do
+    [[ -d "$child" ]] || continue
+    is_worktree_root "$child" || continue
+    printf '%s\n' "$child"
+    return 0
+  done
+
+  return 1
+}
+
+# A base does not need a worktree: a plain local branch, a remote branch, a tag
+# or a commit all work, since the new branch only needs a starting point.
+resolve_base_committish() {
+  local repo_path="$1"
+
+  if git -C "$repo_path" show-ref --verify --quiet "refs/heads/$BASE_SPEC" 2>/dev/null; then
+    printf '%s\n' "$BASE_SPEC"
+    return 0
+  fi
+
+  if git -C "$repo_path" show-ref --verify --quiet "refs/remotes/origin/$BASE_SPEC" 2>/dev/null; then
+    printf 'origin/%s\n' "$BASE_SPEC"
+    return 0
+  fi
+
+  # Anything else git can resolve: origin/x spelled out, a tag, a SHA.
+  if git -C "$repo_path" rev-parse --verify --quiet "$BASE_SPEC^{commit}" >/dev/null 2>&1; then
+    printf '%s\n' "$BASE_SPEC"
+    return 0
+  fi
+
+  return 1
+}
+
+# True when --from names something we can actually build on: a task folder, or
+# something resolvable in at least one of the repos being set up.
+base_spec_is_resolvable() {
+  local repo=""
+
+  case "$BASE_SPEC" in
+    */*) ;;
+    *) [[ -d "$TASKS_DIR/$BASE_SPEC" ]] && return 0 ;;
+  esac
+
+  for repo in "$@"; do
+    if resolve_base_committish "$REPO_DIR/$repo" >/dev/null; then
+      return 0
+    fi
+  done
+
+  return 1
+}
+
+# Where a new branch for $repo should start: the branch of the task named by
+# --from when that task covers this repo, else a branch of that name in the
+# repo, else the repo's own base branch.
+resolve_task_base_ref() {
+  local repo="$1"
+  local repo_path="$2"
+  local base_wt=""
+  local branch=""
+
+  if [[ -z "$BASE_SPEC" ]]; then
+    resolve_base_ref "$repo_path"
+    return
+  fi
+
+  case "$BASE_SPEC" in
+    */*) ;;
+    *)
+      if base_wt="$(task_repo_worktree "$BASE_SPEC" "$repo")"; then
+        branch="$(git -C "$base_wt" branch --show-current 2>/dev/null || true)"
+        if [[ -n "$branch" ]]; then
+          if [[ -n "$(git -C "$base_wt" status --porcelain --untracked-files=no 2>/dev/null || true)" ]]; then
+            warn "$repo: base task '$BASE_SPEC' has uncommitted changes; branching from its last commit"
+          fi
+          printf '%s\n' "$branch"
+          return 0
+        fi
+      fi
+      ;;
+  esac
+
+  if resolve_base_committish "$repo_path"; then
+    return 0
+  fi
+
+  warn "$repo: nothing named '$BASE_SPEC' here; using the repo's base branch instead"
+  resolve_base_ref "$repo_path"
 }
 
 is_registered_worktree_path() {
@@ -1390,7 +1556,8 @@ switch_to_window() {
 DEFAULT_CONTEXT_TEMPLATE='# Task: {{TASK}}
 
 You are working in an iwork task directory. It contains git worktrees of
-the repositories relevant to this task, all on branch `{{BRANCH}}`:
+the repositories relevant to this task, all on branch `{{BRANCH}}`,
+branched from {{BASE}}:
 
 {{REPOS}}
 
@@ -1429,6 +1596,7 @@ write_task_context() {
   local rendered=""
   local child=""
   local target=""
+  local base_text=""
 
   [[ -n "$IWORK_NO_CONTEXT" ]] && return 0
   [[ -d "$folder_path" ]] || return 0
@@ -1448,10 +1616,31 @@ ${child##*/}"
     fi
   done
 
+  if [[ -n "$BASE_SPEC" ]]; then
+    base_text="\`$BASE_SPEC\` — this task is stacked on that work, so its
+commits are already in the history here"
+  else
+    base_text="each repository's base branch"
+  fi
+
   rendered="$template"
   rendered="${rendered//\{\{TASK\}\}/$folder}"
   rendered="${rendered//\{\{BRANCH\}\}/$branch}"
+  rendered="${rendered//\{\{BASE\}\}/$base_text}"
   rendered="${rendered//\{\{REPOS\}\}/$repos_list}"
+
+  # A stacked task is worth saying out loud even when the template predates
+  # {{BASE}} — an agent that does not know the earlier work is already in the
+  # history here is liable to build it a second time.
+  if [[ -n "$BASE_SPEC" && "$template" != *'{{BASE}}'* ]]; then
+    rendered="$rendered
+
+## Base
+
+These branches were created from \`$BASE_SPEC\`, so that work is already in the
+history here. Build on it rather than reimplementing it, and keep this task's
+commits on top."
+  fi
 
   for target in "$folder_path/CLAUDE.md" "$folder_path/AGENTS.md"; do
     [[ -e "$target" ]] && continue
@@ -1795,12 +1984,18 @@ if [[ $# -eq 0 ]]; then
   usage 0
 fi
 
-while [[ "${1:-}" == "--no-tmux" || "${1:-}" == "--no-context" || "${1:-}" == "--detach" || "${1:-}" == "--big" ]]; do
+while [[ "${1:-}" == "--no-tmux" || "${1:-}" == "--no-context" || "${1:-}" == "--detach" || "${1:-}" == "--big" || "${1:-}" == "--from" ]]; do
   case "$1" in
     --no-tmux) IWORK_NO_TMUX=1 ;;
     --no-context) IWORK_NO_CONTEXT=1 ;;
     --detach) IWORK_DETACH=1 ;;
     --big) IWORK_BIG=1 ;;
+    --from)
+      shift
+      [[ $# -gt 0 ]] || die "--from needs a task or branch name"
+      BASE_SPEC="$1"
+      validate_base_spec "$BASE_SPEC"
+      ;;
   esac
   shift
   if [[ $# -eq 0 ]]; then
@@ -1942,14 +2137,23 @@ fi
 
 if [[ "${1:-}" == "add-repo" ]]; then
   if [[ $# -lt 4 ]]; then
-    die "usage: iwork add-repo <task> -r <repo1> [repo2 ...]"
+    die "usage: iwork add-repo <task> [--from <task|branch>] -r <repo1> [repo2 ...]"
   fi
 
   require_config
   folder_name="$2"
   validate_worktree_folder_name "$folder_name"
+  shift 2
 
-  parse_repos_flag "expected -r <repos> after folder name" "${@:3}"
+  if [[ "${1:-}" == "--from" ]]; then
+    shift
+    [[ $# -gt 0 ]] || die "--from needs a task or branch name"
+    BASE_SPEC="$1"
+    validate_base_spec "$BASE_SPEC"
+    shift
+  fi
+
+  parse_repos_flag "expected -r <repos> after folder name" "$@"
 
   branch="$(detect_branch_from_worktree_folder "$folder_name")"
 
@@ -1987,6 +2191,15 @@ shift
 
 require_config
 validate_branch "$branch"
+
+# --from also reads naturally after the branch name: iwork feat/y --from feat-x
+if [[ "${1:-}" == "--from" ]]; then
+  shift
+  [[ $# -gt 0 ]] || die "--from needs a task or branch name"
+  BASE_SPEC="$1"
+  validate_base_spec "$BASE_SPEC"
+  shift
+fi
 
 parse_repos_flag "expected -r <repos> after branch name" "$@"
 
