@@ -193,6 +193,62 @@ inside the worktree:
 git branch --unset-upstream
 ```
 
+## Stacking a task on earlier work
+
+By default a task branches from `origin/main`. `--from` starts it from earlier
+work instead — another task, or any branch:
+
+```bash
+iwork feat/step-two --from feat-step-one -r backend-api frontend
+iwork --from feat-step-one feat/step-two -r backend-api      # also fine, leading
+iwork add-repo feat-step-two --from feat-step-one -r shared-lib
+```
+
+Per repo, iwork uses the first of these that exists and reports which base each
+repo got:
+
+1. the branch checked out in that repo's worktree in the named task
+2. a local branch of that name
+3. `origin/<name>`
+4. anything else git resolves there — `origin/x` spelled out, a tag, a SHA
+
+So the base needs **no worktree and no live task**. `rm` keeps branches, so a task
+you have already torn down still works as a base, and so does an ordinary branch
+you never made a task for:
+
+```bash
+iwork feat/next --from feat/step-one -r api     # branch of a deleted task
+iwork feat/next --from spike/local -r api       # plain local branch
+iwork feat/next --from release/2026 -r web      # remote-only branch
+iwork feat/next --from v1.2.3 -r api            # tag
+```
+
+A stacked task can be wider than its base. Repos the base doesn't cover fall back
+to their own base branch and say so:
+
+```
+Warning: shared: nothing named 'feat-step-one' here; using the repo's base branch instead
+  -> api (branch: feat/step-two, from feat/step-one)
+  -> web (branch: feat/step-two, from feat/step-one)
+  -> shared (branch: feat/step-two, from origin/main)
+```
+
+If the base task has uncommitted changes, the new branch starts from its last
+commit — iwork warns rather than guessing what you meant.
+
+Two things to know:
+
+- **The stack does not track.** Branching is a one-time starting point: if the base
+  branch gains commits later, stacked tasks don't follow. Rebase yourself
+  (`git rebase feat/step-one`) if you need to catch up.
+- **Agents are told.** A stacked task's `CLAUDE.md`/`AGENTS.md` says what it was
+  branched from, so the agent knows that work is already in its history and
+  shouldn't be built again. No template change needed: iwork appends a short
+  `## Base` section. If you'd rather place it yourself, put `{{BASE}}` in
+  `~/.config/iwork/task-context.md.tmpl` — e.g. ``all on branch `{{BRANCH}}`,
+  branched from {{BASE}}:`` — and the appended section is skipped. Tasks without
+  `--from` get no `## Base` section at all.
+
 ## Detached mode
 
 `--detach` spins a task up without dragging you to it. The window is still
