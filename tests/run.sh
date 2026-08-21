@@ -1632,6 +1632,43 @@ test_tmux_session_is_killed_with_the_task() {
   assert_dir "project memory survived" "$SB_PROJECTS/myproj"
 }
 
+test_project_names_differing_only_by_case() {
+  mk_repo backend
+  mk_repo frontend
+  iw feat/one -r backend -p myproj >/dev/null 2>&1
+
+  # On a case-insensitive filesystem these are one directory, so 'MyProj' must
+  # resolve to the existing project rather than becoming a second name sharing
+  # its files.
+  iw feat/two -r frontend -p MyProj >/dev/null 2>&1
+  local linked
+  linked="$(basename "$(cd "$SB_TASKS/feat-two/.project" && pwd -P)")"
+  assert_eq "second task linked to the existing spelling" "myproj" "$linked"
+
+  local out
+  out="$(iw project show myproj 2>&1)"
+  assert_contains "first task listed as live" "feat-one" "$out"
+  assert_contains "second task listed as live too" "feat-two" "$out"
+
+  iw_in "$SB_TASKS/feat-two" todo "captured via the other spelling" >/dev/null 2>&1
+  assert_grep "capture landed in the one project" "captured via the other spelling" \
+    "$SB_PROJECTS/myproj/TODO.md"
+}
+
+test_install_hooks_refuses_malformed_settings() {
+  command -v python3 >/dev/null 2>&1 || { printf '    skip (no python3)\n'; return 0; }
+  printf '%s\n' '{ this is not json' > "$SB/bad-settings.json"
+
+  local out
+  out="$(iw install-hooks "$SB/bad-settings.json" 2>&1 || true)"
+  assert_contains "says the file is the problem" "not valid JSON" "$out"
+  case "$out" in
+    *Traceback*) bad "install-hooks should not print a Python traceback" ;;
+    *) ok ;;
+  esac
+  assert_grep "the broken file is left untouched" "this is not json" "$SB/bad-settings.json"
+}
+
 # --- runner -------------------------------------------------------------------
 
 echo "iwork tests  ($IWORK_SRC)"
