@@ -2003,6 +2003,31 @@ project_path() {
   printf '%s\n' "$PROJECTS_DIR/$1"
 }
 
+# The on-disk spelling of a project name. On a case-insensitive filesystem
+# (macOS APFS by default) 'Foo' and 'foo' are one directory, so without this a
+# task could link to 'Foo', report its project as 'Foo', and then not appear in
+# 'project show foo' — two names quietly sharing one set of files.
+canonical_project_name() {
+  local project="$1"
+  local lower=""
+  local existing=""
+  local existing_lower=""
+
+  lower="$(printf '%s' "$project" | tr '[:upper:]' '[:lower:]')"
+
+  while IFS= read -r existing; do
+    [[ -n "$existing" ]] || continue
+    [[ "$existing" == "$project" ]] && { printf '%s\n' "$project"; return 0; }
+    existing_lower="$(printf '%s' "$existing" | tr '[:upper:]' '[:lower:]')"
+    if [[ "$existing_lower" == "$lower" ]]; then
+      printf '%s\n' "$existing"
+      return 0
+    fi
+  done < <(list_projects)
+
+  printf '%s\n' "$project"
+}
+
 project_exists() {
   [[ -n "$PROJECTS_DIR" && -d "$PROJECTS_DIR/$1" ]]
 }
@@ -2111,6 +2136,7 @@ ensure_project() {
 
   validate_project_name "$project"
   require_projects_dir
+  project="$(canonical_project_name "$project")"
 
   project_exists "$project" && return 0
 
@@ -2224,7 +2250,7 @@ resolve_project_context() {
   # project's tasks, which is exactly the mistake you cannot see happening.
   if [[ -n "$explicit" ]]; then
     validate_project_name "$explicit"
-    RESOLVED_PROJECT="$explicit"
+    RESOLVED_PROJECT="$(canonical_project_name "$explicit")"
   else
     if [[ -n "$RESOLVED_TASK" ]]; then
       RESOLVED_PROJECT="$(task_project_name "$RESOLVED_TASK" || true)"
@@ -2429,6 +2455,9 @@ attach_task_to_project() {
   require_projects_dir
   [[ -d "$TASKS_DIR/$task" ]] || die "no such task: $task"
 
+  # Before the link and the history row are written, so both record the same
+  # spelling the directory actually has.
+  project="$(canonical_project_name "$project")"
   ensure_project "$project"
 
   already="$(task_project_name "$task" || true)"
@@ -3342,7 +3371,17 @@ events = [
 data = {}
 if os.path.exists(settings_path):
     with open(settings_path) as f:
-        data = json.load(f)
+        try:
+            data = json.load(f)
+        except ValueError as exc:
+            # A raw JSONDecodeError traceback here reads like an iwork crash
+            # rather than "your settings file is broken".
+            sys.exit(
+                f"{settings_path} is not valid JSON ({exc}).\n"
+                "Fix or move it, then re-run; refusing to overwrite it."
+            )
+if not isinstance(data, dict):
+    sys.exit(f"{settings_path} does not contain a JSON object; refusing to overwrite it.")
 
 hooks = data.setdefault("hooks", {})
 to_add = []
