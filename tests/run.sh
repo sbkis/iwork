@@ -584,6 +584,45 @@ test_log_and_decided_share_one_file() {
     "$(grep -c '^- ' "$SB_PROJECTS/myproj/LOG.md")"
 }
 
+test_entries_carry_a_time_not_just_a_date() {
+  mk_repo backend
+  iw feat/one -r backend -p myproj >/dev/null 2>&1
+  iw_in "$SB_TASKS/feat-one" decided "first thing" >/dev/null 2>&1
+  iw_in "$SB_TASKS/feat-one" decided "second thing" >/dev/null 2>&1
+  iw_in "$SB_TASKS/feat-one" todo "a todo" >/dev/null 2>&1
+
+  # Date alone made several entries from one day indistinguishable.
+  assert_grep "log entries are stamped with a time" \
+    '^- [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9] [0-9][0-9]:[0-9][0-9]  ' \
+    "$SB_PROJECTS/myproj/LOG.md"
+  assert_eq "both entries stamped" "2" \
+    "$(grep -c '^- [0-9-]* [0-9][0-9]:[0-9][0-9]  ' "$SB_PROJECTS/myproj/LOG.md")"
+  assert_grep "todos too" ', [0-9-]* [0-9][0-9]:[0-9][0-9]$' "$SB_PROJECTS/myproj/TODO.md"
+
+  # The time must reach the reader, not just the file.
+  assert_contains "project show surfaces the time" ":" \
+    "$(iw project show myproj 2>&1 | grep 'first thing')"
+}
+
+test_time_stamps_do_not_break_the_parsers() {
+  mk_repo backend
+  iw feat/one -r backend -p myproj >/dev/null 2>&1
+  iw_in "$SB_TASKS/feat-one" todo "close me" >/dev/null 2>&1
+  local id
+  id="$(sed -n 's/.*(\(t[0-9a-f]*\)).*/\1/p' "$SB_PROJECTS/myproj/TODO.md" | head -1)"
+
+  # The id sits before the stamp, and every reader keys off the line prefix.
+  assert_ok "done still finds the todo" iw_in "$SB_TASKS/feat-one" "done" "$id"
+  assert_grep "and flipped it" '\[x\].*close me' "$SB_PROJECTS/myproj/TODO.md"
+
+  # A pre-existing date-only entry must still be counted and displayed.
+  printf -- '- 2026-01-01  feat-one  decision: written by an older iwork\n' \
+    >> "$SB_PROJECTS/myproj/LOG.md"
+  local out
+  out="$(iw project show myproj 2>&1)"
+  assert_contains "old date-only entries still shown" "written by an older iwork" "$out"
+}
+
 test_capture_is_single_line() {
   mk_repo backend
   iw feat/one -r backend -p myproj >/dev/null 2>&1

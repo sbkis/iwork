@@ -198,8 +198,8 @@ The project is created on first use (after confirming), and the task folder gets
 ├── projects/                          # IWORK_PROJECTS_DIR
 │   └── auth-rewrite/
 │       ├── PROJECT.md                 # curated brief: goal, where we are, constraints
-│       ├── LOG.md                     # append-only, one line per entry
-│       ├── TODO.md                    # captured-not-now, tagged with where it surfaced
+│       ├── LOG.md                     # append-only, one timestamped line per entry
+│       ├── TODO.md                    # captured-not-now, tagged with where and when
 │       ├── history.tsv                # append-only task events (opened/detached/closed)
 │       └── notes/                     # anything that outlives one task
 └── tasks/

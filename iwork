@@ -201,7 +201,7 @@ Projects:
   must not be inside the tasks directory — anything there is treated as a task.
 
       <project>/PROJECT.md     curated brief: goal, where we are, constraints
-      <project>/LOG.md         append-only, one line per entry
+      <project>/LOG.md         append-only, one timestamped line per entry
       <project>/TODO.md        captured-not-now, with the task it surfaced in
       <project>/history.tsv    append-only task events (opened, detached,
                                closed)
@@ -2665,6 +2665,13 @@ project_unlock() {
   PROJECT_LOCK_DIR=""
 }
 
+# Date alone was not enough: ten entries made on one day all read as that day,
+# so there was no way to tell when any of them happened. Minute precision is
+# plenty — both files are append-only, so position already gives exact ordering.
+entry_stamp() {
+  date '+%Y-%m-%d %H:%M'
+}
+
 # These warn and return non-zero rather than calling die: they are reached from
 # hook paths, and a die() there exits the hook non-zero past every '|| true' the
 # caller wrapped it in, which Claude Code reports as a broken hook. Callers that
@@ -2680,7 +2687,7 @@ append_log() {
 
   # One short line, one printf: O_APPEND makes this atomic, so parallel agents
   # cannot interleave and capture never waits on a lock.
-  printf -- '- %s  %s  %s: %s\n' "$(date +%Y-%m-%d)" "${task:-unknown}" "$kind" "$text" \
+  printf -- '- %s  %s  %s: %s\n' "$(entry_stamp)" "${task:-unknown}" "$kind" "$text" \
     >> "$PROJECTS_DIR/$project/LOG.md" || { warn "could not append to LOG.md"; return 1; }
 }
 
@@ -2695,7 +2702,7 @@ append_todo() {
 
   id="$(new_todo_id "$text")"
   printf -- '- [ ] (%s) %s — from %s, %s\n' \
-    "$id" "$text" "${task:-unknown}" "$(date +%Y-%m-%d)" \
+    "$id" "$text" "${task:-unknown}" "$(entry_stamp)" \
     >> "$PROJECTS_DIR/$project/TODO.md" ||
     { warn "could not append to TODO.md"; return 1; }
 
