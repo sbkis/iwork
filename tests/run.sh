@@ -1672,6 +1672,93 @@ test_install_hooks_refuses_malformed_settings() {
   assert_grep "the broken file is left untouched" "this is not json" "$SB/bad-settings.json"
 }
 
+# --- current-task inference ----------------------------------------------------
+
+test_project_add_infers_the_current_task() {
+  mk_repo backend
+  iw feat/oops -r backend >/dev/null 2>&1
+
+  # From the task root, and from a nested worktree directory.
+  iw_in "$SB_TASKS/feat-oops" project add token-work >/dev/null 2>&1
+  assert_link "attached without naming the task" "$SB_TASKS/feat-oops/.project"
+
+  iw feat/other -r backend >/dev/null 2>&1 || true
+  mkdir -p "$SB_TASKS/feat-other/backend/src/deep"
+  iw_in "$SB_TASKS/feat-other/backend/src/deep" project add token-work >/dev/null 2>&1
+  assert_link "works from deep inside a worktree" "$SB_TASKS/feat-other/.project"
+
+  # An explicit name still wins over the current directory.
+  iw feat/third -r backend >/dev/null 2>&1 || true
+  iw_in "$SB_TASKS/feat-oops" project add token-work feat-third >/dev/null 2>&1
+  assert_link "explicit name overrides the cwd" "$SB_TASKS/feat-third/.project"
+}
+
+test_project_rm_infers_both_project_and_task() {
+  mk_repo backend
+  iw feat/one -r backend -p myproj >/dev/null 2>&1
+
+  # The task from the directory, the project from its own .project link.
+  iw_in "$SB_TASKS/feat-one" project rm >/dev/null 2>&1
+  assert_no_file "detached with no arguments at all" "$SB_TASKS/feat-one/.project"
+  assert_dir "memory kept" "$SB_PROJECTS/myproj"
+  assert_fails "and a second bare rm has nothing to detach" \
+    iw_in "$SB_TASKS/feat-one" project rm
+}
+
+test_add_repo_infers_the_current_task() {
+  mk_repo backend
+  mk_repo frontend
+  iw feat/one -r backend -p myproj >/dev/null 2>&1
+
+  iw_in "$SB_TASKS/feat-one" add-repo -r frontend >/dev/null 2>&1
+  assert_dir "worktree added without naming the task" "$SB_TASKS/feat-one/frontend"
+  assert_grep "repos block still refreshed" "frontend" "$SB_TASKS/feat-one/CLAUDE.md"
+}
+
+test_add_repo_infers_the_task_before_from() {
+  mk_repo backend
+  mk_repo frontend
+  iw feat/base -r frontend >/dev/null 2>&1
+  ( cd "$SB_TASKS/feat-base/frontend" && echo base > base.txt &&
+    git add -A && git commit -qm base )
+  iw feat/one -r backend >/dev/null 2>&1
+
+  # --from is a leading flag here, so the task must still be inferred.
+  iw_in "$SB_TASKS/feat-one" add-repo --from feat-base -r frontend >/dev/null 2>&1
+  assert_file "inferred task and honoured --from" "$SB_TASKS/feat-one/frontend/base.txt"
+}
+
+test_rm_requires_current_to_be_explicit() {
+  mk_repo backend
+  iw feat/one -r backend -p myproj >/dev/null 2>&1
+
+  # A bare 'iwork rm' inside a task must not mean "delete this".
+  local out
+  out="$(iw_in "$SB_TASKS/feat-one" rm -f 2>&1 || true)"
+  assert_contains "bare rm explains itself" "--current" "$out"
+  assert_dir "task untouched" "$SB_TASKS/feat-one"
+
+  assert_fails "name and --current together are refused" \
+    iw_in "$SB_TASKS/feat-one" rm -f --current feat-one
+
+  iw_in "$SB_TASKS/feat-one" rm -f --current >/dev/null 2>&1
+  assert_no_file "--current removes the task you are in" "$SB_TASKS/feat-one"
+  assert_dir "project memory survives" "$SB_PROJECTS/myproj"
+}
+
+test_inference_fails_clearly_outside_a_task() {
+  mk_repo backend
+  local out
+  out="$(iw_in "$SB" project add someproject 2>&1 || true)"
+  assert_contains "says there is no current task" "no current task" "$out"
+  assert_no_file "and creates nothing" "$SB_PROJECTS/someproject"
+
+  out="$(iw_in "$SB" add-repo -r backend 2>&1 || true)"
+  assert_contains "add-repo says the same" "no current task" "$out"
+  out="$(iw_in "$SB" rm -f --current 2>&1 || true)"
+  assert_contains "rm --current says the same" "no current task" "$out"
+}
+
 # --- runner -------------------------------------------------------------------
 
 echo "iwork tests  ($IWORK_SRC)"

@@ -342,6 +342,20 @@ than silently relinking, which would leave its history stranded in the first.
 `iwork park <task> -p <project>` works too. Detaching is recorded in
 `history.tsv`, so a task you detached does not keep showing up as still open.
 
+The task name can be left out. `project add`, `project rm` and `add-repo` act on
+the task whose directory you are standing in — the same inference `iwork todo`
+uses, so it works from any depth inside a worktree:
+
+```bash
+cd ~/dev/projects/tasks/feat-oops/backend-api
+iwork project add auth-refactor      # this task joins the project
+iwork add-repo -r shared-lib         # this task gains a repo
+iwork project rm                     # detaches it again; project read from the link
+```
+
+`iwork rm` is deliberately excluded: it destroys worktrees, so it wants
+`--current` spelled out rather than treating a bare `iwork rm` as "this one".
+
 Two caveats when retrofitting:
 
 - `project add` reads the branch from one of the task's worktrees, so a task

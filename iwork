@@ -64,8 +64,8 @@ usage() {
   cat <<'EOF'
 Usage: iwork [flags] <branch-name> [--from <task|branch>] -r <repo1> [repo2 ...]
                                    [-p <project>]
-       iwork add-repo <task> [--from <task|branch>] -r <repo1> [repo2 ...]
-       iwork [--no-tmux] rm [-f] <task> [-r <repo1> [repo2 ...]]
+       iwork add-repo [<task>] [--from <task|branch>] -r <repo1> [repo2 ...]
+       iwork [--no-tmux] rm [-f] <task|--current> [-r <repo1> [repo2 ...]]
        iwork [flags] park <task> [-p <project>]
        iwork [--no-tmux] list
        iwork [--no-tmux] cd <task>
@@ -79,8 +79,8 @@ Usage: iwork [flags] <branch-name> [--from <task|branch>] -r <repo1> [repo2 ...]
        iwork project show [-n <count>] [-p <project> | <project>]
        iwork project grep [-p <project>] <pattern> [ripgrep-args...]
        iwork project cat [-p <project>] <path-inside-the-project>
-       iwork project add <project> <task>
-       iwork project rm <project> <task>
+       iwork project add <project> [<task>]
+       iwork project rm [<project>] [<task>]
        iwork project delete [-f] <project>
 
        iwork todo "<what needs doing>" [-p <project>]
@@ -220,8 +220,11 @@ Projects:
   before the context is dropped. Nothing forces a log entry — a padded log is
   worse than a short one.
 
-  'iwork project add <project> <task>' attaches a task that already exists, so
-  work already in flight can join a project. A task belongs to exactly one
+  'iwork project add <project> [<task>]' attaches a task that already exists,
+  so work already in flight can join a project. The task name may be left out
+  anywhere it is positional — add-repo and 'project add|rm' then act on the task
+  whose directory you are standing in, the same inference 'iwork todo' uses. rm
+  is the exception: it destroys worktrees, so it wants an explicit --current. A task belongs to exactly one
   project; attach again with a different name and it refuses rather than
   silently relinking.
 
@@ -2203,6 +2206,27 @@ task_root_from_cwd() {
   return 1
 }
 
+# The task a command should act on: the one named, or the one we are standing
+# in. Same inference 'iwork todo' already uses, so a task name only has to be
+# spelled out when it is not the current one.
+resolve_task_arg() {
+  local given="${1:-}"
+  local inferred=""
+
+  if [[ -n "$given" ]]; then
+    validate_worktree_folder_name "$given"
+    printf '%s\n' "$given"
+    return 0
+  fi
+
+  inferred="$(task_root_from_cwd || true)"
+  if [[ -z "$inferred" ]]; then
+    die "not inside an iwork task, so there is no current task to use; name one explicitly"
+  fi
+
+  printf '%s\n' "$inferred"
+}
+
 task_project_name() {
   local task="$1"
   local link="$TASKS_DIR/$task/.project"
@@ -3518,8 +3542,8 @@ sibling tasks are appending to while you work:
 
 Managing — the operator's, not an agent's; these change or destroy tasks, so do
 not run them unless you were asked to directly:
-  iwork project add <project> <task>     attach a task that already exists
-  iwork project rm <project> <task>      detach a task, keeping the memory
+  iwork project add <project> [<task>]   attach a task that already exists
+  iwork project rm [<project>] [<task>]  detach a task, keeping the memory
   iwork project delete [-f] <project>    delete a project and its memory
 
 For task and tmux management (creating tasks, add-repo, rm, park, install-hooks)
@@ -3591,20 +3615,27 @@ cmd_project() {
       return "$rc"
       ;;
     add)
-      [[ $# -eq 2 ]] || die "usage: iwork project add <project> <task>"
+      (( $# >= 1 && $# <= 2 )) || die "usage: iwork project add <project> [<task>]"
       require_config
       require_projects_dir
-      task="$2"
-      validate_worktree_folder_name "$task"
+      task="$(resolve_task_arg "${2:-}")"
       [[ -d "$TASKS_DIR/$task" ]] || die "no such task: $task"
       branch="$(detect_branch_from_worktree_folder "$task")"
       attach_task_to_project "$task" "$1" "$branch"
       ;;
     rm)
-      [[ $# -eq 2 ]] || die "usage: iwork project rm <project> <task>"
+      (( $# <= 2 )) || die "usage: iwork project rm [<project>] [<task>]"
       require_config
       require_projects_dir
-      detach_task_from_project "$1" "$2"
+      # Both are inferable: the task from the directory, the project from its
+      # own .project link, so a bare 'iwork project rm' detaches where you are.
+      task="$(resolve_task_arg "${2:-}")"
+      proj="${1:-}"
+      if [[ -z "$proj" ]]; then
+        proj="$(task_project_name "$task" || true)"
+        [[ -n "$proj" ]] || die "task '$task' is not attached to any project"
+      fi
+      detach_task_from_project "$proj" "$task"
       ;;
     delete)
       while [[ $# -gt 0 ]]; do
@@ -3896,12 +3927,17 @@ fi
 if [[ "${1:-}" == "rm" ]]; then
   shift
   rm_force=""
+  rm_current=""
   rm_positional=()
 
   while [[ $# -gt 0 ]]; do
     case "$1" in
       -f|--force)
         rm_force=1
+        shift
+        ;;
+      --current)
+        rm_current=1
         shift
         ;;
       -r)
@@ -3914,13 +3950,25 @@ if [[ "${1:-}" == "rm" ]]; then
     esac
   done
 
-  if [[ ${#rm_positional[@]} -ne 1 ]]; then
-    die "usage: iwork rm [-f] <task> [-r <repo1> [repo2 ...]]"
-  fi
-
   require_config
-  folder_name="${rm_positional[0]}"
-  validate_worktree_folder_name "$folder_name"
+
+  # rm deletes worktrees, so inferring the task from the directory has to be
+  # asked for. A bare 'iwork rm' meaning "this one" is one typo away from
+  # destroying the task you are standing in, and -f skips the confirmation
+  # that would otherwise catch it.
+  if (( ${#rm_positional[@]} == 0 )); then
+    [[ -n "$rm_current" ]] ||
+      die "usage: iwork rm [-f] <task> [-r <repo1> [repo2 ...]]
+  Use --current for the task you are standing in."
+    folder_name="$(resolve_task_arg "")"
+    echo "Using the current task: $folder_name"
+  elif (( ${#rm_positional[@]} == 1 )); then
+    [[ -z "$rm_current" ]] || die "pass a task name or --current, not both"
+    folder_name="${rm_positional[0]}"
+    validate_worktree_folder_name "$folder_name"
+  else
+    die "usage: iwork rm [-f] [--current | <task>] [-r <repo1> [repo2 ...]]"
+  fi
 
   repos=()
   if [[ $# -gt 0 ]]; then
@@ -3932,14 +3980,19 @@ if [[ "${1:-}" == "rm" ]]; then
 fi
 
 if [[ "${1:-}" == "add-repo" ]]; then
-  if [[ $# -lt 4 ]]; then
-    die "usage: iwork add-repo <task> [--from <task|branch>] -r <repo1> [repo2 ...]"
-  fi
-
+  shift
   require_config
-  folder_name="$2"
-  validate_worktree_folder_name "$folder_name"
-  shift 2
+
+  # A leading flag means the task name was left out, so use the current one.
+  case "${1:-}" in
+    ""|-*)
+      folder_name="$(resolve_task_arg "")"
+      ;;
+    *)
+      folder_name="$(resolve_task_arg "$1")"
+      shift
+      ;;
+  esac
 
   if [[ "${1:-}" == "--from" ]]; then
     shift
