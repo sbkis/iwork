@@ -210,15 +210,16 @@ The project is created on first use (after confirming), and the task folder gets
 ```
 
 Project memory is never touched by `iwork rm`, the same guarantee branches already
-get. The `.project` symlink is how iwork knows which project a task belongs to —
-it is what makes `iwork todo` work with no arguments from any depth inside the
-task. It is **not** an access path.
+get. The `.project` symlink does two jobs: it tells iwork which project a task
+belongs to — which is what makes `iwork todo` work with no arguments from any
+depth inside the task — and it puts the memory at a path *inside* the task
+directory, so reaching it never conflicts with the agent's "stay in this
+directory" scope.
 
-### The CLI is the only way in
+### Reads through the CLI, writes only through the CLI
 
 The generated `CLAUDE.md` / `AGENTS.md` gain a marker-delimited block naming the
-project and its goal, and it tells the agent that `.project/` is out of scope
-exactly like any other path outside the task. Everything goes through iwork:
+project and its goal, and pointing at three read commands:
 
 ```bash
 iwork project show [-n N]     # goal, live tasks, open todos, recent log, past tasks
@@ -226,11 +227,24 @@ iwork project grep <pattern>  # search the whole memory
 iwork project cat notes/x.md  # read one file grep turned up
 ```
 
-This is a design choice, not tidiness. If the agent never opens those files
-directly, the atomic-append behaviour and the append-only log stop being rules it
-is *asked* to respect and become rules it has no way to break — and the fact that
-`.project` is invisible to a recursive `rg` (hidden *and* a symlink) stops being a
-problem, because nothing is expected to search it that way.
+The files stay reachable through the symlink, and the block says so — a rule the
+agent can see is false is a rule it stops believing. For **reads** the commands
+are a recommendation with a real reason: `project show` is assembled and bounded,
+whereas `LOG.md` grows without limit and mostly concerns other tasks. It also
+means what an agent learns at startup can be improved centrally, without touching
+every task's `CLAUDE.md`.
+
+For **writes** it is a hard rule, and this one is about correctness rather than
+taste. Tasks run in parallel, so several agents append to the same `LOG.md` and
+`TODO.md` while you work. `iwork log` / `todo` / `decided` add a single line
+atomically; an agent using an editing tool does read-modify-write and silently
+drops whatever a sibling appended in between. `LOG.md` is append-only and
+`TODO.md` ids are referenced from other tasks, so a rewrite loses work that isn't
+its own.
+
+None of this is enforced — `iwork project show` prints the project's absolute path
+in its own header, so a determined agent can always find the files. It is a
+convention with a reason the agent can check, which is the most a prompt can buy.
 
 `PROJECT.md` is yours. The block tells the agent to report staleness rather than
 fix it, so the curated brief stays curated.

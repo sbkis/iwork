@@ -917,17 +917,24 @@ test_project_show_n_limits_the_log() {
   assert_fails "-n needs a number" iw project show -n zero myproj
 }
 
-test_template_forbids_direct_project_access() {
+test_template_routes_access_through_the_cli() {
   mk_repo backend
   iw feat/one -r backend -p myproj >/dev/null 2>&1
+  local f="$SB_TASKS/feat-one/CLAUDE.md"
 
-  # The scope rule stays absolute; the CLI is the only way in.
-  assert_grep "block forbids direct access" "do not read, edit, search" \
-    "$SB_TASKS/feat-one/CLAUDE.md"
-  assert_grep "block offers cat instead" "iwork project cat" \
-    "$SB_TASKS/feat-one/CLAUDE.md"
-  assert_no_grep "block no longer claims .project is in scope" "is in scope" \
-    "$SB_TASKS/feat-one/CLAUDE.md"
+  # Writes are a hard rule and must come with the concurrency reason: an agent
+  # that can see .project sitting in ls will discount a rule it can tell is
+  # false, and discount the rest of the block with it.
+  assert_grep "hand-writing forbidden" "Never write to those files by hand" "$f"
+  assert_grep "reason given for the write rule" "sibling tasks are appending" "$f"
+  assert_grep "read commands offered" "iwork project cat" "$f"
+  assert_grep "reachability stated honestly" "reachable from here" "$f"
+
+  # The claims that were false: the memory is not outside the task directory,
+  # and the scope rule never forbade it.
+  assert_no_grep "no claim that the memory is outside the task dir" \
+    "lives outside this task directory" "$f"
+  assert_no_grep "no blanket prohibition on reading" "do not read, edit, search" "$f"
 }
 
 # --- hooks --------------------------------------------------------------------
@@ -950,7 +957,8 @@ test_hook_session_start_injects_brief() {
   assert_contains "carries the open todos" "needs backoff" "$out"
   assert_contains "carries the decisions" "cursor pagination" "$out"
   assert_contains "tells the agent how to write" "iwork decided" "$out"
-  assert_contains "tells the agent not to touch .project" ".project" "$out"
+  assert_contains "names the read commands" "iwork project show|grep|cat" "$out"
+  assert_contains "forbids hand-writing, with the reason" "sibling tasks" "$out"
 }
 
 test_hook_session_start_works_from_a_worktree() {

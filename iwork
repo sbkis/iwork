@@ -197,12 +197,12 @@ Projects:
   from the filesystem and tmux on every call, exactly as 'iwork list' does.
   history.tsv only records what cannot be derived once a task folder is gone.
 
-  The CLI is the only interface to a project, deliberately: the agent is told
-  '.project' is out of scope like anything else outside the task, so the atomic
-  appends and the append-only log stop being rules it is asked to respect and
-  become rules it cannot break. Reads go through 'project show' (one bounded
-  summary rather than files that grow without limit), 'project grep' and
-  'project cat'; writes go through 'todo' / 'log' / 'decided'.
+  The memory is reachable through the symlink, but the agent is told to go
+  through the CLI. For reads that is a preference: 'project show' is assembled
+  and bounded, while LOG.md grows without limit. For writes it is a hard rule,
+  because tasks run in parallel — 'todo' / 'log' / 'decided' append one line
+  atomically, whereas an agent editing LOG.md does read-modify-write and drops
+  whatever a sibling appended in between.
 
   With the hooks installed (see install-hooks) most of it happens unprompted:
   the project brief is injected at session start, PRs are logged when 'gh pr
@@ -1876,15 +1876,19 @@ the sibling tasks are doing, and the decisions earlier tasks already made — so
 you do not re-litigate a settled question or redo finished work. The git log
 cannot tell you this: the reasoning was never committed.
 
-The project memory lives outside this task directory, and the scope rule above
-applies to it unchanged: **do not read, edit, search or `cd` into `.project/`.**
-It is a marker telling iwork which project this task belongs to, not a door.
-Everything you need from the project comes through these commands, which read a
-bounded view and append atomically even while sibling tasks are writing:
+`.project/` is a symlink to that shared memory, so it is reachable from here.
+Read it through these commands anyway — `project show` is assembled and bounded,
+while LOG.md grows without limit and most of it is not about your task:
 
 - `iwork project show [-n N]` — goal, open todos, recent log, sibling tasks
 - `iwork project grep <pattern>` — search the whole project memory
 - `iwork project cat <path>` — read one file grep turned up, e.g. notes/api.md
+
+**Never write to those files by hand — always use the commands below.** Agents
+in sibling tasks are appending to the same files while you work. The commands
+add one line atomically; an editing tool does read-modify-write and silently
+drops whatever landed in between. LOG.md is append-only, and TODO.md ids are
+referenced from other tasks, so rewriting either loses work that is not yours.
 
 ### Record as you go
 
@@ -2959,8 +2963,9 @@ hook_session_start() {
   echo ""
   project_show "$HOOK_PROJECT" 2>/dev/null || true
   echo ""
-  echo "Do not read, edit or search .project/ directly; it is outside this task."
-  echo "Use 'iwork project show|grep|cat' to read it, and record as you work:"
+  echo "Read it with 'iwork project show|grep|cat' rather than opening the files"
+  echo "under .project/ — and never write to them by hand, because agents in"
+  echo "sibling tasks are appending to the same files right now. Record as you go:"
   echo "  iwork decided \"<what you settled and why>\""
   echo "  iwork todo \"<needs doing, but not in this PR>\""
 }
