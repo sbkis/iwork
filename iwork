@@ -2458,9 +2458,17 @@ attach_task_to_project() {
   # Before the link and the history row are written, so both record the same
   # spelling the directory actually has.
   project="$(canonical_project_name "$project")"
-  ensure_project "$project"
 
+  # Refuse before ensure_project, not after: attaching an already-attached task
+  # to a new name used to create that project and only then fail, leaving a
+  # directory behind that nothing referenced.
   already="$(task_project_name "$task" || true)"
+  if [[ -n "$already" && "$already" != "$project" ]]; then
+    die "task '$task' is already attached to project '$already'; a task belongs to one project.
+  Detach it first:  iwork project rm $already $task"
+  fi
+
+  ensure_project "$project"
   link_task_project "$task" "$project"
   write_project_block "$task" "$project" "$branch" "$seed"
 
