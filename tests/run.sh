@@ -807,6 +807,9 @@ test_project_add_refuses_second_project() {
   assert_fails "one project per task" iw project add beta feat-one
   assert_eq "still attached to the original" "alpha" \
     "$(basename "$(cd "$SB_TASKS/feat-one/.project" && pwd -P)")"
+  # The refusal has to come before the project is created, or a rejected attach
+  # leaves a directory behind that nothing references.
+  assert_no_file "no stray project from the refused attach" "$SB_PROJECTS/beta"
 }
 
 test_project_rm_detaches_but_keeps_memory() {
