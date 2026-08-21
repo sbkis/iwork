@@ -269,6 +269,109 @@ test_baseline_list_repos_excludes_tasks_dir() {
   assert_eq "only the repo is listed" "backend" "$out"
 }
 
+# --- --from (from main) must survive the project changes ----------------------
+#
+# The creation path used to strip --from before parse_repos_flag; it now goes
+# through parse_task_args, which rejects unknown options. Nothing on main tested
+# --from, so these exist to prove the rewrite did not half-break it.
+
+test_from_after_the_branch_name() {
+  mk_repo backend
+  iw feat/base -r backend >/dev/null 2>&1
+  ( cd "$SB_TASKS/feat-base/backend" && echo "base work" > base.txt &&
+    git add -A && git commit -qm "base commit" )
+
+  iw feat/stacked --from feat-base -r backend >/dev/null 2>&1
+
+  assert_dir "stacked task created" "$SB_TASKS/feat-stacked"
+  assert_file "base commit is in the history" "$SB_TASKS/feat-stacked/backend/base.txt"
+}
+
+test_from_before_the_branch_name() {
+  mk_repo backend
+  iw feat/base -r backend >/dev/null 2>&1
+  ( cd "$SB_TASKS/feat-base/backend" && echo "base work" > base.txt &&
+    git add -A && git commit -qm "base commit" )
+
+  # The leading-flag loop, which the project work did not touch.
+  iw --from feat-base feat/stacked -r backend >/dev/null 2>&1
+  assert_file "base commit is in the history" "$SB_TASKS/feat-stacked/backend/base.txt"
+}
+
+test_from_combines_with_project_in_any_order() {
+  mk_repo backend
+  iw feat/base -r backend >/dev/null 2>&1
+  ( cd "$SB_TASKS/feat-base/backend" && echo "base work" > base.txt &&
+    git add -A && git commit -qm "base commit" )
+
+  iw feat/one --from feat-base -r backend -p myproj >/dev/null 2>&1
+  assert_file "stacked and attached: base work present" \
+    "$SB_TASKS/feat-one/backend/base.txt"
+  assert_link "stacked and attached: project linked" "$SB_TASKS/feat-one/.project"
+
+  # -p first, --from last, repos in the middle.
+  iw feat/two -p myproj -r backend --from feat-base >/dev/null 2>&1
+  assert_file "order does not matter: base work present" \
+    "$SB_TASKS/feat-two/backend/base.txt"
+  assert_link "order does not matter: project linked" "$SB_TASKS/feat-two/.project"
+}
+
+test_from_records_the_base_in_task_context() {
+  mk_repo backend
+  iw feat/base -r backend >/dev/null 2>&1
+  iw feat/stacked --from feat-base -r backend -p myproj >/dev/null 2>&1
+
+  # main renders {{BASE}} into the template; the project block is appended after
+  # it. Both must survive together.
+  assert_grep "base recorded for the agent" "feat-base" \
+    "$SB_TASKS/feat-stacked/CLAUDE.md"
+  assert_grep "project block still injected" "iwork:project" \
+    "$SB_TASKS/feat-stacked/CLAUDE.md"
+  assert_grep "repos block still injected" "iwork:repos" \
+    "$SB_TASKS/feat-stacked/CLAUDE.md"
+}
+
+test_from_on_add_repo() {
+  mk_repo backend
+  mk_repo frontend
+  iw feat/base -r frontend >/dev/null 2>&1
+  ( cd "$SB_TASKS/feat-base/frontend" && echo "base work" > base.txt &&
+    git add -A && git commit -qm "base commit" )
+  iw feat/one -r backend -p myproj >/dev/null 2>&1
+
+  iw add-repo feat-one --from feat-base -r frontend >/dev/null 2>&1
+  assert_dir "add-repo --from created the worktree" "$SB_TASKS/feat-one/frontend"
+  assert_file "add-repo --from used the base" "$SB_TASKS/feat-one/frontend/base.txt"
+  assert_grep "repos block refreshed after add-repo" "frontend" \
+    "$SB_TASKS/feat-one/CLAUDE.md"
+}
+
+test_from_rejects_a_swallowed_flag() {
+  mk_repo backend
+  # 'iwork feat/x --from -p proj -r backend' must not take '-p' as the base.
+  assert_fails "--from refuses a flag as its value" \
+    iw feat/one --from -p myproj -r backend
+  assert_fails "--from with nothing after it fails" iw feat/one -r backend --from
+  assert_fails "unresolvable base fails" iw feat/one --from nope-not-a-thing -r backend
+  assert_no_file "no task left behind" "$SB_TASKS/feat-one"
+}
+
+test_project_flag_rejects_a_swallowed_flag() {
+  mk_repo backend
+  # The project name regex allows '-', so without an explicit guard this would
+  # create a project literally called '--from'.
+  assert_fails "-p refuses a flag as its value" \
+    iw feat/one -r backend -p --from feat-base
+  assert_no_file "no project named after a flag" "$SB_PROJECTS/--from"
+  assert_fails "-p with nothing after it fails" iw feat/one -r backend -p
+}
+
+test_unknown_option_still_rejected() {
+  mk_repo backend
+  assert_fails "a genuinely unknown flag is still an error" \
+    iw feat/one -r backend --frobnicate
+}
+
 # --- projects dir ------------------------------------------------------------
 
 test_project_created_on_first_use() {
