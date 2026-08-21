@@ -249,6 +249,20 @@ convention with a reason the agent can check, which is the most a prompt can buy
 `PROJECT.md` is yours. The block tells the agent to report staleness rather than
 fix it, so the curated brief stays curated.
 
+### How the agent discovers the rest
+
+The block names `iwork` as a CLI on the agent's PATH and points at
+`iwork project -h`, so the verbs listed in a months-old `CLAUDE.md` are not the
+only source of truth as the tool grows.
+
+It deliberately does **not** point at `iwork -h`. That is ~180 lines of mostly
+operator material, and it advertises `iwork rm -f`, which deletes worktrees
+*including ones with uncommitted work* — not something to hand an agent that is
+casting around for what it can do. `iwork project -h` is 28 lines in three
+groups — Reading, Recording, and Managing — where the third is labelled as the
+operator's, alongside a line in the block saying that creating tasks,
+`add-repo`, `rm` and `park` are not the agent's to run uninvited.
+
 Because the block is marker-delimited, one code path serves a new task, a retrofit
 and a refresh, and your own edits to the rest of the file survive untouched.
 

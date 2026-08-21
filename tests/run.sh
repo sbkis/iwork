@@ -937,6 +937,53 @@ test_template_routes_access_through_the_cli() {
   assert_no_grep "no blanket prohibition on reading" "do not read, edit, search" "$f"
 }
 
+test_template_points_at_scoped_help_and_draws_the_boundary() {
+  mk_repo backend
+  iw feat/one -r backend -p myproj >/dev/null 2>&1
+  local f="$SB_TASKS/feat-one/CLAUDE.md"
+
+  assert_grep "says iwork is a CLI" "CLI on your PATH" "$f"
+  assert_grep "points at scoped help, not iwork -h" "iwork project -h" "$f"
+  assert_grep "names the operator-only commands" "belongs to the operator" "$f"
+  # 'iwork -h' is 180 lines of mostly operator material and advertises 'rm -f';
+  # the block must not send an agent there.
+  assert_no_grep "does not send the agent to the full help" 'run .iwork -h' "$f"
+}
+
+test_project_help_is_scoped_and_exits_clean() {
+  local out
+  out="$(iw project -h 2>&1)"
+
+  assert_ok "project -h succeeds" iw project -h
+  assert_contains "lists a read verb" "iwork project show" "$out"
+  assert_contains "lists a record verb" "iwork decided" "$out"
+  assert_contains "lists the todo verb" "iwork todo" "$out"
+  assert_contains "separates reading" "Reading" "$out"
+  assert_contains "separates recording" "Recording" "$out"
+  assert_contains "marks managing as the operator's" "the operator's" "$out"
+  # Destructive task-level commands must not read as things to try.
+  case "$out" in
+    *"iwork rm "*) bad "project -h should not advertise 'iwork rm'" ;;
+    *) ok ;;
+  esac
+
+  # No args behaves the same, and a typo points at the scoped help.
+  assert_contains "bare 'project' prints help" "iwork project show" "$(iw project 2>&1)"
+  assert_fails "unknown subcommand still fails" iw project frobnicate
+  assert_contains "typo points at the scoped help" "iwork project -h" \
+    "$(iw project frobnicate 2>&1)"
+}
+
+test_hook_names_the_scoped_help() {
+  mk_repo backend
+  iw feat/one -r backend -p myproj >/dev/null 2>&1
+
+  local out
+  out="$(hook_fire "$SB_TASKS/feat-one" '{"hook_event_name":"SessionStart"}')"
+  assert_contains "hook points at scoped help" "iwork project -h" "$out"
+  assert_contains "hook draws the boundary" "the operator's" "$out"
+}
+
 # --- hooks --------------------------------------------------------------------
 
 hook_fire() {

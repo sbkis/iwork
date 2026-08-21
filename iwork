@@ -1903,6 +1903,12 @@ the end the reasoning is gone, and the reasoning is the part worth keeping.
 - Opened a PR? The URL is recorded for you. Use `iwork log --shipped "..."` only
   to add what the URL alone does not say.
 
+`iwork` is a CLI on your PATH. `iwork project -h` lists every command above and
+stays current if the tool grows new ones, so prefer it over this list going
+stale. Task and tmux management — creating tasks, `add-repo`, `rm`, `park`,
+`install-hooks` — belongs to the operator, not to you: those change or destroy
+worktrees, so do not run them unless you were asked to directly.
+
 PROJECT.md is curated by hand and is not yours to rewrite. If it has gone stale,
 say so instead of fixing it.'
 
@@ -2968,6 +2974,8 @@ hook_session_start() {
   echo "sibling tasks are appending to the same files right now. Record as you go:"
   echo "  iwork decided \"<what you settled and why>\""
   echo "  iwork todo \"<needs doing, but not in this PR>\""
+  echo "'iwork project -h' lists every command that is yours. Task management"
+  echo "(rm, park, add-repo) is the operator's — do not run it uninvited."
 }
 
 # Fires exactly when the reasoning is about to be dropped, which is the one
@@ -3250,6 +3258,42 @@ parse_task_args() {
   (( ${#repos[@]} > 0 )) || die "specify at least one repo after -r"
 }
 
+# Scoped help, so an agent has somewhere to discover its own verbs without
+# reading the full 'iwork -h', which is mostly operator material and advertises
+# 'rm -f'. The three groups are the point: they say which commands are whose.
+project_usage() {
+  cat <<'EOF'
+iwork project — the memory shared by every task of one longer-horizon effort.
+
+Inside a task the project is inferred from the .project link, so none of these
+need -p. Pass -p <project> to target one from anywhere else.
+
+Reading — safe to run at any time:
+  iwork project show [-n <count>] [<project>]
+                                 goal, live tasks, open todos, recent log
+  iwork project grep <pattern>   search the whole project memory
+  iwork project cat <path>       print one file from it, e.g. notes/api.md
+  iwork project list             every project
+
+Recording — one atomic line each; use these instead of editing the files, which
+sibling tasks are appending to while you work:
+  iwork todo "<needs doing, but not in this PR>"
+  iwork decided "<what you settled and why>"
+  iwork log [--decision|--shipped|--note] "<what>"
+  iwork done <todo-id>           close a captured todo
+  iwork drop <todo-id>           abandon one
+
+Managing — the operator's, not an agent's; these change or destroy tasks, so do
+not run them unless you were asked to directly:
+  iwork project add <project> <task>     attach a task that already exists
+  iwork project rm <project> <task>      detach a task, keeping the memory
+  iwork project delete [-f] <project>    delete a project and its memory
+
+For task and tmux management (creating tasks, add-repo, rm, park, install-hooks)
+see 'iwork -h'.
+EOF
+}
+
 cmd_project() {
   local sub="${1:-}"
   local proj=""
@@ -3340,8 +3384,11 @@ cmd_project() {
       require_projects_dir
       delete_project "$proj" "$force"
       ;;
+    ""|-h|--help)
+      project_usage
+      ;;
     *)
-      die "usage: iwork project <list|show|grep|add|rm|delete> ..."
+      die "unknown 'iwork project' subcommand: $sub (run 'iwork project -h')"
       ;;
   esac
 }
