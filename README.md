@@ -47,7 +47,8 @@ The tool itself can live anywhere — it does **not** need to be under `IWORK_RE
 - `bash` and `git` (any version with `git worktree` — i.e. anything modern)
 - `tmux` — optional; only needed for the window management. Everything works
   without it (see `--no-tmux`).
-- `python3` — only needed for `iwork install-hooks`.
+- `python3` — needed for `iwork install-hooks`, and for the hook that logs PRs
+  automatically. Everything else works without it.
 - `claude` / `codex` on your `PATH` — only for those subcommands.
 
 ## Setup
@@ -199,7 +200,7 @@ The project is created on first use (after confirming), and the task folder gets
 │       ├── PROJECT.md                 # curated brief: goal, where we are, constraints
 │       ├── LOG.md                     # append-only, one line per entry
 │       ├── TODO.md                    # captured-not-now, tagged with where it surfaced
-│       ├── history.tsv                # append-only task events (opened, closed)
+│       ├── history.tsv                # append-only task events (opened/detached/closed)
 │       └── notes/                     # anything that outlives one task
 └── tasks/
     └── feat-token-api/
@@ -284,6 +285,12 @@ command, no context switch, and it is waiting for whichever task picks it up.
 iwork done t7dc4      # close a captured todo
 iwork drop t7dc4      # abandon one
 ```
+
+Ids are 32-bit, so a collision is not something you should meet. If one ever
+happens, `done`/`drop` list the candidates and take `--nth <n>` rather than
+refusing. Project names are matched against the spelling already on disk, so on
+a case-insensitive filesystem `-p MyProj` attaches to an existing `myproj`
+instead of quietly becoming a second name over the same files.
 
 ### What happens without you asking
 
@@ -577,6 +584,7 @@ overrides.
 | `IWORK_CONTEXT_TEMPLATE` | `~/.config/iwork/task-context.md.tmpl` | Template for the generated `CLAUDE.md`/`AGENTS.md` (seeded with a default on first use, then yours to edit) |
 | `IWORK_PROJECT_TEMPLATE` | `~/.config/iwork/project-context.md.tmpl` | Template for the project block injected into those files (same deal: seeded once, then yours) |
 | `IWORK_PROJECT` | unset | Fallback project for `todo`/`log`/`decided`/`done`/`drop`. A task's own `.project` link always wins over it; `-p` wins over both |
+| `IWORK_ENTRY_MAX_CHARS` | `800` | Longest `todo`/`log`/`decided` entry. Anything longer is truncated with a marker, since `project show` prints entries back and the `SessionStart` hook injects them into every session |
 | `IWORK_SHOW_LOG_LINES` | `12` | How many log entries and past tasks `iwork project show` prints. Must be a positive integer; anything else warns and falls back to 12 |
 | `IWORK_EDITOR` | `nvim` | Editor started in each repo window under `--big`; run as a command line with the worktree appended |
 | `IWORK_NO_TMUX` | unset | Set to skip all tmux handling (same as the `--no-tmux` flag) |
@@ -603,7 +611,7 @@ reach your real `IWORK_REPO_DIR`, your real `~/.config`, or a live tmux session,
 and the harness refuses to start unless every sandbox path is under `$TMPDIR`.
 
 No test framework, no dependencies: it is the same bash the tool is written in.
-The whole suite takes about 25 seconds. A watchdog turns a hang into a named
+100 tests, roughly a minute. A watchdog turns a hang into a named
 failure (`SUITE_TIMEOUT` to tune it), which matters because `confirm()` reads
 `/dev/tty` — a test that forgets `-f` or `IWORK_ASSUME_YES` would otherwise block
 your terminal with no clue which one did it.

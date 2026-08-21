@@ -197,10 +197,14 @@ Projects:
   directory" scope still holds. Project memory is never touched by 'iwork rm' —
   the same guarantee branches get.
 
+  Projects live in IWORK_PROJECTS_DIR (default: $IWORK_REPO_DIR/projects), which
+  must not be inside the tasks directory — anything there is treated as a task.
+
       <project>/PROJECT.md     curated brief: goal, where we are, constraints
       <project>/LOG.md         append-only, one line per entry
       <project>/TODO.md        captured-not-now, with the task it surfaced in
-      <project>/history.tsv    append-only task events (opened, closed)
+      <project>/history.tsv    append-only task events (opened, detached,
+                               closed)
       <project>/notes/         anything that outlives one task
 
   Live state is never cached: which tasks exist and what they are doing is read
@@ -219,6 +223,9 @@ Projects:
   create' runs, and a compaction prompts the agent to record what it worked out
   before the context is dropped. Nothing forces a log entry — a padded log is
   worse than a short one.
+
+  'iwork project -h' lists just the project commands, grouped by whether they
+  read, record, or manage — that is the help an agent is pointed at.
 
   'iwork project add <project> [<task>]' attaches a task that already exists,
   so work already in flight can join a project. The task name may be left out
@@ -260,10 +267,15 @@ Options:
                 origin/main; accepted before or after the branch name
   -r            Repos to create worktrees for (required, at least one)
   -p            Project this task is part of, created on first use. Also
-                selects the project for todo/log/decided/done/drop and
-                'project show|grep' when you are not inside the task
+                selects the project for todo/log/decided/done/drop and for
+                'project show|grep|cat'. It always wins over both the task's
+                own .project link and IWORK_PROJECT
   -f            rm only: remove worktrees with uncommitted changes or
                 orphaned directories, and skip the confirmation prompt
+  --current     rm only: act on the task whose directory you are in. Every
+                other command that takes a task name infers it without a flag;
+                rm destroys worktrees, so it wants this spelled out
+  --nth         done/drop only: pick one of several todos sharing an id
   -h            Show this help
 
 Completion:
