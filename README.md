@@ -204,7 +204,7 @@ The project is created on first use (after confirming), and the task folder gets
 └── tasks/
     └── feat-token-api/
         ├── auth-service/
-        ├── .project -> ../../projects/auth-rewrite
+        ├── .project -> /abs/path/to/projects/auth-rewrite   # absolute
         ├── CLAUDE.md                  # now carries an <!-- iwork:project --> block
         └── AGENTS.md
 ```
@@ -295,7 +295,7 @@ work, not an event. So three of the four paths are hooks instead (installed by
 | Hook | What it does | Judgement needed |
 |---|---|---|
 | `SessionStart` | Runs `iwork project show` and injects the output as context | none — the agent cannot start without it |
-| `PostToolUse` (Bash) | Spots `gh pr create` and logs the PR URL itself | none — a URL is a fact |
+| `PostToolUse` (Bash) | Logs the PR URL when the command really is `gh pr create` | none — a URL is a fact |
 | `PreCompact` | Prompts a flush right before the reasoning is discarded | the agent's, but at the right moment |
 | `Stop` / `UserPromptSubmit` / `Notification` | tmux window markers, as before | n/a |
 
@@ -304,8 +304,14 @@ every session produces filler, and filler degrades the exact file every future
 session reads. `PreCompact` says as much to the agent — record nothing if there is
 nothing worth keeping.
 
-Outside a project task every one of these prints nothing and exits clean, so
-installing them globally is safe.
+Outside a project task every one of these prints nothing and exits 0, so
+installing them globally is safe. They exit 0 on failure too — an unwritable
+project directory makes a hook silent, never broken.
+
+Entries are capped at 800 characters (`IWORK_ENTRY_MAX_CHARS`) and collapsed to
+one line. `project show` prints them back and the `SessionStart` hook injects
+them into every session in the project, so an unbounded entry would follow you
+around forever with no supported way to remove it — `LOG.md` is append-only.
 
 Each of these appends a single line with one `printf`, which is atomic — so agents
 working in parallel tasks cannot clobber each other, and capture never waits on a
@@ -333,7 +339,22 @@ iwork project delete -f auth-rewrite                 # deletes the memory, asks 
 
 A task belongs to exactly one project. Attaching it to a second one refuses rather
 than silently relinking, which would leave its history stranded in the first.
-`iwork park <task> -p <project>` works too.
+`iwork park <task> -p <project>` works too. Detaching is recorded in
+`history.tsv`, so a task you detached does not keep showing up as still open.
+
+Two caveats when retrofitting:
+
+- `project add` reads the branch from one of the task's worktrees, so a task
+  folder with no worktree in it is rejected.
+- A `~/.config/iwork/task-context.md.tmpl` created before this change has no
+  `<!-- iwork:repos -->` markers and is never overwritten, so `add-repo` cannot
+  refresh the repo list in tasks built from it. It warns rather than leaving the
+  list silently wrong; wrap the template's `{{REPOS}}` line in those markers to
+  fix it for new tasks.
+
+`iwork project cat` reads files inside the project only — a symlink pointing out
+of it is refused. `project grep` forwards its extra arguments to ripgrep,
+including paths, so that one is a convenience rather than a boundary.
 
 ## Branch tracking
 
@@ -541,8 +562,8 @@ overrides.
 | `IWORK_TMUX_SESSION` | `tasks` | tmux session that holds task windows |
 | `IWORK_CONTEXT_TEMPLATE` | `~/.config/iwork/task-context.md.tmpl` | Template for the generated `CLAUDE.md`/`AGENTS.md` (seeded with a default on first use, then yours to edit) |
 | `IWORK_PROJECT_TEMPLATE` | `~/.config/iwork/project-context.md.tmpl` | Template for the project block injected into those files (same deal: seeded once, then yours) |
-| `IWORK_PROJECT` | unset | Default project for `todo`/`log`/`decided`/`done`/`drop` when you are not inside a task |
-| `IWORK_SHOW_LOG_LINES` | `12` | How many log entries and past tasks `iwork project show` prints |
+| `IWORK_PROJECT` | unset | Fallback project for `todo`/`log`/`decided`/`done`/`drop`. A task's own `.project` link always wins over it; `-p` wins over both |
+| `IWORK_SHOW_LOG_LINES` | `12` | How many log entries and past tasks `iwork project show` prints. Must be a positive integer; anything else warns and falls back to 12 |
 | `IWORK_EDITOR` | `nvim` | Editor started in each repo window under `--big`; run as a command line with the worktree appended |
 | `IWORK_NO_TMUX` | unset | Set to skip all tmux handling (same as the `--no-tmux` flag) |
 | `IWORK_NO_CONTEXT` | unset | Set to skip writing task context files (same as `--no-context`) |
@@ -565,7 +586,7 @@ Every test builds a throwaway tree under `$TMPDIR`: fake repos with local
 `origin` remotes, a fake tasks dir, a fake projects dir, a fake `HOME`, and — for
 the tmux tests — a tmux server on its own socket via `TMUX_TMPDIR`. Nothing can
 reach your real `IWORK_REPO_DIR`, your real `~/.config`, or a live tmux session,
-and the harness refuses to start if any sandbox path resolves outside `$TMPDIR`.
+and the harness refuses to start unless every sandbox path is under `$TMPDIR`.
 
 No test framework, no dependencies: it is the same bash the tool is written in.
 The whole suite takes about 25 seconds. A watchdog turns a hang into a named

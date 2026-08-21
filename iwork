@@ -42,6 +42,16 @@ PROJECT_TEMPLATE="${IWORK_PROJECT_TEMPLATE:-$HOME/.config/iwork/project-context.
 SHOW_LOG_LINES="${IWORK_SHOW_LOG_LINES:-12}"
 CHECKPOINT_NUDGE_AFTER=40
 
+# Validated here rather than at the point of use: it is evaluated inside (( ))
+# and by tail -n, so a non-numeric value under 'set -u' aborts project_show
+# halfway through — which the SessionStart hook then reports as a broken hook
+# after emitting half a project brief.
+if [[ ! "$SHOW_LOG_LINES" =~ ^[1-9][0-9]*$ ]]; then
+  # Not warn(): this runs at load time, before the helpers are defined.
+  echo "Warning: IWORK_SHOW_LOG_LINES must be a positive integer, got '$SHOW_LOG_LINES'; using 12" >&2
+  SHOW_LOG_LINES=12
+fi
+
 require_config() {
   if [[ -z "$REPO_DIR" ]]; then
     die "IWORK_REPO_DIR is not set. Run 'iwork init', or add it to $IWORK_CONFIG_FILE:
@@ -66,7 +76,7 @@ Usage: iwork [flags] <branch-name> [--from <task|branch>] -r <repo1> [repo2 ...]
        iwork --completion <bash|zsh>
 
        iwork project list
-       iwork project show [-n <count>] [<project>]
+       iwork project show [-n <count>] [-p <project> | <project>]
        iwork project grep [-p <project>] <pattern> [ripgrep-args...]
        iwork project cat [-p <project>] <path-inside-the-project>
        iwork project add <project> <task>
@@ -76,8 +86,8 @@ Usage: iwork [flags] <branch-name> [--from <task|branch>] -r <repo1> [repo2 ...]
        iwork todo "<what needs doing>" [-p <project>]
        iwork log [--decision|--shipped|--note] "<what>" [-p <project>]
        iwork decided "<what and why>" [-p <project>]
-       iwork done <todo-id> [-p <project>]
-       iwork drop <todo-id> [-p <project>]
+       iwork done <todo-id> [--nth <n>] [-p <project>]
+       iwork drop <todo-id> [--nth <n>] [-p <project>]
 
        flags: [--no-tmux] [--no-context] [--detach] [--big]
 
@@ -706,12 +716,20 @@ kill_task_tmux() {
   local window_id=""
   local current_id=""
 
-  tmux_enabled || return 0
+  # Not tmux_enabled: killing a window or session needs tmux installed, not tmux
+  # attached. Gating on in_tmux meant 'iwork rm' run from a plain shell left the
+  # task's session (and any editors in it) orphaned, contrary to what rm says it
+  # does.
+  [[ -z "$IWORK_NO_TMUX" ]] || return 0
+  command -v tmux >/dev/null 2>&1 || return 0
 
   # A --big task owns its session, so the whole session goes.
   session="$(task_session_name "$folder")"
   if tmux has-session -t "=$session" 2>/dev/null; then
-    current_session="$(tmux display-message -p '#{session_name}' 2>/dev/null || true)"
+    # Only meaningful when a client is actually attached: with none, tmux still
+    # reports *a* current session, which made this refuse to kill anything.
+    current_session=""
+    in_tmux && current_session="$(tmux display-message -p '#{session_name}' 2>/dev/null || true)"
     if [[ -n "$current_session" && "$current_session" == "$session" ]]; then
       warn "you are attached to tmux session '$session'; close it yourself"
       return 0
@@ -723,7 +741,8 @@ kill_task_tmux() {
   line="$(find_window_in_session "$TASKS_SESSION" "$folder")" || return 0
   window_id="${line%% *}"
 
-  current_id="$(tmux display-message -p '#{window_id}' 2>/dev/null || true)"
+  current_id=""
+  in_tmux && current_id="$(tmux display-message -p '#{window_id}' 2>/dev/null || true)"
   if [[ -n "$current_id" && "$current_id" == "$window_id" ]]; then
     warn "tmux window '$folder' is the current window; close it yourself"
     return 0
@@ -937,6 +956,11 @@ parse_repos_flag() {
   shift
 
   while [[ $# -gt 0 ]]; do
+    # Everything after -r used to become a repo name, so a misplaced flag was
+    # reported as a missing repository ('.../-p is not a git repository').
+    case "$1" in
+      -*) die "unexpected option '$1' after -r; it must come before the repo list" ;;
+    esac
     repos+=("$1")
     shift
   done
@@ -1095,10 +1119,27 @@ iwork() {
         return $?
       fi
 
-      folder="$2"
-      shift 2
+      # The task name is not necessarily $2: 'park -p proj task' is accepted.
+      shift
+      folder=""
+      for arg in "$@"; do
+        case "$arg" in
+          -p|--project) skip_next=1 ;;
+          -*) ;;
+          *)
+            if [[ -n "${skip_next:-}" ]]; then
+              skip_next=""
+            else
+              folder="$arg"
+              break
+            fi
+            ;;
+        esac
+      done
+      unset skip_next
+      [[ -n "$folder" ]] || { command "$_iwork_bin" park; return $?; }
       target="$(command "$_iwork_bin" --resolve-park-target-path "$folder")" || return $?
-      command "$_iwork_bin" ${notmux:+--no-tmux} park "$folder" "$@" || return $?
+      command "$_iwork_bin" ${notmux:+--no-tmux} park "$@" || return $?
       if [[ -z "${TMUX:-}" || -n "$notmux" ]]; then
         builtin cd "$target" || return $?
       fi
@@ -1335,10 +1376,27 @@ iwork() {
         return $?
       fi
 
-      folder="$2"
-      shift 2
+      # The task name is not necessarily $2: 'park -p proj task' is accepted.
+      shift
+      folder=""
+      for arg in "$@"; do
+        case "$arg" in
+          -p|--project) skip_next=1 ;;
+          -*) ;;
+          *)
+            if [[ -n "${skip_next:-}" ]]; then
+              skip_next=""
+            else
+              folder="$arg"
+              break
+            fi
+            ;;
+        esac
+      done
+      unset skip_next
+      [[ -n "$folder" ]] || { command "$_iwork_bin" park; return $?; }
       target="$(command "$_iwork_bin" --resolve-park-target-path "$folder")" || return $?
-      command "$_iwork_bin" ${notmux:+--no-tmux} park "$folder" "$@" || return $?
+      command "$_iwork_bin" ${notmux:+--no-tmux} park "$@" || return $?
       if [[ -z "${TMUX:-}" || -n "$notmux" ]]; then
         builtin cd "$target" || return $?
       fi
@@ -2160,21 +2218,30 @@ resolve_project_context() {
   RESOLVED_PROJECT=""
   RESOLVED_TASK="$(task_root_from_cwd || true)"
 
+  # Order: explicit flag, then the task's own .project link, then IWORK_PROJECT.
+  # The link must beat the env var — otherwise exporting IWORK_PROJECT once in a
+  # shell profile silently misfiles every capture made from every other
+  # project's tasks, which is exactly the mistake you cannot see happening.
   if [[ -n "$explicit" ]]; then
     validate_project_name "$explicit"
     RESOLVED_PROJECT="$explicit"
-  elif [[ -n "${IWORK_PROJECT:-}" ]]; then
-    validate_project_name "$IWORK_PROJECT"
-    RESOLVED_PROJECT="$IWORK_PROJECT"
   else
-    if [[ -z "$RESOLVED_TASK" ]]; then
-      die "not inside an iwork task; pass -p <project> or set IWORK_PROJECT"
+    if [[ -n "$RESOLVED_TASK" ]]; then
+      RESOLVED_PROJECT="$(task_project_name "$RESOLVED_TASK" || true)"
     fi
-    RESOLVED_PROJECT="$(task_project_name "$RESOLVED_TASK" || true)"
+
+    if [[ -z "$RESOLVED_PROJECT" && -n "${IWORK_PROJECT:-}" ]]; then
+      validate_project_name "$IWORK_PROJECT"
+      RESOLVED_PROJECT="$IWORK_PROJECT"
+    fi
+
     if [[ -z "$RESOLVED_PROJECT" ]]; then
-      die "task '$RESOLVED_TASK' is not attached to a project.
+      if [[ -n "$RESOLVED_TASK" ]]; then
+        die "task '$RESOLVED_TASK' is not attached to a project.
   Attach it:  iwork project add <project> $RESOLVED_TASK
   Or target one explicitly with -p <project>"
+      fi
+      die "not inside an iwork task; pass -p <project> or set IWORK_PROJECT"
     fi
   fi
 
@@ -2330,8 +2397,17 @@ refresh_task_blocks() {
 
   for target in "$folder_path/CLAUDE.md" "$folder_path/AGENTS.md"; do
     [[ -f "$target" ]] || continue
-    # Templates seeded before markers existed have nothing to refresh.
-    grep -q "<!-- iwork:repos -->" "$target" 2>/dev/null || continue
+
+    # A template seeded before the markers existed has nothing to refresh, and
+    # is never re-seeded — so say so rather than silently leaving the repo list
+    # wrong, which is the very bug the markers were added to fix.
+    if ! grep -q "<!-- iwork:repos -->" "$target" 2>/dev/null; then
+      warn "${target##*/} has no <!-- iwork:repos --> block, so its repo list is now stale"
+      warn "  add the markers around {{REPOS}} in $CONTEXT_TEMPLATE to fix this for new tasks,"
+      warn "  and edit ${target##*/} by hand for this one"
+      continue
+    fi
+
     replace_marked_block "$target" repos "$repos_list" || warn "could not refresh $target"
   done
 
@@ -2389,6 +2465,11 @@ detach_task_from_project() {
     strip_marked_block "$target" project || warn "could not update $target"
   done
 
+  # Without this the task's last event stays 'opened' forever, so 'project show'
+  # lists a detached task under "Past tasks" as though it were still running,
+  # and re-attaching appends a second 'opened' with no close between them.
+  append_history "$project" detached "$task" "" "" ""
+
   echo "Detached '$task' from project '$project'. Project memory was left intact."
 }
 
@@ -2425,27 +2506,43 @@ delete_project() {
 
 # --- capture -----------------------------------------------------------------
 
+# One line, and bounded. project show prints these back and the SessionStart
+# hook injects them as context on every session in the project, so an unbounded
+# entry would pollute every future session with no way to take it back: LOG.md
+# is append-only and hand-editing is off limits.
+ENTRY_MAX_CHARS="${IWORK_ENTRY_MAX_CHARS:-800}"
+
 oneline() {
   local text="$1"
 
   text="${text//$'\r'/ }"
   text="${text//$'\n'/ }"
   text="${text//$'\t'/ }"
+
+  if (( ${#text} > ENTRY_MAX_CHARS )); then
+    text="${text:0:$ENTRY_MAX_CHARS} […truncated]"
+  fi
+
   printf '%s' "$text"
 }
 
 # Derived from the text, the clock and the pid rather than from scanning
 # TODO.md: that is what keeps capture a pure append with no read and no lock.
+#
+# 32 bits, not 16: closed todos stay in the file and keep matching, so the id
+# space never frees, and at 16 bits a project that accumulated a couple of
+# hundred todos hit collisions — which made both of them unclosable.
 new_todo_id() {
   local text="$1"
   local sum=""
 
-  sum="$(printf '%s|%s|%s' "$text" "$(date +%s)" "$$" | cksum | awk '{print $1}')"
-  printf 't%04x' "$(( sum % 65536 ))"
+  sum="$(printf '%s|%s|%s|%s' "$text" "$(date +%s)" "$$" "${RANDOM:-0}" |
+    cksum | awk '{print $1}')"
+  printf 't%08x' "$(( sum % 4294967296 ))"
 }
 
 validate_todo_id() {
-  [[ "$1" =~ ^t[0-9a-f]{1,8}$ ]] || die "'$1' is not a todo id (expected something like t1a2f)"
+  [[ "$1" =~ ^t[0-9a-f]{1,8}$ ]] || die "'$1' is not a todo id (expected something like t1a2f9c04)"
 }
 
 PROJECT_LOCK_DIR=""
@@ -2495,6 +2592,10 @@ project_unlock() {
   PROJECT_LOCK_DIR=""
 }
 
+# These warn and return non-zero rather than calling die: they are reached from
+# hook paths, and a die() there exits the hook non-zero past every '|| true' the
+# caller wrapped it in, which Claude Code reports as a broken hook. Callers that
+# want a hard failure say so themselves.
 append_log() {
   local project="$1"
   local task="$2"
@@ -2502,12 +2603,12 @@ append_log() {
   local text="$4"
 
   text="$(oneline "$text")"
-  [[ -n "$text" ]] || die "nothing to log"
+  [[ -n "$text" ]] || { warn "nothing to log"; return 1; }
 
   # One short line, one printf: O_APPEND makes this atomic, so parallel agents
   # cannot interleave and capture never waits on a lock.
   printf -- '- %s  %s  %s: %s\n' "$(date +%Y-%m-%d)" "${task:-unknown}" "$kind" "$text" \
-    >> "$PROJECTS_DIR/$project/LOG.md" || die "could not append to LOG.md"
+    >> "$PROJECTS_DIR/$project/LOG.md" || { warn "could not append to LOG.md"; return 1; }
 }
 
 append_todo() {
@@ -2517,12 +2618,13 @@ append_todo() {
   local id=""
 
   text="$(oneline "$text")"
-  [[ -n "$text" ]] || die "nothing to capture"
+  [[ -n "$text" ]] || { warn "nothing to capture"; return 1; }
 
   id="$(new_todo_id "$text")"
   printf -- '- [ ] (%s) %s — from %s, %s\n' \
     "$id" "$text" "${task:-unknown}" "$(date +%Y-%m-%d)" \
-    >> "$PROJECTS_DIR/$project/TODO.md" || die "could not append to TODO.md"
+    >> "$PROJECTS_DIR/$project/TODO.md" ||
+    { warn "could not append to TODO.md"; return 1; }
 
   printf '%s\n' "$id"
 }
@@ -2546,6 +2648,7 @@ flip_todo() {
   local project="$1"
   local id="$2"
   local mark="$3"
+  local nth="${4:-}"
   local file="$PROJECTS_DIR/$project/TODO.md"
   local matches=()
   local match=""
@@ -2553,6 +2656,7 @@ flip_todo() {
   local tmp=""
   local line=""
   local rest=""
+  local verb=""
   local n=0
 
   [[ -f "$file" ]] || die "no TODO.md in project '$project'"
@@ -2569,10 +2673,33 @@ flip_todo() {
   fi
 
   (( ${#matches[@]} > 0 )) || die "no todo with id '$id' in project '$project'"
-  (( ${#matches[@]} == 1 )) ||
-    die "id '$id' matches ${#matches[@]} todos; use the full id"
 
-  target="${matches[0]%%:*}"
+  if (( ${#matches[@]} > 1 )); then
+    case "$mark" in
+      x) verb="done" ;;
+      *) verb="drop" ;;
+    esac
+
+    # "Use the full id" was useless advice when the id already was full, so
+    # offer an index the user can actually act on.
+    if [[ -z "$nth" ]]; then
+      echo "id '$id' matches ${#matches[@]} todos:" >&2
+      for match in "${matches[@]}"; do
+        n=$((n + 1))
+        printf '  %s. %s\n' "$n" "${match#*:}" >&2
+      done
+      die "pick one with: iwork $verb $id --nth <1-${#matches[@]}>"
+    fi
+
+    [[ "$nth" =~ ^[1-9][0-9]*$ ]] || die "--nth needs a number from 1 to ${#matches[@]}"
+    (( nth <= ${#matches[@]} )) || die "--nth $nth is out of range (1-${#matches[@]})"
+    target="${matches[$((nth - 1))]%%:*}"
+  else
+    [[ -z "$nth" ]] || die "--nth only applies when an id matches more than one todo"
+    target="${matches[0]%%:*}"
+  fi
+
+  n=0
 
   project_lock "$project" || die "project '$project' is locked; nothing was changed"
 
@@ -2742,7 +2869,36 @@ project_cat() {
   target="$PROJECTS_DIR/$project/$rel"
   [[ -f "$target" ]] || die "no such file in project '$project': $rel"
 
-  cat "$target"
+  # The '..' test above is not containment on its own: a symlink inside the
+  # project reaches outside without one — as a directory (notes/etc -> /etc) or
+  # as the file itself (notes/x.md -> /elsewhere). Follow the chain, then check
+  # where it actually landed.
+  local resolved="$target"
+  local link=""
+  local hops=0
+  local dir_real=""
+  local project_real=""
+
+  while [[ -L "$resolved" ]]; do
+    hops=$((hops + 1))
+    (( hops <= 32 )) || die "too many symlinks resolving '$rel' in project '$project'"
+    link="$(readlink "$resolved")" || die "cannot resolve '$rel' in project '$project'"
+    case "$link" in
+      /*) resolved="$link" ;;
+      *) resolved="$(dirname "$resolved")/$link" ;;
+    esac
+  done
+
+  dir_real="$(cd "$(dirname "$resolved")" 2>/dev/null && pwd -P)" ||
+    die "cannot resolve '$rel' in project '$project'"
+  project_real="$(cd "$PROJECTS_DIR/$project" && pwd -P)"
+
+  case "$dir_real/" in
+    "$project_real"/*) ;;
+    *) die "'$rel' resolves outside project '$project' (via a symlink); refusing" ;;
+  esac
+
+  cat "$resolved"
 }
 
 project_grep() {
@@ -2992,18 +3148,43 @@ hook_pre_compact() {
 
 # A PR URL is a fact, not a judgement call, so it does not need the agent to
 # remember anything.
+# Reads the Bash command and its output as separate fields. A substring test over
+# the whole payload matched 'gh pr create' appearing in tool OUTPUT — so
+# 'grep -rn "gh pr create" docs/' logged whatever PR link happened to be in the
+# match, writing false history into an append-only file.
+hook_pr_url_from_payload() {
+  command -v python3 >/dev/null 2>&1 || return 1
+
+  python3 -c '
+import json, re, sys
+
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    sys.exit(1)
+
+cmd = (d.get("tool_input") or {}).get("command") or ""
+# Only an actual invocation counts, not a mention of one. Allow a leading cd/&&
+# chain, which is how these commands are usually written.
+if not re.search(r"(^|[;&|]\s*)gh\s+pr\s+create(\s|$)", cmd):
+    sys.exit(1)
+
+resp = d.get("tool_response")
+if not isinstance(resp, str):
+    resp = json.dumps(resp) if resp is not None else ""
+
+m = re.search(r"https://github\.com/[\w.-]+/[\w.-]+/pull/\d+", resp)
+if not m:
+    sys.exit(1)
+print(m.group(0))
+'
+}
+
 hook_post_tool_use() {
   local input="$1"
   local url=""
 
-  case "$input" in
-    *"pr create"*) ;;
-    *) return 0 ;;
-  esac
-
-  url="$(printf '%s' "$input" |
-    grep -o 'https://github\.com/[A-Za-z0-9._-]*/[A-Za-z0-9._-]*/pull/[0-9][0-9]*' |
-    head -1 || true)"
+  url="$(printf '%s' "$input" | hook_pr_url_from_payload 2>/dev/null || true)"
   [[ -n "$url" ]] || return 0
 
   hook_project_context || return 0
@@ -3131,7 +3312,11 @@ run_init() {
 
 install_claude_hooks() {
   local settings_path="$1"
-  local hook_cmd="$SELF_PATH --hook"
+  # Quoted, because the settings file stores a shell command line: an iwork
+  # installed under a path containing a space produced a hook that failed with
+  # 127 on every event.
+  local hook_cmd=""
+  printf -v hook_cmd '%q --hook' "$SELF_PATH"
 
   command -v python3 >/dev/null 2>&1 || die "install-hooks requires python3"
 
@@ -3282,6 +3467,7 @@ sibling tasks are appending to while you work:
   iwork log [--decision|--shipped|--note] "<what>"
   iwork done <todo-id>           close a captured todo
   iwork drop <todo-id>           abandon one
+     add --nth <n> if an id somehow matches more than one todo
 
 Managing — the operator's, not an agent's; these change or destroy tasks, so do
 not run them unless you were asked to directly:
@@ -3317,6 +3503,12 @@ cmd_project() {
           -n)
             count="${2:-}"
             [[ "$count" =~ ^[1-9][0-9]*$ ]] || die "-n needs a positive number"
+            shift 2
+            ;;
+          -p|--project)
+            # Both help texts advertise -p here; only the positional worked.
+            [[ $# -ge 2 ]] || die "expected a project name after $1"
+            proj="$2"
             shift 2
             ;;
           -*) die "unknown option '$1'" ;;
@@ -3398,6 +3590,7 @@ cmd_capture() {
   local proj=""
   local kind=""
   local text=""
+  local nth=""
   local nargs=0
   local id=""
 
@@ -3406,8 +3599,14 @@ cmd_capture() {
   while [[ $# -gt 0 ]]; do
     case "$1" in
       -p|--project)
-        proj="${2:-}"
-        [[ -n "$proj" ]] || die "expected a project name after $1"
+        [[ $# -ge 2 ]] || die "expected a project name after $1"
+        proj="$2"
+        validate_project_name "$proj"
+        shift 2
+        ;;
+      --nth)
+        [[ $# -ge 2 ]] || die "--nth needs a number"
+        nth="$2"
         shift 2
         ;;
       --decision) kind="decision"; shift ;;
@@ -3437,29 +3636,37 @@ cmd_capture() {
   case "$verb" in
     todo)
       [[ -z "$kind" ]] || die "iwork todo takes no --decision/--shipped/--note"
+      [[ -z "$nth" ]] || die "--nth applies only to done/drop"
       (( nargs > 0 )) || die "usage: iwork todo \"<what needs doing>\""
-      id="$(append_todo "$RESOLVED_PROJECT" "$RESOLVED_TASK" "$text")"
+      id="$(append_todo "$RESOLVED_PROJECT" "$RESOLVED_TASK" "$text")" ||
+        die "could not capture the todo"
       echo "Captured $id in project '$RESOLVED_PROJECT'"
       ;;
     log)
+      [[ -z "$nth" ]] || die "--nth applies only to done/drop"
       (( nargs > 0 )) || die "usage: iwork log [--decision|--shipped|--note] \"<what>\""
-      append_log "$RESOLVED_PROJECT" "$RESOLVED_TASK" "${kind:-note}" "$text"
+      append_log "$RESOLVED_PROJECT" "$RESOLVED_TASK" "${kind:-note}" "$text" ||
+        die "could not write to the project log"
       echo "Logged to project '$RESOLVED_PROJECT'"
       ;;
     decided)
       [[ -z "$kind" ]] || die "iwork decided is already --decision"
+      [[ -z "$nth" ]] || die "--nth applies only to done/drop"
       (( nargs > 0 )) || die "usage: iwork decided \"<what and why>\""
-      append_log "$RESOLVED_PROJECT" "$RESOLVED_TASK" decision "$text"
+      append_log "$RESOLVED_PROJECT" "$RESOLVED_TASK" decision "$text" ||
+        die "could not write to the project log"
       echo "Recorded a decision in project '$RESOLVED_PROJECT'"
       ;;
     done)
-      (( nargs == 1 )) || die "usage: iwork done <todo-id>"
-      flip_todo "$RESOLVED_PROJECT" "$text" x
+      [[ -z "$kind" ]] || die "iwork done takes no --decision/--shipped/--note"
+      (( nargs == 1 )) || die "usage: iwork done <todo-id> [--nth <n>]"
+      flip_todo "$RESOLVED_PROJECT" "$text" x "$nth"
       echo "Closed $text in project '$RESOLVED_PROJECT'"
       ;;
     drop)
-      (( nargs == 1 )) || die "usage: iwork drop <todo-id>"
-      flip_todo "$RESOLVED_PROJECT" "$text" -
+      [[ -z "$kind" ]] || die "iwork drop takes no --decision/--shipped/--note"
+      (( nargs == 1 )) || die "usage: iwork drop <todo-id> [--nth <n>]"
+      flip_todo "$RESOLVED_PROJECT" "$text" - "$nth"
       echo "Dropped $text in project '$RESOLVED_PROJECT'"
       ;;
   esac
@@ -3591,8 +3798,9 @@ if [[ "${1:-}" == "park" ]]; then
   while [[ $# -gt 0 ]]; do
     case "$1" in
       -p|--project)
-        park_project="${2:-}"
-        [[ -n "$park_project" ]] || die "expected a project name after $1"
+        [[ $# -ge 2 ]] || die "expected a project name after $1"
+        park_project="$2"
+        validate_project_name "$park_project"
         shift 2
         ;;
       -*)
@@ -3609,6 +3817,9 @@ if [[ "${1:-}" == "park" ]]; then
   [[ -n "$park_folder" ]] || die "usage: iwork park <task> [-p <project>]"
 
   require_config
+  # Before ensure_project, or an invalid task name leaves a freshly created and
+  # entirely useless project directory behind.
+  validate_worktree_folder_name "$park_folder"
 
   if [[ -n "$park_project" ]]; then
     require_projects_dir
