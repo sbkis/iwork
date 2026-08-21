@@ -61,6 +61,25 @@ IWORK_TASKS_DIR="$SB_TASKS"
 IWORK_PROJECTS_DIR="$SB_PROJECTS"
 CONF
 
+  # iwork send-keys a real 'claude' (and 'nvim' under --big) into the panes it
+  # creates. A test suite must not launch an actual agent or editor, and a
+  # long-lived one would also hold the suite's stdout open.
+  mkdir -p "$SB/bin"
+  local stub=""
+  for stub in claude codex nvim; do
+    printf '#!/bin/sh\nexit 0\n' > "$SB/bin/$stub"
+    chmod +x "$SB/bin/$stub"
+  done
+
+  # Start the tmux server here, with its file descriptors detached. Whichever
+  # command first needs a server would otherwise spawn a daemon holding this
+  # suite's stdout, so anything reading our output (a pipe to tail, a CI
+  # collector) would block until teardown even though the run had finished.
+  if command -v tmux >/dev/null 2>&1; then
+    env -u TMUX TMUX_TMPDIR="$SB/tmux" tmux -f /dev/null start-server \
+      </dev/null >/dev/null 2>&1 || true
+  fi
+
   cat > "$SB_HOME/.gitconfig" <<CONF
 [user]
 	name = iwork tests
@@ -98,19 +117,38 @@ mk_repo() {
 # Every iwork invocation goes through here, so no test can accidentally reach
 # the real config or the real tmux server.
 iw() {
-  env -u TMUX \
-    HOME="$SB_HOME" \
-    GIT_CONFIG_GLOBAL="$SB_HOME/.gitconfig" \
-    TMUX_TMPDIR="$SB/tmux" \
-    IWORK_CONFIG_FILE="$SB/config" \
-    IWORK_REPO_DIR="$SB_REPOS" \
-    IWORK_TASKS_DIR="$SB_TASKS" \
-    IWORK_PROJECTS_DIR="$SB_PROJECTS" \
-    IWORK_CONTEXT_TEMPLATE="$SB_HOME/.config/iwork/task-context.md.tmpl" \
-    IWORK_PROJECT_TEMPLATE="$SB_HOME/.config/iwork/project-context.md.tmpl" \
-    IWORK_NO_TMUX="${WANT_TMUX:+}${WANT_TMUX:-1}" \
-    IWORK_ASSUME_YES="${ASSUME_YES-1}" \
-    "$IWORK_SRC" "$@"
+  local env_args=()
+  local no_tmux="1"
+
+  # WANT_TMUX=1 lets a test drive the real tmux paths against the sandbox's own
+  # tmux server. This used to read "${WANT_TMUX:+}${WANT_TMUX:-1}", which
+  # evaluates to 1 whether WANT_TMUX is set or not — so the hatch was dead and
+  # no test ever exercised window creation.
+  [[ -n "${WANT_TMUX:-}" ]] && no_tmux=""
+
+  env_args=(
+    PATH="$SB/bin:$PATH"
+    IWORK_EDITOR="nvim"
+    HOME="$SB_HOME"
+    GIT_CONFIG_GLOBAL="$SB_HOME/.gitconfig"
+    TMUX_TMPDIR="$SB/tmux"
+    IWORK_CONFIG_FILE="$SB/config"
+    IWORK_REPO_DIR="$SB_REPOS"
+    IWORK_TASKS_DIR="$SB_TASKS"
+    IWORK_PROJECTS_DIR="$SB_PROJECTS"
+    IWORK_CONTEXT_TEMPLATE="$SB_HOME/.config/iwork/task-context.md.tmpl"
+    IWORK_PROJECT_TEMPLATE="$SB_HOME/.config/iwork/project-context.md.tmpl"
+    IWORK_NO_TMUX="$no_tmux"
+    IWORK_ASSUME_YES="${ASSUME_YES-1}"
+  )
+
+  # Only forwarded when a test sets them, so iwork sees its own defaults
+  # otherwise.
+  [[ -n "${WANT_ENTRY_MAX:-}" ]] && env_args+=(IWORK_ENTRY_MAX_CHARS="$WANT_ENTRY_MAX")
+  [[ -n "${WANT_SHOW_LINES+x}" ]] && env_args+=(IWORK_SHOW_LOG_LINES="$WANT_SHOW_LINES")
+  [[ -n "${WANT_PROJECT_ENV:-}" ]] && env_args+=(IWORK_PROJECT="$WANT_PROJECT_ENV")
+
+  env -u TMUX "${env_args[@]}" "$IWORK_SRC" "$@"
 }
 
 # Same, but from inside a task directory, which is how agents will call it.
@@ -958,13 +996,40 @@ test_park_with_project() {
 }
 
 test_park_wrapper_forwards_flags() {
-  # The sourced wrapper used to drop everything after the task name, which
-  # would silently swallow -p.
   local out
-  out="$(iw --completion bash 2>&1)"
-  assert_contains "wrapper forwards park args" 'park "$folder" "$@"' "$out"
-  out="$(iw --completion zsh 2>&1)"
-  assert_contains "zsh wrapper forwards park args" 'park "$folder" "$@"' "$out"
+  for shell in bash zsh; do
+    out="$(iw --completion "$shell" 2>&1)"
+    assert_contains "$shell wrapper forwards every park arg" 'park "$@"' "$out"
+    assert_contains "$shell wrapper does not assume the task is \$2" 'skip_next' "$out"
+  done
+}
+
+# Behavioural, not textual: the wrapper has to find the task name in order to cd
+# there, and 'park -p proj task' puts it in $3. Getting this wrong left the user
+# in the wrong directory with a non-zero status, while park itself succeeded.
+test_park_wrapper_finds_the_task_after_a_flag() {
+  local shim="$SB/shim"
+  cat > "$shim" <<SHIM
+#!/usr/bin/env bash
+if [[ "\$1" == "--resolve-park-target-path" ]]; then
+  echo "resolve:\$2" >> "$SB/calls"
+  echo "$SB"
+  exit 0
+fi
+printf 'run:%s\n' "\$*" >> "$SB/calls"
+SHIM
+  chmod +x "$shim"
+
+  : > "$SB/calls"
+  iw --completion bash > "$SB/wrapper.sh" 2>/dev/null
+  ( . "$SB/wrapper.sh" >/dev/null 2>&1
+    _iwork_bin="$shim"
+    iwork park -p myproj mytask >/dev/null 2>&1 )
+
+  assert_grep "wrapper resolved the task, not the flag" '^resolve:mytask$' "$SB/calls"
+  assert_grep "wrapper forwarded both the flag and the task" 'run:park -p myproj mytask' \
+    "$SB/calls"
+  assert_no_grep "wrapper did not treat '-p' as the task" '^resolve:-p$' "$SB/calls"
 }
 
 # --- CLI-only access to project memory ----------------------------------------
@@ -1237,6 +1302,334 @@ print(sum(len(v) for v in data.get("hooks", {}).values()))
 PY
 )"
   assert_eq "install-hooks is idempotent" "6" "$count"
+}
+
+# --- review findings: durability ----------------------------------------------
+
+test_todo_ids_are_wide_enough_to_not_collide() {
+  mk_repo backend
+  iw feat/one -r backend -p myproj >/dev/null 2>&1
+
+  # 16-bit ids collided at a couple of hundred todos, and a collision made both
+  # entries permanently unclosable. Check the width, then check a realistic
+  # volume actually stays unique.
+  iw_in "$SB_TASKS/feat-one" todo "width probe" >/dev/null 2>&1
+  local id
+  id="$(sed -n 's/.*(\(t[0-9a-f]*\)).*/\1/p' "$SB_PROJECTS/myproj/TODO.md" | head -1)"
+  assert_eq "id is 8 hex digits" "9" "${#id}"
+
+  local i
+  for i in $(seq 1 200); do
+    printf -- '- [ ] (%s) filler %s — from feat-one, 2026-08-21\n' \
+      "$(iw_in "$SB_TASKS/feat-one" todo "item $i" | sed -n 's/^Captured \(t[0-9a-f]*\).*/\1/p')" \
+      "$i" >/dev/null
+  done
+  local total unique
+  total="$(grep -c '^- \[' "$SB_PROJECTS/myproj/TODO.md")"
+  unique="$(grep -o '(t[0-9a-f]*)' "$SB_PROJECTS/myproj/TODO.md" | sort -u | wc -l | tr -d ' ')"
+  assert_eq "no id collisions across 201 todos" "$total" "$unique"
+}
+
+test_ambiguous_todo_id_is_recoverable() {
+  mk_repo backend
+  iw feat/one -r backend -p myproj >/dev/null 2>&1
+  # Hand-craft the collision that a 16-bit id used to produce, and check there
+  # is a way out. Previously both entries were unclosable forever.
+  {
+    printf -- '- [ ] (tdeadbeef) first colliding item — from feat-one, 2026-08-21\n'
+    printf -- '- [ ] (tdeadbeef) second colliding item — from feat-one, 2026-08-21\n'
+  } >> "$SB_PROJECTS/myproj/TODO.md"
+
+  local out
+  out="$(iw_in "$SB_TASKS/feat-one" "done" tdeadbeef 2>&1)"
+  assert_contains "ambiguity lists the candidates" "first colliding item" "$out"
+  assert_contains "ambiguity offers --nth" "--nth" "$out"
+
+  assert_ok "--nth closes the chosen one" \
+    iw_in "$SB_TASKS/feat-one" "done" tdeadbeef --nth 2
+  assert_grep "second is closed" '\[x\].*second colliding item' "$SB_PROJECTS/myproj/TODO.md"
+  assert_grep "first left alone" '\[ \].*first colliding item' "$SB_PROJECTS/myproj/TODO.md"
+  assert_fails "--nth out of range refused" \
+    iw_in "$SB_TASKS/feat-one" "done" tdeadbeef --nth 9
+}
+
+test_captured_text_is_length_capped() {
+  mk_repo backend
+  iw feat/one -r backend -p myproj >/dev/null 2>&1
+
+  local huge
+  huge="$(head -c 5000 /dev/zero | tr '\0' 'x')"
+  iw_in "$SB_TASKS/feat-one" decided "$huge" >/dev/null 2>&1
+
+  local longest
+  longest="$(awk '{ if (length($0) > m) m = length($0) } END { print m + 0 }' \
+    "$SB_PROJECTS/myproj/LOG.md")"
+  # An uncapped entry would be injected into every future session forever.
+  if (( longest < 1200 )); then ok; else bad "log line not capped (longest $longest chars)"; fi
+  assert_grep "truncation is visible" "truncated" "$SB_PROJECTS/myproj/LOG.md"
+}
+
+test_hook_exits_zero_when_it_cannot_write() {
+  mk_repo backend
+  iw feat/one -r backend -p myproj >/dev/null 2>&1
+  chmod 500 "$SB_PROJECTS/myproj"
+
+  # append_log used to die(), which exits past every '|| true' the hook wrapped
+  # it in, so Claude Code saw a failing hook with empty stderr.
+  local payload='{"hook_event_name":"PostToolUse","tool_name":"Bash","tool_input":{"command":"gh pr create --fill"},"tool_response":{"stdout":"https://github.com/acme/backend/pull/5\n"}}'
+  printf '%s' "$payload" | iw_in "$SB_TASKS/feat-one" --hook >/dev/null 2>&1
+  assert_eq "PostToolUse exits 0 even when the log is unwritable" "0" "$?"
+
+  printf '{"hook_event_name":"SessionStart"}' | iw_in "$SB_TASKS/feat-one" --hook >/dev/null 2>&1
+  assert_eq "SessionStart exits 0 too" "0" "$?"
+  chmod 700 "$SB_PROJECTS/myproj"
+}
+
+test_bad_show_log_lines_does_not_break_the_brief() {
+  mk_repo backend
+  iw feat/one -r backend -p myproj >/dev/null 2>&1
+  iw_in "$SB_TASKS/feat-one" decided "a decision worth seeing" >/dev/null 2>&1
+
+  # Evaluated inside (( )) and by tail -n, so a non-numeric value used to abort
+  # project_show halfway and take the hook's exit status with it.
+  local out
+  out="$(WANT_SHOW_LINES=lots iw project show myproj 2>/dev/null)"
+  assert_eq "project show still succeeds" "0" "$?"
+  assert_contains "and is complete" "a decision worth seeing" "$out"
+
+  out="$(printf '{"hook_event_name":"SessionStart"}' |
+    WANT_SHOW_LINES=lots iw_in "$SB_TASKS/feat-one" --hook 2>/dev/null)"
+  assert_eq "SessionStart hook still exits 0" "0" "$?"
+  assert_contains "and injects the whole brief" "a decision worth seeing" "$out"
+}
+
+test_pr_autolog_ignores_mentions_of_the_command() {
+  mk_repo backend
+  iw feat/one -r backend -p myproj >/dev/null 2>&1
+
+  # A substring test over the whole payload logged PR links that appeared in
+  # tool OUTPUT, e.g. grepping the docs for "gh pr create".
+  local grepping='{"hook_event_name":"PostToolUse","tool_name":"Bash","tool_input":{"command":"grep -rn \"gh pr create\" docs/"},"tool_response":{"stdout":"docs/x.md:4: see https://github.com/acme/backend/pull/9001\n"}}'
+  printf '%s' "$grepping" | iw_in "$SB_TASKS/feat-one" --hook >/dev/null 2>&1
+  assert_no_grep "a grep for the command logs nothing" "9001" "$SB_PROJECTS/myproj/LOG.md"
+
+  local reading='{"hook_event_name":"PostToolUse","tool_name":"Bash","tool_input":{"command":"cat CONTRIBUTING.md"},"tool_response":{"stdout":"Run gh pr create. See https://github.com/acme/backend/pull/1\n"}}'
+  printf '%s' "$reading" | iw_in "$SB_TASKS/feat-one" --hook >/dev/null 2>&1
+  assert_no_grep "reading a file that mentions it logs nothing" "pull/1" \
+    "$SB_PROJECTS/myproj/LOG.md"
+
+  # ...but a real invocation still lands, including behind a cd chain.
+  local real='{"hook_event_name":"PostToolUse","tool_name":"Bash","tool_input":{"command":"cd backend && gh pr create --fill"},"tool_response":{"stdout":"https://github.com/acme/backend/pull/77\n"}}'
+  printf '%s' "$real" | iw_in "$SB_TASKS/feat-one" --hook >/dev/null 2>&1
+  assert_grep "a real gh pr create is still logged" "pull/77" "$SB_PROJECTS/myproj/LOG.md"
+}
+
+test_project_link_beats_the_env_var() {
+  mk_repo backend
+  mk_repo frontend
+  iw feat/one -r backend -p alpha >/dev/null 2>&1
+  iw feat/two -r frontend -p beta >/dev/null 2>&1
+
+  # Exporting IWORK_PROJECT once used to misfile every capture from every other
+  # project's tasks, silently.
+  WANT_PROJECT_ENV=beta iw_in "$SB_TASKS/feat-one" todo "belongs to alpha" >/dev/null 2>&1
+  assert_grep "capture went to the task's own project" "belongs to alpha" \
+    "$SB_PROJECTS/alpha/TODO.md"
+  assert_no_grep "and not to the env var's project" "belongs to alpha" \
+    "$SB_PROJECTS/beta/TODO.md"
+
+  # Outside a task it is still the fallback, and -p still wins everywhere.
+  WANT_PROJECT_ENV=beta iw_in "$SB" todo "outside any task" >/dev/null 2>&1
+  assert_grep "env var applies outside a task" "outside any task" "$SB_PROJECTS/beta/TODO.md"
+  WANT_PROJECT_ENV=beta iw_in "$SB_TASKS/feat-one" todo "explicit wins" -p beta >/dev/null 2>&1
+  assert_grep "-p overrides both" "explicit wins" "$SB_PROJECTS/beta/TODO.md"
+}
+
+# --- review findings: correctness ---------------------------------------------
+
+test_project_cat_refuses_a_symlink_out() {
+  mk_repo backend
+  iw feat/one -r backend -p myproj >/dev/null 2>&1
+  echo "SECRET" > "$SB/outside.txt"
+  ln -s "$SB/outside.txt" "$SB_PROJECTS/myproj/notes/link.md"
+  ln -s /etc "$SB_PROJECTS/myproj/notes/etc"
+
+  # The '..' check was not containment: a symlink inside the project reached
+  # outside it without one.
+  assert_fails "symlinked file refused" \
+    iw_in "$SB_TASKS/feat-one" project cat notes/link.md
+  assert_fails "symlinked directory refused" \
+    iw_in "$SB_TASKS/feat-one" project cat notes/etc/hosts
+  assert_ok "a real file inside is still readable" \
+    iw_in "$SB_TASKS/feat-one" project cat LOG.md
+}
+
+test_park_validates_the_task_before_creating_a_project() {
+  mk_repo backend
+  git -C "$SB_REPOS/backend" checkout -q -b feat/parked
+  ( cd "$SB_REPOS/backend" && iw park 'bad/name' -p brandnew ) >/dev/null 2>&1
+  assert_no_file "no stray project from an invalid task name" "$SB_PROJECTS/brandnew"
+}
+
+test_park_refuses_a_repo_outside_the_repo_dir() {
+  mk_repo backend
+  git init -q -b main "$SB/elsewhere"
+  ( cd "$SB/elsewhere" && git -c user.name=t -c user.email=t@e commit -qm init --allow-empty
+    git checkout -q -b feat/x ) >/dev/null 2>&1
+  assert_fails "park refuses a repo outside IWORK_REPO_DIR" \
+    sh -c "cd '$SB/elsewhere' && '$IWORK_SRC' park sometask"
+}
+
+test_project_show_accepts_the_p_flag() {
+  mk_repo backend
+  iw feat/one -r backend -p myproj >/dev/null 2>&1
+  # Both help texts advertise this; only the positional form worked.
+  assert_ok "project show -p works" iw project show -p myproj
+  assert_contains "and targets the right project" "myproj" \
+    "$(iw project show -p myproj 2>&1)"
+}
+
+test_detach_is_recorded_in_history() {
+  mk_repo backend
+  iw feat/one -r backend -p myproj >/dev/null 2>&1
+  iw project rm myproj feat-one >/dev/null 2>&1
+
+  assert_grep "detach recorded" "detached" "$SB_PROJECTS/myproj/history.tsv"
+  rm -rf "$SB_TASKS/feat-one"
+  local out
+  out="$(iw project show myproj 2>&1)"
+  # Without the detach event the task showed as 'opened' forever.
+  assert_contains "past tasks show the detach" "detached" "$out"
+}
+
+test_done_and_drop_reject_kind_flags() {
+  mk_repo backend
+  iw feat/one -r backend -p myproj >/dev/null 2>&1
+  iw_in "$SB_TASKS/feat-one" todo "a thing" >/dev/null 2>&1
+  local id
+  id="$(sed -n 's/.*(\(t[0-9a-f]*\)).*/\1/p' "$SB_PROJECTS/myproj/TODO.md" | head -1)"
+
+  # These were silently accepted and ignored.
+  assert_fails "done rejects --shipped" iw_in "$SB_TASKS/feat-one" "done" "$id" --shipped
+  assert_fails "drop rejects --decision" iw_in "$SB_TASKS/feat-one" drop "$id" --decision
+  assert_grep "todo untouched" '^- \[ \]' "$SB_PROJECTS/myproj/TODO.md"
+}
+
+test_misplaced_flag_after_repos_is_an_error() {
+  mk_repo backend
+  # Used to surface as ".../-p is not a git repository".
+  local out
+  out="$(iw add-repo nosuchtask -r backend --from main 2>&1 || true)"
+  assert_contains "the error names the flag, not a missing repo" "unexpected option" "$out"
+  out="$(iw rm -f nosuchtask -r backend -p proj 2>&1 || true)"
+  assert_contains "same for rm" "unexpected option" "$out"
+}
+
+test_install_hooks_quotes_the_command_path() {
+  command -v python3 >/dev/null 2>&1 || { printf '    skip (no python3)\n'; return 0; }
+  mkdir -p "$SB/my tools"
+  cp "$IWORK_SRC" "$SB/my tools/iwork"
+  chmod +x "$SB/my tools/iwork"
+
+  env -u TMUX HOME="$SB_HOME" IWORK_CONFIG_FILE="$SB/config" \
+    IWORK_REPO_DIR="$SB_REPOS" IWORK_TASKS_DIR="$SB_TASKS" \
+    IWORK_PROJECTS_DIR="$SB_PROJECTS" IWORK_ASSUME_YES=1 \
+    "$SB/my tools/iwork" install-hooks "$SB/settings-spaces.json" >/dev/null 2>&1
+
+  # An unquoted path made every hook fail with 127.
+  local cmd
+  cmd="$(python3 - "$SB/settings-spaces.json" <<'PY'
+import json, sys
+hooks = json.load(open(sys.argv[1])).get("hooks", {})
+for entries in hooks.values():
+    for e in entries:
+        for h in e.get("hooks", []):
+            print(h.get("command", "")); raise SystemExit
+PY
+)"
+  assert_contains "path is quoted or escaped" '\' "$cmd"
+  assert_ok "and the quoted command actually runs" \
+    sh -c "printf '{\"hook_event_name\":\"Stop\"}' | $cmd"
+}
+
+# --- review findings: the four mutations that survived -------------------------
+
+test_project_delete_requires_force_for_real() {
+  mk_repo backend
+  iw feat/one -r backend -p myproj >/dev/null 2>&1
+  iw_in "$SB_TASKS/feat-one" decided "worth keeping" >/dev/null 2>&1
+  iw project rm myproj feat-one >/dev/null 2>&1
+
+  # The old test passed because a task was still attached, so it never
+  # exercised the -f requirement at all.
+  assert_fails "delete without -f is refused" iw project delete myproj
+  assert_dir "project survives the refusal" "$SB_PROJECTS/myproj"
+  assert_grep "memory intact" "worth keeping" "$SB_PROJECTS/myproj/LOG.md"
+
+  assert_ok "delete -f removes it" iw project delete -f myproj
+  assert_no_file "project is gone" "$SB_PROJECTS/myproj"
+}
+
+test_project_delete_refuses_while_attached_even_with_force() {
+  mk_repo backend
+  iw feat/one -r backend -p myproj >/dev/null 2>&1
+  assert_fails "attached task blocks delete even with -f" iw project delete -f myproj
+  assert_dir "project survives" "$SB_PROJECTS/myproj"
+}
+
+test_flip_todo_takes_the_lock() {
+  mk_repo backend
+  iw feat/one -r backend -p myproj >/dev/null 2>&1
+  iw_in "$SB_TASKS/feat-one" todo "a thing" >/dev/null 2>&1
+  local id
+  id="$(sed -n 's/.*(\(t[0-9a-f]*\)).*/\1/p' "$SB_PROJECTS/myproj/TODO.md" | head -1)"
+
+  # A live lock held by this very shell must block the rewrite. Without this,
+  # removing the lock entirely from flip_todo went unnoticed.
+  mkdir -p "$SB_PROJECTS/myproj/.lock"
+  echo "$$" > "$SB_PROJECTS/myproj/.lock/pid"
+  assert_fails "flip refuses while the lock is genuinely held" \
+    iw_in "$SB_TASKS/feat-one" "done" "$id"
+  assert_grep "todo untouched" '^- \[ \]' "$SB_PROJECTS/myproj/TODO.md"
+  rm -rf "$SB_PROJECTS/myproj/.lock"
+
+  assert_ok "and succeeds once released" iw_in "$SB_TASKS/feat-one" "done" "$id"
+}
+
+# --- review findings: tmux, which nothing exercised ---------------------------
+
+test_tmux_window_is_created_for_a_task() {
+  command -v tmux >/dev/null 2>&1 || { printf '    skip (no tmux)\n'; return 0; }
+  mk_repo backend
+
+  # WANT_TMUX was dead, so window creation, session naming and kill_task_tmux
+  # were never run by any test.
+  WANT_TMUX=1 iw --detach feat/one -r backend -p myproj >/dev/null 2>&1
+
+  local windows
+  windows="$(tmux_t list-windows -t tasks -F '#{window_name}' 2>/dev/null | tr '\n' ' ')"
+  assert_contains "a window was created for the task" "feat-one" "$windows"
+  assert_link "and the project was still attached" "$SB_TASKS/feat-one/.project"
+}
+
+test_tmux_session_is_killed_with_the_task() {
+  command -v tmux >/dev/null 2>&1 || { printf '    skip (no tmux)\n'; return 0; }
+  mk_repo backend
+  WANT_TMUX=1 iw --detach --big feat/one -r backend -p myproj >/dev/null 2>&1
+
+  local session="tasks-feat-one"
+  if ! tmux_t has-session -t "=$session" 2>/dev/null; then
+    printf '    skip (--big session not created in this environment)\n'
+    return 0
+  fi
+  ok
+  WANT_TMUX=1 iw rm -f feat-one >/dev/null 2>&1
+  if tmux_t has-session -t "=$session" 2>/dev/null; then
+    bad "rm left the task's tmux session behind"
+  else
+    ok
+  fi
+  assert_dir "project memory survived" "$SB_PROJECTS/myproj"
 }
 
 # --- runner -------------------------------------------------------------------
