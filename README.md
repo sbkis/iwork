@@ -106,7 +106,11 @@ command -v iwork >/dev/null && source <(iwork --completion zsh)
 command -v iwork >/dev/null && source <(iwork --completion bash)
 ```
 
-Open a new shell (or `source` your rc) to pick it up. Without this step the tool
+Open a new shell (or `source` your rc) to pick it up. The wrapper resolves the
+`iwork` binary itself when it has to, so it also works in a non-interactive
+shell — an agent's `Bash` tool inherits these functions from a shell snapshot
+that carries the function but not the variable that used to point at the
+binary. Without this step the tool
 still works, except `iwork cd` — which requires the wrapper — will tell you to set
 it up.
 

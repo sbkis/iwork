@@ -1037,6 +1037,80 @@ test_park_with_project() {
   assert_file "stashed work restored" "$SB_TASKS/parked-task/backend/wip.txt"
 }
 
+# The gap that made every agent-facing verb unreachable: an agent's shell
+# inherits these functions from a Claude Code shell snapshot, which captures the
+# function but not the '_iwork_bin=' assignment emitted next to it. The wrapper
+# then executed the empty string. Every other test in this file calls the binary
+# directly, so nothing here would have noticed.
+test_wrapper_works_without_iwork_bin_set() {
+  mk_repo backend
+  iw feat/one -r backend -p myproj >/dev/null 2>&1
+
+  local shell=""
+  local out=""
+  for shell in bash zsh; do
+    command -v "$shell" >/dev/null 2>&1 || continue
+    iw --completion "$shell" > "$SB/wrapper-$shell.sh" 2>/dev/null
+
+    # PATH-resolvable iwork, no _iwork_bin — exactly the snapshot situation.
+    out="$("$shell" -c "
+      export PATH='$SB/bin':\$PATH
+      ln -sf '$IWORK_SRC' '$SB/bin/iwork'
+      source '$SB/wrapper-$shell.sh'
+      unset _iwork_bin
+      export IWORK_CONFIG_FILE='$SB/config' IWORK_REPO_DIR='$SB_REPOS'
+      export IWORK_TASKS_DIR='$SB_TASKS' IWORK_PROJECTS_DIR='$SB_PROJECTS'
+      export IWORK_NO_TMUX=1 HOME='$SB_HOME'
+      iwork list
+    " 2>&1)"
+    assert_contains "$shell wrapper works with _iwork_bin unset" "feat-one" "$out"
+    case "$out" in
+      *"permission denied"*) bad "$shell wrapper tried to execute the empty string" ;;
+      *) ok ;;
+    esac
+  done
+}
+
+test_wrapper_says_so_when_the_binary_is_missing() {
+  mk_repo backend
+  iw --completion bash > "$SB/wrapper.sh" 2>/dev/null
+
+  # No _iwork_bin and nothing on PATH: an actionable message, not a silent fail.
+  local out
+  out="$(bash -c "
+    source '$SB/wrapper.sh'
+    unset _iwork_bin
+    PATH=/usr/bin:/bin
+    iwork list
+    echo \"exit=\$?\"
+  " 2>&1)"
+  assert_contains "the message names the fix" "re-source the shell integration" "$out"
+  assert_contains "and it exits 127" "exit=127" "$out"
+}
+
+test_completion_helpers_also_resolve_the_binary() {
+  mk_repo backend
+  iw feat/one -r backend -p myproj >/dev/null 2>&1
+  iw --completion bash > "$SB/wrapper.sh" 2>/dev/null
+
+  # The completion function calls the binary too; patching only the wrapper
+  # would have left tab completion silently returning nothing.
+  local out
+  out="$(bash -c "
+    export PATH='$SB/bin':\$PATH
+    ln -sf '$IWORK_SRC' '$SB/bin/iwork'
+    source '$SB/wrapper.sh'
+    unset _iwork_bin
+    export IWORK_CONFIG_FILE='$SB/config' IWORK_REPO_DIR='$SB_REPOS'
+    export IWORK_TASKS_DIR='$SB_TASKS' IWORK_PROJECTS_DIR='$SB_PROJECTS'
+    export IWORK_NO_TMUX=1 HOME='$SB_HOME'
+    COMP_WORDS=(iwork cd '') COMP_CWORD=2
+    _iwork
+    printf '%s\n' \"\${COMPREPLY[@]}\"
+  " 2>&1)"
+  assert_contains "completion still produces candidates" "feat-one" "$out"
+}
+
 test_park_wrapper_forwards_flags() {
   local out
   for shell in bash zsh; do

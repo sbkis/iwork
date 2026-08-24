@@ -1201,6 +1201,17 @@ iwork() {
   local notmux=""
   local msg=""
   local lead=()
+  local _bin="${_iwork_bin:-}"
+
+  # A shell snapshot — how a non-interactive shell such as an agent's Bash tool
+  # inherits these functions — captures the function but not the _iwork_bin
+  # assignment emitted beside it. Without this the wrapper tried to execute the
+  # empty string ("permission denied: ") and nothing was reachable.
+  [[ -n "$_bin" ]] || _bin="$(type -P iwork 2>/dev/null)"
+  if [[ -z "$_bin" ]]; then
+    echo "iwork: cannot locate the iwork binary on PATH; re-source the shell integration" >&2
+    return 127
+  fi
 
   # Flags can precede the subcommand, so skip them to find it -- otherwise
   # 'iwork -m msg park x' misses the park branch and its cd. -m and --from
@@ -1224,7 +1235,7 @@ iwork() {
   case "$cmd" in
     rm)
       if [[ $# -lt 2 ]]; then
-        command "$_iwork_bin" rm
+        command "$_bin" rm
         return $?
       fi
 
@@ -1234,13 +1245,13 @@ iwork() {
         case "$arg" in
           -*) ;;
           *)
-            target="$(command "$_iwork_bin" --resolve-worktree-folder "$arg" 2>/dev/null)"
+            target="$(command "$_bin" --resolve-worktree-folder "$arg" 2>/dev/null)"
             break
             ;;
         esac
       done
 
-      command "$_iwork_bin" ${lead[@]+"${lead[@]}"} rm "$@" || return $?
+      command "$_bin" ${lead[@]+"${lead[@]}"} rm "$@" || return $?
 
       # The folder we were standing in may be gone now.
       if [[ -n "$target" && ! -d "$target" && "$PWD" == "$target"* ]]; then
@@ -1249,7 +1260,7 @@ iwork() {
       ;;
     park)
       if [[ $# -lt 2 ]]; then
-        command "$_iwork_bin" park
+        command "$_bin" park
         return $?
       fi
 
@@ -1271,40 +1282,40 @@ iwork() {
         esac
       done
       unset skip_next
-      [[ -n "$folder" ]] || { command "$_iwork_bin" park; return $?; }
-      target="$(command "$_iwork_bin" --resolve-park-target-path "$folder")" || return $?
-      command "$_iwork_bin" ${lead[@]+"${lead[@]}"} park "$@" || return $?
+      [[ -n "$folder" ]] || { command "$_bin" park; return $?; }
+      target="$(command "$_bin" --resolve-park-target-path "$folder")" || return $?
+      command "$_bin" ${lead[@]+"${lead[@]}"} park "$@" || return $?
       if [[ -z "${TMUX:-}" || -n "$notmux" ]]; then
         builtin cd "$target" || return $?
       fi
       ;;
     cd)
       if [[ $# -lt 2 ]]; then
-        command "$_iwork_bin" cd
+        command "$_bin" cd
         return $?
       fi
 
       folder="$2"
       shift 2
-      if [[ -n "${TMUX:-}" && -z "$notmux" ]] && command "$_iwork_bin" --switch-task-window "$folder" 2>/dev/null; then
+      if [[ -n "${TMUX:-}" && -z "$notmux" ]] && command "$_bin" --switch-task-window "$folder" 2>/dev/null; then
         return 0
       fi
-      target="$(command "$_iwork_bin" --resolve-worktree-folder "$folder")" || return $?
+      target="$(command "$_bin" --resolve-worktree-folder "$folder")" || return $?
       builtin cd "$target" || return $?
       ;;
     claude|codex)
       if [[ $# -lt 2 ]]; then
-        command "$_iwork_bin" "$cmd"
+        command "$_bin" "$cmd"
         return $?
       fi
 
       folder="$2"
       shift 2
       if [[ -n "${TMUX:-}" && -z "$notmux" ]]; then
-        command "$_iwork_bin" ${lead[@]+"${lead[@]}"} "$cmd" "$folder" "$@"
+        command "$_bin" ${lead[@]+"${lead[@]}"} "$cmd" "$folder" "$@"
         return $?
       fi
-      target="$(command "$_iwork_bin" --resolve-worktree-folder "$folder")" || return $?
+      target="$(command "$_bin" --resolve-worktree-folder "$folder")" || return $?
       builtin cd "$target" || return $?
       if [[ -n "$msg" ]]; then
         "$cmd" "$@" -- "$msg"
@@ -1313,13 +1324,21 @@ iwork() {
       fi
       ;;
     *)
-      command "$_iwork_bin" ${lead[@]+"${lead[@]}"} "$@"
+      command "$_bin" ${lead[@]+"${lead[@]}"} "$@"
       ;;
   esac
 }
 
 _iwork() {
   local cur prev seen_r i repos folders folder cmd cmd_i projects sub
+  local _bin="${_iwork_bin:-}"
+
+  # A shell snapshot — how a non-interactive shell such as an agent's Bash tool
+  # inherits these functions — captures the function but not the _iwork_bin
+  # assignment emitted beside it. Without this the wrapper tried to execute the
+  # empty string ("permission denied: ") and nothing was reachable.
+  [[ -n "$_bin" ]] || _bin="$(type -P iwork 2>/dev/null)"
+
   COMPREPLY=()
   cur="${COMP_WORDS[COMP_CWORD]}"
   prev=""
@@ -1342,7 +1361,7 @@ _iwork() {
 
   # -p takes a project name wherever it appears.
   if [[ "$prev" == "-p" || "$prev" == "--project" ]]; then
-    projects="$("$_iwork_bin" --complete-projects "$cur" 2>/dev/null)" || return 0
+    projects="$("$_bin" --complete-projects "$cur" 2>/dev/null)" || return 0
     COMPREPLY=( $(compgen -W "$projects" -- "$cur") )
     return 0
   fi
@@ -1357,16 +1376,16 @@ _iwork() {
       case "$sub" in
         show|grep|cat|delete)
           if (( COMP_CWORD == 3 )); then
-            projects="$("$_iwork_bin" --complete-projects "$cur" 2>/dev/null)" || return 0
+            projects="$("$_bin" --complete-projects "$cur" 2>/dev/null)" || return 0
             COMPREPLY=( $(compgen -W "$projects" -- "$cur") )
           fi
           ;;
         add|rm)
           if (( COMP_CWORD == 3 )); then
-            projects="$("$_iwork_bin" --complete-projects "$cur" 2>/dev/null)" || return 0
+            projects="$("$_bin" --complete-projects "$cur" 2>/dev/null)" || return 0
             COMPREPLY=( $(compgen -W "$projects" -- "$cur") )
           elif (( COMP_CWORD == 4 )); then
-            folders="$("$_iwork_bin" --complete-worktree-folders "$cur" 2>/dev/null)" || return 0
+            folders="$("$_bin" --complete-worktree-folders "$cur" 2>/dev/null)" || return 0
             COMPREPLY=( $(compgen -W "$folders" -- "$cur") )
           fi
           ;;
@@ -1385,14 +1404,14 @@ _iwork() {
       ;;
     cd|claude|codex)
       if (( COMP_CWORD == cmd_i + 1 )); then
-        folders="$("$_iwork_bin" --complete-worktree-folders "$cur" 2>/dev/null)" || return 0
+        folders="$("$_bin" --complete-worktree-folders "$cur" 2>/dev/null)" || return 0
         COMPREPLY=( $(compgen -W "$folders" -- "$cur") )
       fi
       return 0
       ;;
     add-repo|rm)
       if (( COMP_CWORD == cmd_i + 1 )); then
-        folders="$("$_iwork_bin" --complete-worktree-folders "$cur" 2>/dev/null)" || return 0
+        folders="$("$_bin" --complete-worktree-folders "$cur" 2>/dev/null)" || return 0
         COMPREPLY=( $(compgen -W "$folders" -- "$cur") )
         return 0
       fi
@@ -1418,7 +1437,7 @@ _iwork() {
 
   # --from takes an existing task (or a branch, which we cannot complete)
   if [[ "$prev" == "--from" ]]; then
-    folders="$("$_iwork_bin" --complete-worktree-folders "$cur" 2>/dev/null)" || return 0
+    folders="$("$_bin" --complete-worktree-folders "$cur" 2>/dev/null)" || return 0
     COMPREPLY=( $(compgen -W "$folders" -- "$cur") )
     return 0
   fi
@@ -1449,9 +1468,9 @@ _iwork() {
     fi
 
     if [[ "$cmd" == "rm" && -n "$folder" ]]; then
-      repos="$("$_iwork_bin" --complete-task-worktrees "$folder" "$cur" 2>/dev/null)" || return 0
+      repos="$("$_bin" --complete-task-worktrees "$folder" "$cur" 2>/dev/null)" || return 0
     else
-      repos="$("$_iwork_bin" --complete-repos "$cur" 2>/dev/null)" || return 0
+      repos="$("$_bin" --complete-repos "$cur" 2>/dev/null)" || return 0
     fi
     COMPREPLY=( $(compgen -W "$repos" -- "$cur") )
     return 0
@@ -1497,6 +1516,17 @@ iwork() {
   local notmux=""
   local msg=""
   local lead=()
+  local _bin="${_iwork_bin:-}"
+
+  # A shell snapshot — how a non-interactive shell such as an agent's Bash tool
+  # inherits these functions — captures the function but not the _iwork_bin
+  # assignment emitted beside it. Without this the wrapper tried to execute the
+  # empty string ("permission denied: ") and nothing was reachable.
+  [[ -n "$_bin" ]] || _bin="$(whence -p iwork 2>/dev/null)"
+  if [[ -z "$_bin" ]]; then
+    echo "iwork: cannot locate the iwork binary on PATH; re-source the shell integration" >&2
+    return 127
+  fi
 
   # Flags can precede the subcommand, so skip them to find it -- otherwise
   # 'iwork -m msg park x' misses the park branch and its cd. -m and --from
@@ -1520,7 +1550,7 @@ iwork() {
   case "$cmd" in
     rm)
       if [[ $# -lt 2 ]]; then
-        command "$_iwork_bin" rm
+        command "$_bin" rm
         return $?
       fi
 
@@ -1530,13 +1560,13 @@ iwork() {
         case "$arg" in
           -*) ;;
           *)
-            target="$(command "$_iwork_bin" --resolve-worktree-folder "$arg" 2>/dev/null)"
+            target="$(command "$_bin" --resolve-worktree-folder "$arg" 2>/dev/null)"
             break
             ;;
         esac
       done
 
-      command "$_iwork_bin" ${lead[@]+"${lead[@]}"} rm "$@" || return $?
+      command "$_bin" ${lead[@]+"${lead[@]}"} rm "$@" || return $?
 
       # The folder we were standing in may be gone now.
       if [[ -n "$target" && ! -d "$target" && "$PWD" == "$target"* ]]; then
@@ -1545,7 +1575,7 @@ iwork() {
       ;;
     park)
       if [[ $# -lt 2 ]]; then
-        command "$_iwork_bin" park
+        command "$_bin" park
         return $?
       fi
 
@@ -1567,40 +1597,40 @@ iwork() {
         esac
       done
       unset skip_next
-      [[ -n "$folder" ]] || { command "$_iwork_bin" park; return $?; }
-      target="$(command "$_iwork_bin" --resolve-park-target-path "$folder")" || return $?
-      command "$_iwork_bin" ${lead[@]+"${lead[@]}"} park "$@" || return $?
+      [[ -n "$folder" ]] || { command "$_bin" park; return $?; }
+      target="$(command "$_bin" --resolve-park-target-path "$folder")" || return $?
+      command "$_bin" ${lead[@]+"${lead[@]}"} park "$@" || return $?
       if [[ -z "${TMUX:-}" || -n "$notmux" ]]; then
         builtin cd "$target" || return $?
       fi
       ;;
     cd)
       if [[ $# -lt 2 ]]; then
-        command "$_iwork_bin" cd
+        command "$_bin" cd
         return $?
       fi
 
       folder="$2"
       shift 2
-      if [[ -n "${TMUX:-}" && -z "$notmux" ]] && command "$_iwork_bin" --switch-task-window "$folder" 2>/dev/null; then
+      if [[ -n "${TMUX:-}" && -z "$notmux" ]] && command "$_bin" --switch-task-window "$folder" 2>/dev/null; then
         return 0
       fi
-      target="$(command "$_iwork_bin" --resolve-worktree-folder "$folder")" || return $?
+      target="$(command "$_bin" --resolve-worktree-folder "$folder")" || return $?
       builtin cd "$target" || return $?
       ;;
     claude|codex)
       if [[ $# -lt 2 ]]; then
-        command "$_iwork_bin" "$cmd"
+        command "$_bin" "$cmd"
         return $?
       fi
 
       folder="$2"
       shift 2
       if [[ -n "${TMUX:-}" && -z "$notmux" ]]; then
-        command "$_iwork_bin" ${lead[@]+"${lead[@]}"} "$cmd" "$folder" "$@"
+        command "$_bin" ${lead[@]+"${lead[@]}"} "$cmd" "$folder" "$@"
         return $?
       fi
-      target="$(command "$_iwork_bin" --resolve-worktree-folder "$folder")" || return $?
+      target="$(command "$_bin" --resolve-worktree-folder "$folder")" || return $?
       builtin cd "$target" || return $?
       if [[ -n "$msg" ]]; then
         "$cmd" "$@" -- "$msg"
@@ -1609,7 +1639,7 @@ iwork() {
       fi
       ;;
     *)
-      command "$_iwork_bin" ${lead[@]+"${lead[@]}"} "$@"
+      command "$_bin" ${lead[@]+"${lead[@]}"} "$@"
       ;;
   esac
 }
@@ -1620,6 +1650,13 @@ _iwork() {
   local -a repos folders projects
   local cmd="" folder="" word="" sub=""
   local cmd_i=0 i=0
+  local _bin="${_iwork_bin:-}"
+
+  # A shell snapshot — how a non-interactive shell such as an agent's Bash tool
+  # inherits these functions — captures the function but not the _iwork_bin
+  # assignment emitted beside it. Without this the wrapper tried to execute the
+  # empty string ("permission denied: ") and nothing was reachable.
+  [[ -n "$_bin" ]] || _bin="$(whence -p iwork 2>/dev/null)"
 
   # Flags may precede the subcommand, so find the first word that is not one
   # (or a flag's value) rather than assuming index 2.
@@ -1662,7 +1699,7 @@ _iwork() {
 
   # -p takes a project name wherever it appears.
   if [[ "${words[CURRENT-1]:-}" == "-p" || "${words[CURRENT-1]:-}" == "--project" ]]; then
-    projects=("${(@f)$("$_iwork_bin" --complete-projects "$PREFIX" 2>/dev/null)}")
+    projects=("${(@f)$("$_bin" --complete-projects "$PREFIX" 2>/dev/null)}")
     _describe -t projects 'project' projects
     return 0
   fi
@@ -1684,16 +1721,16 @@ _iwork() {
       case "$sub" in
         show|grep|cat|delete)
           if (( CURRENT == 4 )); then
-            projects=("${(@f)$("$_iwork_bin" --complete-projects "$PREFIX" 2>/dev/null)}")
+            projects=("${(@f)$("$_bin" --complete-projects "$PREFIX" 2>/dev/null)}")
             _describe -t projects 'project' projects
           fi
           ;;
         add|rm)
           if (( CURRENT == 4 )); then
-            projects=("${(@f)$("$_iwork_bin" --complete-projects "$PREFIX" 2>/dev/null)}")
+            projects=("${(@f)$("$_bin" --complete-projects "$PREFIX" 2>/dev/null)}")
             _describe -t projects 'project' projects
           elif (( CURRENT == 5 )); then
-            folders=("${(@f)$("$_iwork_bin" --complete-worktree-folders "$PREFIX" 2>/dev/null)}")
+            folders=("${(@f)$("$_bin" --complete-worktree-folders "$PREFIX" 2>/dev/null)}")
             _describe -t folders 'worktree folder' folders
           fi
           ;;
@@ -1714,14 +1751,14 @@ _iwork() {
       ;;
     cd|claude|codex)
       if (( CURRENT == cmd_i + 1 )); then
-        folders=("${(@f)$("$_iwork_bin" --complete-worktree-folders "$PREFIX" 2>/dev/null)}")
+        folders=("${(@f)$("$_bin" --complete-worktree-folders "$PREFIX" 2>/dev/null)}")
         _describe -t folders 'worktree folder' folders
       fi
       return 0
       ;;
     add-repo|rm)
       if (( CURRENT == cmd_i + 1 )); then
-        folders=("${(@f)$("$_iwork_bin" --complete-worktree-folders "$PREFIX" 2>/dev/null)}")
+        folders=("${(@f)$("$_bin" --complete-worktree-folders "$PREFIX" 2>/dev/null)}")
         _describe -t folders 'worktree folder' folders
         return 0
       fi
@@ -1745,7 +1782,7 @@ _iwork() {
   fi
 
   if [[ "${words[CURRENT-1]}" == "--from" ]]; then
-    folders=("${(@f)$("$_iwork_bin" --complete-worktree-folders "$PREFIX" 2>/dev/null)}")
+    folders=("${(@f)$("$_bin" --complete-worktree-folders "$PREFIX" 2>/dev/null)}")
     _describe -t folders 'task to build on' folders
     return 0
   fi
@@ -1760,9 +1797,9 @@ _iwork() {
 
     if (( ${words[(I)-r]} > 0 )); then
       if [[ -n "$folder" ]]; then
-        repos=("${(@f)$("$_iwork_bin" --complete-task-worktrees "$folder" "$PREFIX" 2>/dev/null)}")
+        repos=("${(@f)$("$_bin" --complete-task-worktrees "$folder" "$PREFIX" 2>/dev/null)}")
       else
-        repos=("${(@f)$("$_iwork_bin" --complete-repos "$PREFIX" 2>/dev/null)}")
+        repos=("${(@f)$("$_bin" --complete-repos "$PREFIX" 2>/dev/null)}")
       fi
       _describe -t repos 'repo' repos
     else
@@ -1791,7 +1828,7 @@ _iwork() {
         '--no-context[skip writing task context files]'
       return 0
     fi
-    repos=("${(@f)$("$_iwork_bin" --complete-repos "$PREFIX" 2>/dev/null)}")
+    repos=("${(@f)$("$_bin" --complete-repos "$PREFIX" 2>/dev/null)}")
     _describe -t repos 'repo' repos
   fi
 }
@@ -3716,7 +3753,8 @@ need -p. Pass -p <project> to target one from anywhere else.
 Reading — safe to run at any time:
   iwork project show [-n <count>] [<project>]
                                  goal, live tasks, open todos, recent log
-  iwork project grep <pattern>   search the whole project memory
+  iwork project grep <pattern>   search the whole project memory (exits 1 when
+                                 nothing matches, like grep — not an error)
   iwork project cat <path>       print one file from it, e.g. notes/api.md
   iwork project list             every project
 
