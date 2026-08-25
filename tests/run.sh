@@ -805,7 +805,9 @@ test_project_grep_finds_hidden_symlinked_notes() {
   # reason `project grep` exists.
   if command -v rg >/dev/null 2>&1; then
     local raw
-    raw="$( cd "$SB_TASKS/feat-one" && rg ZORBLAX 2>/dev/null )"
+    # The path matters: given no path and a piped stdin, rg searches stdin
+    # instead of the directory, and hangs the suite if nothing ever closes it.
+    raw="$( cd "$SB_TASKS/feat-one" && rg ZORBLAX . 2>/dev/null )"
     assert_eq "plain rg cannot see project notes" "" "$raw"
   fi
 
