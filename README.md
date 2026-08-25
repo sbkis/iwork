@@ -264,7 +264,7 @@ The block names `iwork` as a CLI on the agent's PATH and points at
 `iwork project -h`, so the verbs listed in a months-old `CLAUDE.md` are not the
 only source of truth as the tool grows.
 
-It deliberately does **not** point at `iwork -h`. That is ~180 lines of mostly
+It deliberately does **not** point at `iwork -h`. That is ~220 lines of mostly
 operator material, and it advertises `iwork rm -f`, which deletes worktrees
 *including ones with uncommitted work* — not something to hand an agent that is
 casting around for what it can do. `iwork project -h` is 33 lines in three
