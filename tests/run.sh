@@ -1643,8 +1643,19 @@ test_misplaced_flag_after_repos_is_an_error() {
   mk_repo backend
   # Used to surface as ".../-p is not a git repository".
   local out
+
+  # Flags read in any position on an add-repo line now, so this one is legal and
+  # the command gets as far as its real complaint instead of taking the flag for
+  # a repo name.
   out="$(iw add-repo nosuchtask -r backend --from main 2>&1 || true)"
-  assert_contains "the error names the flag, not a missing repo" "unexpected option" "$out"
+  assert_contains "a flag after -r is parsed as a flag" "worktree folder not found" "$out"
+
+  # -p is not add-repo's to take, and is refused rather than quietly ignored.
+  out="$(iw add-repo nosuchtask -r backend -p proj 2>&1 || true)"
+  assert_contains "-p on add-repo says where it does belong" "does not apply to add-repo" "$out"
+
+  # rm still gathers repos with the stricter parser, where a trailing flag is
+  # a mistake rather than a position.
   out="$(iw rm -f nosuchtask -r backend -p proj 2>&1 || true)"
   assert_contains "same for rm" "unexpected option" "$out"
 }
@@ -2098,6 +2109,35 @@ test_project_directory_beats_the_env_var() {
   local WANT_PROJECT_ENV="otherproj"
   assert_contains "the directory wins over IWORK_PROJECT" "myproj" \
     "$(iw_in "$SB_PROJECTS/myproj" project agents 2>&1)"
+}
+
+test_project_flag_and_message_coexist() {
+  mk_repo backend
+
+  # -m arrived on main while -p was on this branch; both parse in any position
+  # and neither swallows the other's value.
+  local out
+  out="$(iw feat/one -r backend -m "start on the refactor" -p myproj 2>&1)"
+  assert_link "the task still joined the project" "$SB_TASKS/feat-one/.project"
+  assert_grep "and got its project block" "iwork:project" "$SB_TASKS/feat-one/CLAUDE.md"
+  assert_contains "-m says it could not be delivered without tmux" "-m was not delivered" "$out"
+
+  out="$(iw -m "another" feat/two -r backend -p myproj 2>&1)"
+  assert_link "-m ahead of the branch name works too" "$SB_TASKS/feat-two/.project"
+}
+
+test_message_undelivered_on_project_subcommands() {
+  mk_repo backend
+  iw feat/one -r backend -p myproj >/dev/null 2>&1
+
+  # These start no agent either, and main's list predates them: a dropped
+  # message must still be reported rather than silently discarded.
+  local verb out
+  for verb in "project list" "todo something" "decided something"; do
+    # shellcheck disable=SC2086
+    out="$(iw -m "hi" $verb 2>&1)"
+    assert_contains "-m reports itself undelivered for '$verb'" "-m was not delivered" "$out"
+  done
 }
 
 # --- runner -------------------------------------------------------------------

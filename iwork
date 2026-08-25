@@ -4240,7 +4240,7 @@ if [[ $# -eq 0 ]]; then
 fi
 
 case "${1:-}" in
-  rm|list|cd|init|install-hooks)
+  rm|list|cd|init|install-hooks|project|todo|log|decided|done|drop)
     warn_message_undelivered "'$1' does not start an agent"
     ;;
 esac
