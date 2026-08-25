@@ -986,6 +986,14 @@ test_completion_scripts_are_valid_shell() {
   assert_contains "project subcommand offered" "project" "$out"
   out="$(iw --completion zsh 2>&1)"
   assert_contains "zsh completion mentions project" "project" "$out"
+
+  # The zsh half only ever had a substring check, so a syntax error in its
+  # wrapper or its completion could ship without a single test noticing.
+  if command -v zsh >/dev/null 2>&1; then
+    assert_ok "zsh completion parses" zsh -n <(printf '%s' "$out")
+  else
+    printf '    skip (no zsh)\n'
+  fi
 }
 
 test_complete_projects_helper() {
