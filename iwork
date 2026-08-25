@@ -36,6 +36,10 @@ IWORK_BIG="${IWORK_BIG:-}"
 IWORK_EDITOR="${IWORK_EDITOR:-nvim}"
 # Per-invocation only (--from): the task or branch new branches start from.
 BASE_SPEC=""
+# Per-invocation only (-m): the agent's first prompt, and the argv tail that
+# hands it over (see agent_message_args).
+INITIAL_MESSAGE=""
+AGENT_ARGS=()
 CONTEXT_TEMPLATE="${IWORK_CONTEXT_TEMPLATE:-$HOME/.config/iwork/task-context.md.tmpl}"
 
 require_config() {
@@ -60,7 +64,8 @@ Usage: iwork [flags] <branch-name> [--from <task|branch>] -r <repo1> [repo2 ...]
        iwork install-hooks [settings-path]
        iwork --completion <bash|zsh>
 
-       flags: [--no-tmux] [--no-context] [--detach] [--big]
+       flags: [--no-tmux] [--no-context] [--detach|-d] [--big]
+              [--message|-m <message>]
 
 Create a task folder in the tasks directory and set up git worktrees for
 the specified repos, all on the given branch. Each worktree lives in a
@@ -96,6 +101,15 @@ window (claude starts in the left pane, a shell in the right);
 claude/codex/cd switch to it if it exists. Claude Code hooks (see
 install-hooks) mark the window name with the agent state:
 *task = busy, !task = waiting for you.
+
+-m <message> hands the agent the message as its first prompt, so a new task
+starts working the moment it comes up instead of waiting for you to type it.
+It applies wherever iwork starts an agent itself: creation, park, and
+claude/codex on a task whose window is not already open. Pair it with --detach
+to kick a task off and carry on with what you were doing. -m never types into
+an agent that is already running, since that pane may have been left at a
+shell; when there is nothing to start, iwork says the message was not
+delivered rather than dropping it silently.
 
 With --detach the window is still created and the agent still starts in it,
 but your client stays where it is — nothing switches session or window. It
@@ -162,20 +176,23 @@ Examples:
   iwork claude feat-bla
   iwork --detach feat/bla -r backend-api frontend
   iwork --detach claude feat-bla
+  iwork fix/login-bug -r auth-service -m 'Sentry AUTH-42: why does login 500?'
+  iwork fix/login-bug -r auth-service -m 'Look at Sentry AUTH-42' -d
   iwork --big feat/huge-thing -r backend-api frontend shared-lib admin
   iwork --big --detach feat/huge-thing -r backend-api frontend
   iwork --no-tmux claude feat-bla
   iwork install-hooks
 
-Options:
-  --no-tmux     Skip all tmux window handling (leading flag)
-  --no-context  Skip writing CLAUDE.md/AGENTS.md task context (leading flag)
-  --detach      Create the task window and start the agent without switching
-                to it (leading flag)
+Options (all accepted before the branch name or after the repo list):
+  --no-tmux     Skip all tmux window handling
+  --no-context  Skip writing CLAUDE.md/AGENTS.md task context
+  --detach, -d  Create the task window and start the agent without switching
+                to it
   --big         Give the task its own tmux session, with a window per repo
-                (editor + shell) alongside the agent window (leading flag)
+                (editor + shell) alongside the agent window
   --from        Start the new branches from this task or branch instead of
-                origin/main; accepted before or after the branch name
+                origin/main
+  --message, -m The agent's first prompt, so it starts work on its own
   -r            Repos to create worktrees for (required, at least one)
   -f            rm only: remove worktrees with uncommitted changes or
                 orphaned directories, and skip the confirmation prompt
@@ -195,6 +212,23 @@ die() {
 
 warn() {
   echo "Warning: $*" >&2
+}
+
+# The prompt goes last, behind '--'. claude and codex both take it positionally,
+# and the separator is load-bearing twice over: it stops a message that starts
+# with a dash from being read as an option, and it ends a variadic option like
+# claude's --add-dir, which otherwise swallows a trailing prompt as one more
+# directory. AGENT_ARGS is empty when no message was given.
+agent_message_args() {
+  AGENT_ARGS=()
+  [[ -z "$INITIAL_MESSAGE" ]] || AGENT_ARGS=(-- "$INITIAL_MESSAGE")
+}
+
+# -m only reaches an agent that this invocation starts itself. Everywhere else
+# say so rather than dropping the prompt on the floor.
+warn_message_undelivered() {
+  [[ -n "$INITIAL_MESSAGE" ]] || return 0
+  warn "-m was not delivered: $1"
 }
 
 is_git_repo() {
@@ -504,7 +538,8 @@ park_current_repo() {
   echo "  $wt_path"
 
   write_task_context "$folder_name" "$branch"
-  open_task "$folder_name" claude
+  agent_message_args
+  open_task "$folder_name" claude ${AGENT_ARGS[@]+"${AGENT_ARGS[@]}"}
 }
 
 detect_branch_from_worktree_folder() {
@@ -837,6 +872,70 @@ parse_repos_flag() {
   fi
 }
 
+# Consumes one flag from the front of "$@" and reports how many arguments it
+# took in FLAG_SHIFT, or 0 when $1 is not a flag of ours. Shared by the leading
+# flag loop and parse_task_args so both accept exactly the same spellings.
+take_task_flag() {
+  FLAG_SHIFT=0
+
+  case "${1:-}" in
+    --no-tmux) IWORK_NO_TMUX=1; FLAG_SHIFT=1 ;;
+    --no-context) IWORK_NO_CONTEXT=1; FLAG_SHIFT=1 ;;
+    -d|--detach) IWORK_DETACH=1; FLAG_SHIFT=1 ;;
+    --big) IWORK_BIG=1; FLAG_SHIFT=1 ;;
+    --from)
+      [[ $# -gt 1 ]] || die "--from needs a task or branch name"
+      BASE_SPEC="$2"
+      validate_base_spec "$BASE_SPEC"
+      FLAG_SHIFT=2
+      ;;
+    -m|--message)
+      [[ $# -gt 1 ]] || die "-m needs a message"
+      INITIAL_MESSAGE="$2"
+      validate_initial_message "$INITIAL_MESSAGE"
+      FLAG_SHIFT=2
+      ;;
+  esac
+}
+
+# Flags and '-r <repos>' in any order, so a message or --detach reads naturally
+# at the end of the line. Repo names never start with '-', so the first flag
+# after -r ends the repo list.
+parse_task_args() {
+  local missing_flag_message="$1"
+  shift
+
+  repos=()
+
+  while [[ $# -gt 0 ]]; do
+    take_task_flag "$@"
+    if (( FLAG_SHIFT > 0 )); then
+      shift "$FLAG_SHIFT"
+      continue
+    fi
+
+    case "$1" in
+      -h|--help)
+        usage 0
+        ;;
+      -r)
+        [[ ${#repos[@]} -eq 0 ]] || die "-r was given more than once"
+        shift
+        while [[ $# -gt 0 && "$1" != -* ]]; do
+          repos+=("$1")
+          shift
+        done
+        [[ ${#repos[@]} -gt 0 ]] || die "specify at least one repo after -r"
+        ;;
+      *)
+        die "unexpected argument '$1'"
+        ;;
+    esac
+  done
+
+  [[ ${#repos[@]} -gt 0 ]] || die "$missing_flag_message"
+}
+
 create_worktrees() {
   local branch="$1"
   local folder_name="$2"
@@ -946,11 +1045,25 @@ iwork() {
   local target=""
   local arg=""
   local notmux=""
+  local msg=""
+  local lead=()
 
-  if [[ "${1:-}" == "--no-tmux" ]]; then
-    notmux=1
-    shift
-  fi
+  # Flags can precede the subcommand, so skip them to find it -- otherwise
+  # 'iwork -m msg park x' misses the park branch and its cd. -m and --from
+  # take a value; the guard keeps 'iwork -m' from looping forever.
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --no-tmux) notmux=1; lead+=("$1"); shift ;;
+      --no-context|--detach|-d|--big) lead+=("$1"); shift ;;
+      -m|--message)
+        [[ $# -ge 2 ]] || break
+        msg="$2"; lead+=("$1" "$2"); shift 2 ;;
+      --from)
+        [[ $# -ge 2 ]] || break
+        lead+=("$1" "$2"); shift 2 ;;
+      *) break ;;
+    esac
+  done
 
   cmd="${1:-}"
 
@@ -973,7 +1086,7 @@ iwork() {
         esac
       done
 
-      command "$_iwork_bin" ${notmux:+--no-tmux} rm "$@" || return $?
+      command "$_iwork_bin" ${lead[@]+"${lead[@]}"} rm "$@" || return $?
 
       # The folder we were standing in may be gone now.
       if [[ -n "$target" && ! -d "$target" && "$PWD" == "$target"* ]]; then
@@ -988,7 +1101,7 @@ iwork() {
 
       folder="$2"
       target="$(command "$_iwork_bin" --resolve-park-target-path "$folder")" || return $?
-      command "$_iwork_bin" ${notmux:+--no-tmux} park "$folder" || return $?
+      command "$_iwork_bin" ${lead[@]+"${lead[@]}"} park "$folder" || return $?
       if [[ -z "${TMUX:-}" || -n "$notmux" ]]; then
         builtin cd "$target" || return $?
       fi
@@ -1016,40 +1129,55 @@ iwork() {
       folder="$2"
       shift 2
       if [[ -n "${TMUX:-}" && -z "$notmux" ]]; then
-        command "$_iwork_bin" "$cmd" "$folder" "$@"
+        command "$_iwork_bin" ${lead[@]+"${lead[@]}"} "$cmd" "$folder" "$@"
         return $?
       fi
       target="$(command "$_iwork_bin" --resolve-worktree-folder "$folder")" || return $?
       builtin cd "$target" || return $?
-      "$cmd" "$@"
+      if [[ -n "$msg" ]]; then
+        "$cmd" "$@" -- "$msg"
+      else
+        "$cmd" "$@"
+      fi
       ;;
     *)
-      command "$_iwork_bin" ${notmux:+--no-tmux} "$@"
+      command "$_iwork_bin" ${lead[@]+"${lead[@]}"} "$@"
       ;;
   esac
 }
 
 _iwork() {
-  local cur prev seen_r i repos folders folder cmd
+  local cur prev seen_r i repos folders folder cmd cmd_i
   COMPREPLY=()
   cur="${COMP_WORDS[COMP_CWORD]}"
   prev=""
-  cmd="${COMP_WORDS[1]:-}"
 
   if (( COMP_CWORD > 0 )); then
     prev="${COMP_WORDS[COMP_CWORD-1]}"
   fi
 
+  # Flags may precede the subcommand, so find the first word that is not one
+  # (or a flag's value) rather than assuming index 1.
+  cmd=""
+  cmd_i=0
+  for ((i = 1; i < COMP_CWORD; i++)); do
+    case "${COMP_WORDS[i]}" in
+      -m|--message|--from) (( i++ )) ;;
+      -*) ;;
+      *) cmd="${COMP_WORDS[i]}"; cmd_i=$i; break ;;
+    esac
+  done
+
   case "$cmd" in
     cd|claude|codex)
-      if (( COMP_CWORD == 2 )); then
+      if (( COMP_CWORD == cmd_i + 1 )); then
         folders="$("$_iwork_bin" --complete-worktree-folders "$cur" 2>/dev/null)" || return 0
         COMPREPLY=( $(compgen -W "$folders" -- "$cur") )
       fi
       return 0
       ;;
     add-repo|rm)
-      if (( COMP_CWORD == 2 )); then
+      if (( COMP_CWORD == cmd_i + 1 )); then
         folders="$("$_iwork_bin" --complete-worktree-folders "$cur" 2>/dev/null)" || return 0
         COMPREPLY=( $(compgen -W "$folders" -- "$cur") )
         return 0
@@ -1069,6 +1197,11 @@ _iwork() {
       ;;
   esac
 
+  # A message is free text, so offering repo or task names there is only noise.
+  if [[ "$prev" == "-m" || "$prev" == "--message" ]]; then
+    return 0
+  fi
+
   # --from takes an existing task (or a branch, which we cannot complete)
   if [[ "$prev" == "--from" ]]; then
     folders="$("$_iwork_bin" --complete-worktree-folders "$cur" 2>/dev/null)" || return 0
@@ -1085,10 +1218,15 @@ _iwork() {
   done
 
   if [[ "$prev" == "-r" || -n "$seen_r" ]]; then
+    if [[ "$cur" == -* && "$cmd" != "rm" ]]; then
+      COMPREPLY=( $(compgen -W "--message -m --detach -d --big --from --no-tmux --no-context" -- "$cur") )
+      return 0
+    fi
+
     # For rm, only the repos that actually have a worktree in the task.
     if [[ "$cmd" == "rm" ]]; then
       folder=""
-      for ((i = 2; i < COMP_CWORD; i++)); do
+      for ((i = cmd_i + 1; i < COMP_CWORD; i++)); do
         case "${COMP_WORDS[i]}" in
           -*) ;;
           *) folder="${COMP_WORDS[i]}"; break ;;
@@ -1105,8 +1243,8 @@ _iwork() {
     return 0
   fi
 
-  if (( COMP_CWORD == 1 )); then
-    COMPREPLY=( $(compgen -W "add-repo rm park list cd claude codex init install-hooks --no-tmux --no-context --detach --big --from -h --help --completion" -- "$cur") )
+  if [[ -z "$cmd" ]]; then
+    COMPREPLY=( $(compgen -W "add-repo rm park list cd claude codex init install-hooks --no-tmux --no-context --detach -d --big --from --message -m -h --help --completion" -- "$cur") )
     return 0
   fi
 
@@ -1114,7 +1252,7 @@ _iwork() {
     if [[ "$cmd" == "rm" ]]; then
       COMPREPLY=( $(compgen -W "-r -f" -- "$cur") )
     else
-      COMPREPLY=( $(compgen -W "-r --from -h --help --completion --no-tmux --no-context --detach --big" -- "$cur") )
+      COMPREPLY=( $(compgen -W "-r --from --message -m -h --help --completion --no-tmux --no-context --detach -d --big" -- "$cur") )
     fi
     return 0
   fi
@@ -1141,11 +1279,25 @@ iwork() {
   local target=""
   local arg=""
   local notmux=""
+  local msg=""
+  local lead=()
 
-  if [[ "${1:-}" == "--no-tmux" ]]; then
-    notmux=1
-    shift
-  fi
+  # Flags can precede the subcommand, so skip them to find it -- otherwise
+  # 'iwork -m msg park x' misses the park branch and its cd. -m and --from
+  # take a value; the guard keeps 'iwork -m' from looping forever.
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --no-tmux) notmux=1; lead+=("$1"); shift ;;
+      --no-context|--detach|-d|--big) lead+=("$1"); shift ;;
+      -m|--message)
+        [[ $# -ge 2 ]] || break
+        msg="$2"; lead+=("$1" "$2"); shift 2 ;;
+      --from)
+        [[ $# -ge 2 ]] || break
+        lead+=("$1" "$2"); shift 2 ;;
+      *) break ;;
+    esac
+  done
 
   cmd="${1:-}"
 
@@ -1168,7 +1320,7 @@ iwork() {
         esac
       done
 
-      command "$_iwork_bin" ${notmux:+--no-tmux} rm "$@" || return $?
+      command "$_iwork_bin" ${lead[@]+"${lead[@]}"} rm "$@" || return $?
 
       # The folder we were standing in may be gone now.
       if [[ -n "$target" && ! -d "$target" && "$PWD" == "$target"* ]]; then
@@ -1183,7 +1335,7 @@ iwork() {
 
       folder="$2"
       target="$(command "$_iwork_bin" --resolve-park-target-path "$folder")" || return $?
-      command "$_iwork_bin" ${notmux:+--no-tmux} park "$folder" || return $?
+      command "$_iwork_bin" ${lead[@]+"${lead[@]}"} park "$folder" || return $?
       if [[ -z "${TMUX:-}" || -n "$notmux" ]]; then
         builtin cd "$target" || return $?
       fi
@@ -1211,15 +1363,19 @@ iwork() {
       folder="$2"
       shift 2
       if [[ -n "${TMUX:-}" && -z "$notmux" ]]; then
-        command "$_iwork_bin" "$cmd" "$folder" "$@"
+        command "$_iwork_bin" ${lead[@]+"${lead[@]}"} "$cmd" "$folder" "$@"
         return $?
       fi
       target="$(command "$_iwork_bin" --resolve-worktree-folder "$folder")" || return $?
       builtin cd "$target" || return $?
-      "$cmd" "$@"
+      if [[ -n "$msg" ]]; then
+        "$cmd" "$@" -- "$msg"
+      else
+        "$cmd" "$@"
+      fi
       ;;
     *)
-      command "$_iwork_bin" ${notmux:+--no-tmux} "$@"
+      command "$_iwork_bin" ${lead[@]+"${lead[@]}"} "$@"
       ;;
   esac
 }
@@ -1228,10 +1384,20 @@ iwork() {
 
 _iwork() {
   local -a repos folders
-  local cmd="${words[2]:-}"
-  local folder="" word=""
+  local cmd="" folder="" word=""
+  local cmd_i=0 i=0
 
-  if (( CURRENT == 2 )); then
+  # Flags may precede the subcommand, so find the first word that is not one
+  # (or a flag's value) rather than assuming index 2.
+  for (( i = 2; i < CURRENT; i++ )); do
+    case "${words[i]}" in
+      -m|--message|--from) (( i++ )) ;;
+      -*) ;;
+      *) cmd="${words[i]}"; cmd_i=$i; break ;;
+    esac
+  done
+
+  if [[ -z "$cmd" ]]; then
     _values 'command' \
       'add-repo[add repos to an existing worktree folder]' \
       'rm[remove worktrees from a task, or the whole task]' \
@@ -1245,22 +1411,25 @@ _iwork() {
       '--no-tmux[skip tmux window handling]' \
       '--no-context[skip writing task context files]' \
       '--detach[create the task window without switching to it]' \
+      '-d[create the task window without switching to it]' \
       '--big[give the task its own tmux session with a window per repo]' \
       '--from[start the new branches from this task or branch]' \
+      '--message[first prompt for the agent, so it starts work on its own]' \
+      '-m[first prompt for the agent, so it starts work on its own]' \
       '--completion[print shell integration]'
     return 0
   fi
 
   case "$cmd" in
     cd|claude|codex)
-      if (( CURRENT == 3 )); then
+      if (( CURRENT == cmd_i + 1 )); then
         folders=("${(@f)$("$_iwork_bin" --complete-worktree-folders "$PREFIX" 2>/dev/null)}")
         _describe -t folders 'worktree folder' folders
       fi
       return 0
       ;;
     add-repo|rm)
-      if (( CURRENT == 3 )); then
+      if (( CURRENT == cmd_i + 1 )); then
         folders=("${(@f)$("$_iwork_bin" --complete-worktree-folders "$PREFIX" 2>/dev/null)}")
         _describe -t folders 'worktree folder' folders
         return 0
@@ -1280,6 +1449,10 @@ _iwork() {
       ;;
   esac
 
+  if [[ "${words[CURRENT-1]}" == "-m" || "${words[CURRENT-1]}" == "--message" ]]; then
+    return 0
+  fi
+
   if [[ "${words[CURRENT-1]}" == "--from" ]]; then
     folders=("${(@f)$("$_iwork_bin" --complete-worktree-folders "$PREFIX" 2>/dev/null)}")
     _describe -t folders 'task to build on' folders
@@ -1287,7 +1460,7 @@ _iwork() {
   fi
 
   if [[ "$cmd" == "rm" ]]; then
-    for word in "${words[@]:2}"; do
+    for word in "${words[@]:$cmd_i}"; do
       case "$word" in
         -*) ;;
         *) folder="$word"; break ;;
@@ -1307,12 +1480,24 @@ _iwork() {
     return 0
   fi
 
-  if (( CURRENT == 3 )); then
+  if (( CURRENT == cmd_i + 1 )); then
     _values 'option' '-r[repos to create worktrees for]'
     return 0
   fi
 
   if (( ${words[(I)-r]} <= CURRENT )); then
+    if [[ "$PREFIX" == -* ]]; then
+      _values 'option' \
+        '--message[first prompt for the agent, so it starts work on its own]' \
+        '-m[first prompt for the agent, so it starts work on its own]' \
+        '--detach[create the task window without switching to it]' \
+        '-d[create the task window without switching to it]' \
+        '--big[give the task its own tmux session with a window per repo]' \
+        '--from[start the new branches from this task or branch]' \
+        '--no-tmux[skip tmux window handling]' \
+        '--no-context[skip writing task context files]'
+      return 0
+    fi
     repos=("${(@f)$("$_iwork_bin" --complete-repos "$PREFIX" 2>/dev/null)}")
     _describe -t repos 'repo' repos
   fi
@@ -1349,6 +1534,22 @@ resolve_base_ref() {
   done
 
   return 1
+}
+
+# A prompt is ordinary prose, so it may well start with a dash ("--no-verify is
+# being ignored, find out why"). Only an exact iwork flag means the value was
+# forgotten, as in 'iwork feat/x -r api -m -d'.
+validate_initial_message() {
+  local message="$1"
+
+  case "$message" in
+    "")
+      die "-m needs a message"
+      ;;
+    -r|-d|-m|-h|--message|--detach|--big|--from|--help|--no-tmux|--no-context)
+      die "-m needs a message, got the flag '$message'"
+      ;;
+  esac
 }
 
 validate_base_spec() {
@@ -1661,6 +1862,9 @@ open_task_window() {
   [[ -d "$folder_path" ]] || return 0
 
   if window_id="$(find_task_window "$folder")"; then
+    # Nothing is started here, and the pane may be a shell rather than a live
+    # agent, so typing the prompt into it is not safe.
+    warn_message_undelivered "an agent is already open in tmux window '$folder'"
     if [[ -n "$IWORK_DETACH" ]]; then
       echo "tmux window '$folder' is already open (not switching)"
       return 0
@@ -1756,6 +1960,7 @@ open_task_session() {
     if shared_line="$(find_window_in_session "$TASKS_SESSION" "$folder")"; then
       warn "task '$folder' is already open in session '$TASKS_SESSION'; not starting a second agent there"
       warn "close that window first if you want '$folder' to have its own session"
+      warn_message_undelivered "no agent was started for '$folder'"
       if [[ -z "$IWORK_DETACH" ]] && in_tmux; then
         switch_to_window "${shared_line%% *}" || true
       fi
@@ -1780,6 +1985,7 @@ open_task_session() {
   added="$(add_repo_windows "$folder" "$session")"
 
   if [[ -z "$created" ]]; then
+    warn_message_undelivered "an agent is already open in tmux session '$session'"
     echo "tmux session '$session' already exists (added $added repo window(s))"
   else
     echo "tmux session '$session': '$folder' running $tool, plus $added repo window(s)"
@@ -1802,6 +2008,8 @@ open_task_session() {
 }
 
 open_task() {
+  tmux_enabled || warn_message_undelivered "no agent is started without tmux"
+
   if [[ -n "$IWORK_BIG" ]]; then
     open_task_session "$@"
   else
@@ -1984,24 +2192,21 @@ if [[ $# -eq 0 ]]; then
   usage 0
 fi
 
-while [[ "${1:-}" == "--no-tmux" || "${1:-}" == "--no-context" || "${1:-}" == "--detach" || "${1:-}" == "--big" || "${1:-}" == "--from" ]]; do
-  case "$1" in
-    --no-tmux) IWORK_NO_TMUX=1 ;;
-    --no-context) IWORK_NO_CONTEXT=1 ;;
-    --detach) IWORK_DETACH=1 ;;
-    --big) IWORK_BIG=1 ;;
-    --from)
-      shift
-      [[ $# -gt 0 ]] || die "--from needs a task or branch name"
-      BASE_SPEC="$1"
-      validate_base_spec "$BASE_SPEC"
-      ;;
-  esac
-  shift
-  if [[ $# -eq 0 ]]; then
-    usage 1
-  fi
+while [[ $# -gt 0 ]]; do
+  take_task_flag "$@"
+  (( FLAG_SHIFT > 0 )) || break
+  shift "$FLAG_SHIFT"
 done
+
+if [[ $# -eq 0 ]]; then
+  usage 1
+fi
+
+case "${1:-}" in
+  rm|list|cd|init|install-hooks)
+    warn_message_undelivered "'$1' does not start an agent"
+    ;;
+esac
 
 case "${1:-}" in
   -h|--help)
@@ -2145,15 +2350,9 @@ if [[ "${1:-}" == "add-repo" ]]; then
   validate_worktree_folder_name "$folder_name"
   shift 2
 
-  if [[ "${1:-}" == "--from" ]]; then
-    shift
-    [[ $# -gt 0 ]] || die "--from needs a task or branch name"
-    BASE_SPEC="$1"
-    validate_base_spec "$BASE_SPEC"
-    shift
-  fi
+  parse_task_args "expected -r <repos> after folder name" "$@"
 
-  parse_repos_flag "expected -r <repos> after folder name" "$@"
+  warn_message_undelivered "add-repo does not start an agent"
 
   branch="$(detect_branch_from_worktree_folder "$folder_name")"
 
@@ -2175,7 +2374,8 @@ if [[ "${1:-}" == "claude" && "${2:-}" != "-r" ]]; then
     die "usage: iwork claude <task> [claude-args...]"
   fi
 
-  run_tool_in_worktree claude "$2" "${@:3}"
+  agent_message_args
+  run_tool_in_worktree claude "$2" "${@:3}" ${AGENT_ARGS[@]+"${AGENT_ARGS[@]}"}
 fi
 
 if [[ "${1:-}" == "codex" && "${2:-}" != "-r" ]]; then
@@ -2183,7 +2383,8 @@ if [[ "${1:-}" == "codex" && "${2:-}" != "-r" ]]; then
     die "usage: iwork codex <task> [codex-args...]"
   fi
 
-  run_tool_in_worktree codex "$2" "${@:3}"
+  agent_message_args
+  run_tool_in_worktree codex "$2" "${@:3}" ${AGENT_ARGS[@]+"${AGENT_ARGS[@]}"}
 fi
 
 branch="$1"
@@ -2192,20 +2393,12 @@ shift
 require_config
 validate_branch "$branch"
 
-# --from also reads naturally after the branch name: iwork feat/y --from feat-x
-if [[ "${1:-}" == "--from" ]]; then
-  shift
-  [[ $# -gt 0 ]] || die "--from needs a task or branch name"
-  BASE_SPEC="$1"
-  validate_base_spec "$BASE_SPEC"
-  shift
-fi
-
-parse_repos_flag "expected -r <repos> after branch name" "$@"
+parse_task_args "expected -r <repos> after branch name" "$@"
 
 # Folder name: replace / with -
 folder_name="${branch//\//-}"
 
 create_worktrees "$branch" "$folder_name" "${repos[@]}"
 write_task_context "$folder_name" "$branch"
-open_task "$folder_name" claude
+agent_message_args
+open_task "$folder_name" claude ${AGENT_ARGS[@]+"${AGENT_ARGS[@]}"}

@@ -145,6 +145,9 @@ With `--big` in play, `prefix + s` lists the `tasks-` sessions together.
 # Create a task: worktrees for two repos on a new branch, in one folder
 iwork feat/login-bug -r backend-api frontend
 
+# Create a task and give the agent its first prompt, so it starts without you
+iwork fix/login-500 -r backend-api -m 'Look at Sentry AUTH-42 and say what breaks'
+
 # Add another repo to that task later
 iwork add-repo feat-login-bug -r shared-lib
 
@@ -249,6 +252,50 @@ Two things to know:
   branched from {{BASE}}:`` — and the appended section is skipped. Tasks without
   `--from` get no `## Base` section at all.
 
+## Starting the agent with a prompt
+
+`-m` (`--message`) hands the agent its first prompt, so the task is already
+working by the time you look at it — no waiting for the worktrees, the tmux
+window and the context files before you can type:
+
+```bash
+iwork fix/login-500 -r auth-service -m 'Look at Sentry AUTH-42 and assess what is going wrong'
+```
+
+The message is passed to `claude` (or `codex`) as its initial prompt, so the
+agent reads the generated `CLAUDE.md` and goes straight to work. It applies
+wherever iwork starts an agent itself — creation, `park`, and `claude`/`codex`
+on a task whose window is not already open:
+
+```bash
+iwork -m 'write up what changed here' park task-billing-followup
+iwork -m 'continue the refactor' claude feat-login-bug   # if the window is closed
+```
+
+`-m` never types into an agent that is already running: that pane may have been
+left at a shell, where free text would run as a command. When there is nothing
+to start — the window or session is already open, `--no-tmux` is in play, or the
+subcommand starts no agent at all — iwork says the message was not delivered
+rather than dropping it silently:
+
+```
+Warning: -m was not delivered: an agent is already open in tmux window 'feat-login-bug'
+```
+
+Pair it with `--detach` (or its short form `-d`) to fire a task off and carry on
+with what you were doing:
+
+```bash
+iwork fix/login-500 -r auth-service -m 'Look at Sentry AUTH-42' -d
+```
+
+Flags read in any position on a create or `add-repo` line — before the branch
+name, or after the repo list — so the message can go wherever it reads best:
+
+```bash
+iwork -d -m 'triage this' fix/login-500 -r auth-service   # same thing
+```
+
 ## Detached mode
 
 `--detach` spins a task up without dragging you to it. The window is still
@@ -258,6 +305,7 @@ created and the agent still starts in it — your client just stays where it is:
 iwork --detach feat/login-bug -r backend-api frontend   # create, stay put
 iwork --detach claude feat-login-bug                    # start an agent, stay put
 iwork --detach park task-billing-followup               # park, stay put
+iwork -d feat/login-bug -r backend-api                  # -d is the short form
 ```
 
 Useful when you want an agent chewing on something while you keep working, and
