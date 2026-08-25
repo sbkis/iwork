@@ -439,15 +439,19 @@ iwork project rm                     # detaches it again; project read from the 
 `iwork rm` is deliberately excluded: it destroys worktrees, so it wants
 `--current` spelled out rather than treating a bare `iwork rm` as "this one".
 
-Two caveats when retrofitting:
+One caveat when retrofitting: `project add` reads the branch from one of the
+task's worktrees, so a task folder with no worktree in it is rejected.
 
-- `project add` reads the branch from one of the task's worktrees, so a task
-  folder with no worktree in it is rejected.
-- A `~/.config/iwork/task-context.md.tmpl` created before this change has no
-  `<!-- iwork:repos -->` markers and is never overwritten, so `add-repo` cannot
-  refresh the repo list in tasks built from it. It warns rather than leaving the
-  list silently wrong; wrap the template's `{{REPOS}}` line in those markers to
-  fix it for new tasks.
+A `~/.config/iwork/task-context.md.tmpl` created before the marker blocks
+existed has no `<!-- iwork:repos -->` markers, and the template is never
+overwritten — so `add-repo` had no block to refresh and the repo list in tasks
+built from it stayed wrong forever. The next task creation now adds the markers
+around the template's `{{REPOS}}` line and says that it did. The markers are
+structural rather than content, so this is a repair rather than an opinion:
+every line you wrote stays where it was, and a template that already has them
+is left alone. A `{{REPOS}}` that is inlined in a sentence, or appears more than
+once, is not a shape worth guessing at — those are left to you, and `add-repo`
+still warns at the point it matters.
 
 `iwork project cat` reads files inside the project only — a symlink pointing out
 of it is refused. `project grep` forwards its extra arguments to ripgrep,

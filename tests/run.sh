@@ -2140,6 +2140,90 @@ test_message_undelivered_on_project_subcommands() {
   done
 }
 
+# The pre-marker template, as anyone who used iwork before the marker blocks
+# existed still has on disk.
+write_old_template() {
+  cat > "$SB_HOME/.config/iwork/task-context.md.tmpl" <<'TMPL'
+# Task: {{TASK}}
+
+My own note, which must survive.
+
+{{REPOS}}
+
+## Scope
+
+- Stay within this task directory.
+TMPL
+}
+
+test_old_context_template_gains_the_repos_markers() {
+  mk_repo backend
+  mk_repo frontend
+  write_old_template
+
+  local tmpl="$SB_HOME/.config/iwork/task-context.md.tmpl"
+  local out
+  out="$(iw feat/one -r backend 2>&1)"
+
+  assert_grep "the template gained the markers" "<!-- iwork:repos -->" "$tmpl"
+  assert_grep "and the closing one" "<!-- /iwork:repos -->" "$tmpl"
+  assert_grep "the placeholder is still there" "{{REPOS}}" "$tmpl"
+  assert_grep "and the owner's own line is untouched" "My own note, which must survive." "$tmpl"
+  assert_contains "the repair is announced, not silent" "added <!-- iwork:repos --> markers" "$out"
+
+  # The point of the repair: add-repo can now correct the list it writes.
+  assert_grep "the task got a marked block" "<!-- iwork:repos -->" "$SB_TASKS/feat-one/CLAUDE.md"
+  iw_in "$SB_TASKS/feat-one" add-repo -r frontend >/dev/null 2>&1
+  assert_grep "and add-repo refreshed it" "frontend" "$SB_TASKS/feat-one/CLAUDE.md"
+}
+
+test_context_template_upgrade_runs_once() {
+  mk_repo backend
+  write_old_template
+  local tmpl="$SB_HOME/.config/iwork/task-context.md.tmpl"
+
+  iw feat/one -r backend >/dev/null 2>&1
+  local first
+  first="$(cat "$tmpl")"
+
+  # A second task must not add a second pair, nor say anything.
+  local out
+  out="$(iw feat/two -r backend 2>&1)"
+  assert_eq "the template is unchanged the second time" "$first" "$(cat "$tmpl")"
+  assert_eq "markers appear exactly once" "1" "$(grep -c '^<!-- iwork:repos -->$' "$tmpl")"
+  case "$out" in
+    *"added <!-- iwork:repos --> markers"*) bad "announced the repair twice" ;;
+    *) ok ;;
+  esac
+}
+
+test_context_template_upgrade_leaves_odd_shapes_alone() {
+  mk_repo backend
+  mk_repo frontend
+  # Inlined, so wrapping the line would make refresh_task_blocks overwrite the
+  # prose around it. Left to its owner instead.
+  cat > "$SB_HOME/.config/iwork/task-context.md.tmpl" <<'TMPL'
+# Task: {{TASK}}
+
+Repos: {{REPOS}}
+TMPL
+  local tmpl="$SB_HOME/.config/iwork/task-context.md.tmpl"
+  local before
+  before="$(cat "$tmpl")"
+
+  local out
+  out="$(iw feat/one -r backend 2>&1)"
+  assert_eq "an inlined placeholder is not rewritten" "$before" "$(cat "$tmpl")"
+  case "$out" in
+    *"added <!-- iwork:repos --> markers"*) bad "claimed a repair it did not make" ;;
+    *) ok ;;
+  esac
+
+  # And the existing warning still fires where it matters.
+  out="$(iw_in "$SB_TASKS/feat-one" add-repo -r frontend 2>&1 || true)"
+  assert_contains "add-repo still says the list is stale" "iwork:repos" "$out"
+}
+
 # --- runner -------------------------------------------------------------------
 
 echo "iwork tests  ($IWORK_SRC)"
