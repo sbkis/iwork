@@ -219,6 +219,8 @@ Projects:
       <project>/TODO.md        captured-not-now, with the task it surfaced in
       <project>/history.tsv    append-only task events (opened, detached,
                                closed)
+      <project>/agents.tsv     append-only session events; 'project agents'
+                               reduces it to who is live right now
       <project>/notes/         anything that outlives one task
 
   Live state is never cached: which tasks exist and what they are doing is read
@@ -1370,11 +1372,11 @@ _iwork() {
     project)
       sub="${COMP_WORDS[2]:-}"
       if (( COMP_CWORD == 2 )); then
-        COMPREPLY=( $(compgen -W "list show grep cat add rm delete" -- "$cur") )
+        COMPREPLY=( $(compgen -W "list show agents grep cat add rm delete" -- "$cur") )
         return 0
       fi
       case "$sub" in
-        show|grep|cat|delete)
+        show|agents|grep|cat|delete)
           if (( COMP_CWORD == 3 )); then
             projects="$("$_bin" --complete-projects "$cur" 2>/dev/null)" || return 0
             COMPREPLY=( $(compgen -W "$projects" -- "$cur") )
@@ -1711,6 +1713,7 @@ _iwork() {
         _values 'subcommand' \
           'list[list projects]' \
           'show[print goal, open todos, recent log and live tasks]' \
+          'agents[list the sessions live in the project and their tasks]' \
           'grep[search the project memory]' \
           'cat[print one file from the project memory]' \
           'add[attach an existing task to a project]' \
@@ -1719,7 +1722,7 @@ _iwork() {
         return 0
       fi
       case "$sub" in
-        show|grep|cat|delete)
+        show|agents|grep|cat|delete)
           if (( CURRENT == 4 )); then
             projects=("${(@f)$("$_bin" --complete-projects "$PREFIX" 2>/dev/null)}")
             _describe -t projects 'project' projects
@@ -2385,6 +2388,11 @@ EOF
       die "could not write $dir/history.tsv"
   fi
 
+  if [[ ! -f "$dir/agents.tsv" ]]; then
+    printf '%s\n' "$AGENTS_HEADER" > "$dir/agents.tsv" ||
+      die "could not write $dir/agents.tsv"
+  fi
+
   if [[ ! -f "$dir/notes/.keep" ]]; then
     : > "$dir/notes/.keep" 2>/dev/null || true
   fi
@@ -2452,6 +2460,31 @@ task_root_from_cwd() {
     [[ -n "$parent" ]] || parent="/"
 
     if [[ -d "$parent" && "$parent" -ef "$TASKS_DIR" ]]; then
+      printf '%s\n' "${dir##*/}"
+      return 0
+    fi
+
+    dir="$parent"
+  done
+
+  return 1
+}
+
+# The same walk for the projects directory, so the read verbs work from inside
+# the project itself — which is where a session coordinating the other tasks
+# runs, and the one place 'project agents' was unusable without naming its own
+# project on the command line.
+project_root_from_cwd() {
+  local dir="$PWD"
+  local parent=""
+
+  [[ -n "$PROJECTS_DIR" && -d "$PROJECTS_DIR" ]] || return 1
+
+  while [[ -n "$dir" && "$dir" != "/" ]]; do
+    parent="${dir%/*}"
+    [[ -n "$parent" ]] || parent="/"
+
+    if [[ -d "$parent" && "$parent" -ef "$PROJECTS_DIR" ]]; then
       printf '%s\n' "${dir##*/}"
       return 0
     fi
@@ -2536,6 +2569,12 @@ resolve_project_context() {
       RESOLVED_PROJECT="$(task_project_name "$RESOLVED_TASK" || true)"
     fi
 
+    # Standing in the project directory itself counts as naming it.
+    if [[ -z "$RESOLVED_PROJECT" ]]; then
+      RESOLVED_PROJECT="$(project_root_from_cwd || true)"
+      [[ -n "$RESOLVED_PROJECT" ]] && validate_project_name "$RESOLVED_PROJECT"
+    fi
+
     if [[ -z "$RESOLVED_PROJECT" && -n "${IWORK_PROJECT:-}" ]]; then
       validate_project_name "$IWORK_PROJECT"
       RESOLVED_PROJECT="$IWORK_PROJECT"
@@ -2547,7 +2586,7 @@ resolve_project_context() {
   Attach it:  iwork project add <project> $RESOLVED_TASK
   Or target one explicitly with -p <project>"
       fi
-      die "not inside an iwork task; pass -p <project> or set IWORK_PROJECT"
+      die "not inside an iwork task or project directory; pass -p <project> or set IWORK_PROJECT"
     fi
   fi
 
@@ -2814,7 +2853,7 @@ delete_project() {
   fi
 
   echo "This deletes $PROJECTS_DIR/$project and everything in it:"
-  echo "  PROJECT.md, LOG.md, TODO.md, history.tsv, notes/"
+  echo "  PROJECT.md, LOG.md, TODO.md, history.tsv, agents.tsv, notes/"
   confirm "Proceed?" || die "aborted"
 
   rm -rf "${PROJECTS_DIR:?}/${project:?}" || die "could not remove $PROJECTS_DIR/$project"
@@ -2968,6 +3007,42 @@ append_history() {
     >> "$PROJECTS_DIR/$project/history.tsv" || warn "could not append to history.tsv"
 }
 
+AGENTS_HEADER=$'# timestamp\tevent\ttask\tsession\tpid\tpane\ttranscript'
+
+# Set from the hook payload, because the transcript path is the one field the
+# environment does not carry.
+HOOK_TRANSCRIPT=""
+
+# Records this session joining or leaving a project. One printf under O_APPEND,
+# for the same reason capture is: several sessions in one project come up at
+# once, and a session must never wait on a lock to start.
+#
+# The header is written here as well, so a project created before agents.tsv
+# existed grows one on first registration instead of needing a migration.
+append_agent() {
+  local project="$1"
+  local event="$2"
+  local task="$3"
+  local file="$PROJECTS_DIR/$project/agents.tsv"
+
+  # No session id means this is not a Claude session — a bare shell running
+  # 'iwork --hook', or a harness that stopped exporting it. Nothing to register.
+  [[ -n "${CLAUDE_CODE_SESSION_ID:-}" ]] || return 1
+
+  # Appended, not written: two sessions registering at once must not be able to
+  # truncate a row the other just added. A duplicate header is skipped on read.
+  if [[ ! -f "$file" ]]; then
+    printf '%s\n' "$AGENTS_HEADER" >> "$file" 2>/dev/null ||
+      { warn "could not create agents.tsv"; return 1; }
+  fi
+
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+    "$(date +%Y-%m-%dT%H:%M:%S%z)" "$event" "$(oneline "$task")" \
+    "$(oneline "$CLAUDE_CODE_SESSION_ID")" "$(oneline "${CLAUDE_PID:-}")" \
+    "$(oneline "${TMUX_PANE:-}")" "$(oneline "$HOOK_TRANSCRIPT")" \
+    >> "$file" || { warn "could not append to agents.tsv"; return 1; }
+}
+
 flip_todo() {
   local project="$1"
   local id="$2"
@@ -3089,12 +3164,131 @@ project_history_tasks() {
   ' "$dir/history.tsv" 2>/dev/null
 }
 
+# Seconds since $1 was last written. GNU first: BSD stat rejects -c outright,
+# whereas GNU's -f means *filesystem* status and would answer '?' rather than
+# fail, so the other order silently loses this on Linux.
+file_age_seconds() {
+  local mtime=""
+  local age=0
+
+  mtime="$(stat -c %Y "$1" 2>/dev/null || stat -f %m "$1" 2>/dev/null || true)"
+  [[ "$mtime" =~ ^[0-9]+$ ]] || return 1
+
+  age=$(( $(date +%s) - mtime ))
+  (( age < 0 )) && age=0
+  printf '%s\n' "$age"
+}
+
+# Coarse on purpose: this is only ever printed, never compared.
+human_age() {
+  local s="$1"
+
+  if (( s < 90 )); then
+    printf '%ds\n' "$s"
+  elif (( s < 5400 )); then
+    printf '%dm\n' "$(( s / 60 ))"
+  elif (( s < 172800 )); then
+    printf '%dh\n' "$(( s / 3600 ))"
+  else
+    printf '%dd\n' "$(( s / 86400 ))"
+  fi
+}
+
+# The live agents of a project: the last row per session, minus the ones that
+# said they were leaving, minus the ones that died without saying so.
+#
+# Liveness is derived on every call rather than stored, for the same reason
+# project_show derives its task list — a registry that remembers who *was*
+# running starts lying the moment a pane is closed. 'kill -0' is the same tell
+# project_lock uses for a dead lock holder.
+#
+# Emits: task \t session \t pid \t pane \t transcript
+project_agents() {
+  local project="$1"
+  local file="$PROJECTS_DIR/$project/agents.tsv"
+  local task="" session="" pid="" pane="" transcript=""
+
+  [[ -f "$file" ]] || return 0
+
+  while IFS=$'\t' read -r task session pid pane transcript; do
+    [[ -n "$session" ]] || continue
+
+    # A pid that cannot be signalled is a session that is gone. An empty pid is
+    # a row written before one was recorded, so trust its 'ended' event alone.
+    #
+    # Pids are reused, so this can in principle keep a dead session listed once
+    # something else inherits its number. That is why the pane is recorded too:
+    # it is what the caller matches against the live session list, which is
+    # authoritative in a way a file on disk cannot be.
+    if [[ -n "$pid" ]] && ! kill -0 "$pid" 2>/dev/null; then
+      continue
+    fi
+
+    printf '%s\t%s\t%s\t%s\t%s\n' "$task" "$session" "$pid" "$pane" "$transcript"
+  done < <(awk -F'\t' '
+    /^#/ { next }
+    NF >= 4 && $4 != "" {
+      if (!($4 in seen)) { seen[$4] = 1; order[++n] = $4 }
+      event[$4] = $2; task[$4] = $3; pid[$4] = $5; pane[$4] = $6; trans[$4] = $7
+    }
+    END {
+      for (i = 1; i <= n; i++) {
+        s = order[i]
+        if (event[s] == "ended") continue
+        printf "%s\t%s\t%s\t%s\t%s\n", task[s], s, pid[s], pane[s], trans[s]
+      }
+    }
+  ' "$file" 2>/dev/null)
+}
+
+project_agents_show() {
+  local project="$1"
+  local task="" session="" pid="" pane="" transcript=""
+  local found="" age="" last=""
+
+  echo "Agents (live) in project '$project':"
+
+  # Grouped by task, because "who is working on what" is the question this
+  # answers; a task with two agents should name itself once.
+  while IFS=$'\t' read -r task session pid pane transcript; do
+    [[ -n "$session" ]] || continue
+    found=1
+
+    if [[ "$task" != "$last" ]]; then
+      printf '  %s\n' "${task:-unknown}"
+      last="$task"
+    fi
+
+    printf '    session %s' "$session"
+    [[ -n "$pid" ]] && printf '  pid %s' "$pid"
+    [[ -n "$pane" ]] && printf '  tmux pane %s' "$pane"
+    printf '\n'
+
+    if [[ -n "$transcript" ]] && age="$(file_age_seconds "$transcript")"; then
+      printf '    last active %s ago\n' "$(human_age "$age")"
+    fi
+  done < <(project_agents "$project" | sort -t $'\t' -k1,1 -s)
+
+  if [[ -z "$found" ]]; then
+    echo "  (none)"
+    return 0
+  fi
+
+  echo ""
+  echo "  A session is addressed by the name its own harness gives it, not by the"
+  echo "  session id above. Match the tmux pane against your list of live sessions"
+  echo "  to find the name, then message that."
+}
+
 project_show() {
   local project="$1"
   local dir="$PROJECTS_DIR/$project"
   local goal=""
   local line=""
   local status=""
+  local detail=""
+  local agent_tasks=""
+  local agents=0
   local found=""
   local total=0
   local since=0
@@ -3111,13 +3305,21 @@ project_show() {
   echo ""
   echo "Tasks (live):"
   found=""
+  agent_tasks="$(project_agents "$project" | cut -f1 || true)"
   while IFS= read -r line; do
     [[ -n "$line" ]] || continue
     found=1
     status=""
     tmux_enabled && status="$(task_status "$line")"
-    if [[ -n "$status" ]]; then
-      printf '  %s  %s\n' "$line" "$status"
+    agents="$(printf '%s\n' "$agent_tasks" | awk -v t="$line" '$0 == t { n++ } END { print n + 0 }')"
+    detail="$status"
+    if (( agents == 1 )); then
+      detail="${detail:+$detail  }1 agent"
+    elif (( agents > 1 )); then
+      detail="${detail:+$detail  }$agents agents"
+    fi
+    if [[ -n "$detail" ]]; then
+      printf '  %s  %s\n' "$line" "$detail"
     else
       printf '  %s\n' "$line"
     fi
@@ -3452,6 +3654,10 @@ hook_project_context() {
 hook_session_start() {
   hook_project_context || return 0
 
+  # Registered before the brief is printed, so this session appears in the very
+  # list it is about to read rather than one session behind.
+  append_agent "$HOOK_PROJECT" registered "$HOOK_TASK" 2>/dev/null || true
+
   echo "iwork: this task belongs to project '$HOOK_PROJECT'. Its shared memory:"
   echo ""
   project_show "$HOOK_PROJECT" 2>/dev/null || true
@@ -3463,6 +3669,14 @@ hook_session_start() {
   echo "  iwork todo \"<needs doing, but not in this PR>\""
   echo "'iwork project -h' lists every command that is yours. Task management"
   echo "(rm, park, add-repo) is the operator's — do not run it uninvited."
+}
+
+# The counterpart to the registration above. Nothing is printed: a session that
+# is ending has nobody left to read it.
+hook_session_end() {
+  hook_project_context || return 0
+
+  append_agent "$HOOK_PROJECT" ended "$HOOK_TASK" 2>/dev/null || true
 }
 
 # Fires exactly when the reasoning is about to be dropped, which is the one
@@ -3572,9 +3786,19 @@ handle_claude_hook() {
     head -1 || true)"
   [[ -n "$event" ]] || exit 0
 
+  # The one field the environment does not carry. Same sed as the event above,
+  # so the hook still needs no JSON parser.
+  HOOK_TRANSCRIPT="$(printf '%s' "$input" |
+    sed -n 's/.*"transcript_path"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' |
+    head -1 || true)"
+
   case "$event" in
     SessionStart)
       hook_session_start || true
+      exit 0
+      ;;
+    SessionEnd)
+      hook_session_end || true
       exit 0
       ;;
     PreCompact)
@@ -3660,12 +3884,14 @@ settings_path = sys.argv[1]
 cmd = sys.argv[2]
 
 # (event, matcher). The first three keep tmux window names in sync; the rest
-# feed project memory to the agent and record PRs without being asked.
+# feed project memory to the agent, record PRs without being asked, and keep the
+# project's list of live agents current at both ends of a session.
 events = [
     ("UserPromptSubmit", None),
     ("Stop", None),
     ("Notification", None),
     ("SessionStart", None),
+    ("SessionEnd", None),
     ("PreCompact", None),
     ("PostToolUse", "Bash"),
 ]
@@ -3747,8 +3973,9 @@ project_usage() {
   cat <<'EOF'
 iwork project — the memory shared by every task of one longer-horizon effort.
 
-Inside a task the project is inferred from the .project link, so none of these
-need -p. Pass -p <project> to target one from anywhere else.
+Inside a task the project is inferred from the .project link, and inside the
+project directory itself from where you are standing, so none of these need -p.
+Pass -p <project> to target one from anywhere else.
 
 Reading — safe to run at any time:
   iwork project show [-n <count>] [<project>]
@@ -3756,6 +3983,8 @@ Reading — safe to run at any time:
   iwork project grep <pattern>   search the whole project memory (exits 1 when
                                  nothing matches, like grep — not an error)
   iwork project cat <path>       print one file from it, e.g. notes/api.md
+  iwork project agents           the sessions live in this project right now,
+                                 and the task each one is working in
   iwork project list             every project
 
 Recording — one atomic line each; use these instead of editing the files, which
@@ -3820,6 +4049,25 @@ cmd_project() {
       resolve_project_context "$proj"
       [[ -n "$count" ]] && SHOW_LOG_LINES="$count"
       project_show "$RESOLVED_PROJECT"
+      ;;
+    agents)
+      while [[ $# -gt 0 ]]; do
+        case "$1" in
+          -p|--project)
+            [[ $# -ge 2 ]] || die "expected a project name after $1"
+            proj="$2"
+            shift 2
+            ;;
+          -*) die "unknown option '$1'" ;;
+          *)
+            [[ -z "$proj" ]] || die "usage: iwork project agents [<project>]"
+            proj="$1"
+            shift
+            ;;
+        esac
+      done
+      resolve_project_context "$proj"
+      project_agents_show "$RESOLVED_PROJECT"
       ;;
     cat)
       if [[ "${1:-}" == "-p" || "${1:-}" == "--project" ]]; then

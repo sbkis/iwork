@@ -140,6 +140,12 @@ iw() {
     IWORK_PROJECT_TEMPLATE="$SB_HOME/.config/iwork/project-context.md.tmpl"
     IWORK_NO_TMUX="$no_tmux"
     IWORK_ASSUME_YES="${ASSUME_YES-1}"
+    # Always set, never inherited. A suite run from inside a real Claude session
+    # would otherwise register that session into the sandbox's projects, and the
+    # agent tests would assert against whoever happened to be running them.
+    CLAUDE_CODE_SESSION_ID="${WANT_SESSION_ID:-}"
+    CLAUDE_PID="${WANT_CLAUDE_PID:-}"
+    TMUX_PANE="${WANT_PANE:-}"
   )
 
   # Only forwarded when a test sets them, so iwork sees its own defaults
@@ -1399,7 +1405,7 @@ test_install_hooks_registers_every_event() {
   assert_eq "every event registered" "" "$(python3 - "$SB/settings.json" <<'PY'
 import json, sys
 hooks = json.load(open(sys.argv[1])).get("hooks", {})
-want = ["UserPromptSubmit", "Stop", "Notification", "SessionStart", "PreCompact", "PostToolUse"]
+want = ["UserPromptSubmit", "Stop", "Notification", "SessionStart", "SessionEnd", "PreCompact", "PostToolUse"]
 print(",".join(e for e in want if not hooks.get(e)), end="")
 PY
 )"
@@ -1419,7 +1425,7 @@ data = json.load(open(sys.argv[1]))
 print(sum(len(v) for v in data.get("hooks", {}).values()))
 PY
 )"
-  assert_eq "install-hooks is idempotent" "6" "$count"
+  assert_eq "install-hooks is idempotent" "7" "$count"
 }
 
 # --- review findings: durability ----------------------------------------------
@@ -1872,6 +1878,226 @@ test_inference_fails_clearly_outside_a_task() {
   assert_contains "add-repo says the same" "no current task" "$out"
   out="$(iw_in "$SB" rm -f --current 2>&1 || true)"
   assert_contains "rm --current says the same" "no current task" "$out"
+}
+
+# --- agent registry -----------------------------------------------------------
+
+test_agents_register_on_session_start() {
+  mk_repo backend
+  iw feat/one -r backend -p myproj >/dev/null 2>&1
+  local WANT_SESSION_ID="sess-aaa" WANT_CLAUDE_PID="$$" WANT_PANE="%42"
+
+  hook_fire "$SB_TASKS/feat-one" '{"hook_event_name":"SessionStart"}' >/dev/null
+
+  assert_file "agents.tsv is written" "$SB_PROJECTS/myproj/agents.tsv"
+  assert_grep "the session is recorded against its task" \
+    "registered[[:space:]]feat-one[[:space:]]sess-aaa" "$SB_PROJECTS/myproj/agents.tsv"
+  # The pane, not the session id, is what the master can turn into an address.
+  assert_grep "the pane is recorded too" "%42" "$SB_PROJECTS/myproj/agents.tsv"
+
+  local out
+  out="$(iw_in "$SB_TASKS/feat-one" project agents 2>&1)"
+  assert_contains "project agents names the session" "sess-aaa" "$out"
+  assert_contains "and the task it is in" "feat-one" "$out"
+  assert_contains "and the pane" "%42" "$out"
+}
+
+test_agents_deregister_on_session_end() {
+  mk_repo backend
+  iw feat/one -r backend -p myproj >/dev/null 2>&1
+  local WANT_SESSION_ID="sess-bbb" WANT_CLAUDE_PID="$$" WANT_PANE="%7"
+
+  hook_fire "$SB_TASKS/feat-one" '{"hook_event_name":"SessionStart"}' >/dev/null
+  assert_contains "live to begin with" "sess-bbb" \
+    "$(iw_in "$SB_TASKS/feat-one" project agents 2>&1)"
+
+  hook_fire "$SB_TASKS/feat-one" '{"hook_event_name":"SessionEnd"}' >/dev/null
+  assert_contains "gone after SessionEnd" "(none)" \
+    "$(iw_in "$SB_TASKS/feat-one" project agents 2>&1)"
+  # Append-only: leaving is a new row, not the removal of an old one.
+  assert_grep "both events survive on disk" "ended" "$SB_PROJECTS/myproj/agents.tsv"
+  assert_grep "including the registration" "registered" "$SB_PROJECTS/myproj/agents.tsv"
+}
+
+test_agents_drops_a_session_that_died() {
+  mk_repo backend
+  iw feat/one -r backend -p myproj >/dev/null 2>&1
+
+  # A session that went away without a SessionEnd: a killed pane, a crash,
+  # kill -9. Nothing will ever write an 'ended' row for it.
+  ( exit 0 ) &
+  local dead=$!
+  wait "$dead" 2>/dev/null || true
+
+  local WANT_SESSION_ID="sess-ccc" WANT_CLAUDE_PID="$dead" WANT_PANE="%9"
+  hook_fire "$SB_TASKS/feat-one" '{"hook_event_name":"SessionStart"}' >/dev/null
+
+  assert_grep "the row is still on disk" "sess-ccc" "$SB_PROJECTS/myproj/agents.tsv"
+  assert_contains "but liveness is derived, so it is not listed" "(none)" \
+    "$(iw_in "$SB_TASKS/feat-one" project agents 2>&1)"
+}
+
+test_agents_two_sessions_in_one_task() {
+  mk_repo backend
+  iw feat/one -r backend -p myproj >/dev/null 2>&1
+
+  # One task can hold several agents, so the map is task -> many.
+  local WANT_CLAUDE_PID="$$"
+  local WANT_SESSION_ID="sess-one" WANT_PANE="%1"
+  hook_fire "$SB_TASKS/feat-one" '{"hook_event_name":"SessionStart"}' >/dev/null
+  WANT_SESSION_ID="sess-two"
+  WANT_PANE="%2"
+  hook_fire "$SB_TASKS/feat-one" '{"hook_event_name":"SessionStart"}' >/dev/null
+
+  local out
+  out="$(iw_in "$SB_TASKS/feat-one" project agents 2>&1)"
+  assert_contains "the first is listed" "sess-one" "$out"
+  assert_contains "the second is listed too" "sess-two" "$out"
+
+  out="$(iw_in "$SB_TASKS/feat-one" project show 2>&1)"
+  assert_contains "project show counts them on the task" "2 agents" "$out"
+}
+
+test_agents_a_resumed_session_is_listed_once() {
+  mk_repo backend
+  iw feat/one -r backend -p myproj >/dev/null 2>&1
+  local WANT_SESSION_ID="sess-ddd" WANT_CLAUDE_PID="$$" WANT_PANE="%5"
+
+  # SessionStart fires again on resume and on compaction, so the same session
+  # registers repeatedly. It must still be one agent, not three.
+  hook_fire "$SB_TASKS/feat-one" '{"hook_event_name":"SessionStart"}' >/dev/null
+  hook_fire "$SB_TASKS/feat-one" '{"hook_event_name":"SessionStart"}' >/dev/null
+  hook_fire "$SB_TASKS/feat-one" '{"hook_event_name":"SessionStart"}' >/dev/null
+
+  assert_eq "listed once despite three registrations" "1" \
+    "$(iw_in "$SB_TASKS/feat-one" project agents 2>&1 | grep -c 'sess-ddd')"
+  assert_contains "and counted once" "1 agent" \
+    "$(iw_in "$SB_TASKS/feat-one" project show 2>&1)"
+}
+
+test_agents_last_active_comes_from_the_transcript() {
+  mk_repo backend
+  iw feat/one -r backend -p myproj >/dev/null 2>&1
+  : > "$SB/transcript.jsonl"
+  local WANT_SESSION_ID="sess-fff" WANT_CLAUDE_PID="$$" WANT_PANE="%3"
+
+  hook_fire "$SB_TASKS/feat-one" \
+    "{\"hook_event_name\":\"SessionStart\",\"transcript_path\":\"$SB/transcript.jsonl\"}" >/dev/null
+
+  assert_grep "the transcript path is recorded" "transcript.jsonl" \
+    "$SB_PROJECTS/myproj/agents.tsv"
+  assert_contains "and reported as an age, derived on read" "last active" \
+    "$(iw_in "$SB_TASKS/feat-one" project agents 2>&1)"
+}
+
+test_agents_without_a_session_id_registers_nothing() {
+  mk_repo backend
+  iw feat/one -r backend -p myproj >/dev/null 2>&1
+
+  # WANT_SESSION_ID unset, so CLAUDE_CODE_SESSION_ID is empty: a plain shell
+  # running the hook, not a Claude session.
+  local out
+  out="$(hook_fire "$SB_TASKS/feat-one" '{"hook_event_name":"SessionStart"}')"
+  assert_contains "the brief is still injected" "myproj" "$out"
+  assert_contains "but nobody is registered" "(none)" \
+    "$(iw_in "$SB_TASKS/feat-one" project agents 2>&1)"
+}
+
+test_agents_registration_is_silent_outside_a_project() {
+  mk_repo backend
+  iw feat/plain -r backend >/dev/null 2>&1
+  local WANT_SESSION_ID="sess-ggg" WANT_CLAUDE_PID="$$"
+
+  assert_eq "SessionStart says nothing for a task with no project" "" \
+    "$(hook_fire "$SB_TASKS/feat-plain" '{"hook_event_name":"SessionStart"}')"
+  assert_eq "nor does SessionEnd" "" \
+    "$(hook_fire "$SB_TASKS/feat-plain" '{"hook_event_name":"SessionEnd"}')"
+  assert_eq "nor either of them outside a task at all" "" \
+    "$(hook_fire "$SB" '{"hook_event_name":"SessionEnd"}')"
+}
+
+test_agents_tsv_appears_for_a_project_that_predates_it() {
+  mk_repo backend
+  iw feat/one -r backend -p myproj >/dev/null 2>&1
+
+  # Projects created before this feature have no agents.tsv, and there is no
+  # migration step — the first registration has to grow the file itself.
+  rm -f "$SB_PROJECTS/myproj/agents.tsv"
+  local WANT_SESSION_ID="sess-hhh" WANT_CLAUDE_PID="$$" WANT_PANE="%8"
+  hook_fire "$SB_TASKS/feat-one" '{"hook_event_name":"SessionStart"}' >/dev/null
+
+  assert_file "the file is recreated" "$SB_PROJECTS/myproj/agents.tsv"
+  assert_grep "with its header" "^# timestamp" "$SB_PROJECTS/myproj/agents.tsv"
+  assert_contains "and the session is listed" "sess-hhh" \
+    "$(iw_in "$SB_TASKS/feat-one" project agents 2>&1)"
+}
+
+test_agents_row_without_a_pid_or_pane_still_lists() {
+  mk_repo backend
+  iw feat/one -r backend -p myproj >/dev/null 2>&1
+
+  # A harness that exports no pid, or a row written before one was recorded.
+  # There is nothing to signal, so the 'ended' event is the only thing that can
+  # retire it — and the display must not choke on the empty columns.
+  printf '2026-01-01T00:00:00+0000\tregistered\tfeat-one\tsess-old\t\t\t\n' \
+    >> "$SB_PROJECTS/myproj/agents.tsv"
+
+  local out
+  out="$(iw_in "$SB_TASKS/feat-one" project agents 2>&1)"
+  assert_contains "listed despite the empty columns" "sess-old" "$out"
+  assert_contains "under its task" "feat-one" "$out"
+  assert_contains "and counted by project show" "1 agent" \
+    "$(iw_in "$SB_TASKS/feat-one" project show 2>&1)"
+
+  local WANT_SESSION_ID="sess-old" WANT_CLAUDE_PID="$$"
+  hook_fire "$SB_TASKS/feat-one" '{"hook_event_name":"SessionEnd"}' >/dev/null
+  assert_contains "and an 'ended' row still retires it" "(none)" \
+    "$(iw_in "$SB_TASKS/feat-one" project agents 2>&1)"
+}
+
+test_agents_verb_rejects_junk_and_resolves_a_project() {
+  mk_repo backend
+  iw feat/one -r backend -p myproj >/dev/null 2>&1
+
+  assert_fails "an unknown flag is refused" iw project agents --nope
+  assert_fails "two projects are refused" iw project agents myproj otherproj
+  assert_ok "a positional project works from anywhere" iw project agents myproj
+  assert_ok "so does -p" iw project agents -p myproj
+  assert_fails "an unknown project still fails" iw project agents nosuchproject
+}
+
+test_read_verbs_work_from_the_project_directory() {
+  mk_repo backend
+  iw feat/one -r backend -p myproj >/dev/null 2>&1
+  local WANT_SESSION_ID="sess-iii" WANT_CLAUDE_PID="$$" WANT_PANE="%4"
+  hook_fire "$SB_TASKS/feat-one" '{"hook_event_name":"SessionStart"}' >/dev/null
+  unset WANT_SESSION_ID WANT_CLAUDE_PID WANT_PANE
+
+  # The project directory is where a session coordinating the other tasks runs,
+  # and it used to be the one place the read verbs could not infer a project.
+  local out
+  out="$(iw_in "$SB_PROJECTS/myproj" project agents 2>&1)"
+  assert_contains "the project is inferred from the directory" "myproj" "$out"
+  assert_contains "and the task's agents are listed" "sess-iii" "$out"
+
+  assert_ok "show works there too" iw_in "$SB_PROJECTS/myproj" project show
+  assert_ok "and from a subdirectory of it" iw_in "$SB_PROJECTS/myproj/notes" project show
+
+  out="$(iw_in "$SB" project agents 2>&1 || true)"
+  assert_contains "outside both kinds of directory it still says how to say which" \
+    "pass -p" "$out"
+}
+
+test_project_directory_beats_the_env_var() {
+  mk_repo backend
+  iw feat/one -r backend -p myproj >/dev/null 2>&1
+  mkdir -p "$SB_PROJECTS/otherproj"
+
+  # Same reasoning as the .project link beating it: an IWORK_PROJECT exported
+  # once in a shell profile must not silently redirect what you are standing in.
+  local WANT_PROJECT_ENV="otherproj"
+  assert_contains "the directory wins over IWORK_PROJECT" "myproj" \
+    "$(iw_in "$SB_PROJECTS/myproj" project agents 2>&1)"
 }
 
 # --- runner -------------------------------------------------------------------

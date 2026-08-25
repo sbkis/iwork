@@ -208,6 +208,7 @@ The project is created on first use (after confirming), and the task folder gets
 │       ├── LOG.md                     # append-only, one timestamped line per entry
 │       ├── TODO.md                    # captured-not-now, tagged with where and when
 │       ├── history.tsv                # append-only task events (opened/detached/closed)
+│       ├── agents.tsv                 # append-only session events; who is live is derived
 │       └── notes/                     # anything that outlives one task
 └── tasks/
     └── feat-token-api/
@@ -266,7 +267,7 @@ only source of truth as the tool grows.
 It deliberately does **not** point at `iwork -h`. That is ~180 lines of mostly
 operator material, and it advertises `iwork rm -f`, which deletes worktrees
 *including ones with uncommitted work* — not something to hand an agent that is
-casting around for what it can do. `iwork project -h` is 28 lines in three
+casting around for what it can do. `iwork project -h` is 33 lines in three
 groups — Reading, Recording, and Managing — where the third is labelled as the
 operator's, alongside a line in the block saying that creating tasks,
 `add-repo`, `rm` and `park` are not the agent's to run uninvited.
@@ -308,7 +309,8 @@ work, not an event. So three of the four paths are hooks instead (installed by
 
 | Hook | What it does | Judgement needed |
 |---|---|---|
-| `SessionStart` | Runs `iwork project show` and injects the output as context | none — the agent cannot start without it |
+| `SessionStart` | Registers the session in `agents.tsv`, then runs `iwork project show` and injects the output as context | none — the agent cannot start without it |
+| `SessionEnd` | Records that the session left, so it stops being listed as live | none — an event, not a judgement |
 | `PostToolUse` (Bash) | Logs the PR URL when the command really is `gh pr create` | none — a URL is a fact |
 | `PreCompact` | Prompts a flush right before the reasoning is discarded | the agent's, but at the right moment |
 | `Stop` / `UserPromptSubmit` / `Notification` | tmux window markers, as before | n/a |
@@ -341,6 +343,73 @@ and `project show` simply stops listing it as live.
 `history.tsv` records only what *cannot* be derived once a task folder is gone —
 the branch, the repos, when it opened and closed. It is append-only, one line per
 event, so it never needs rewriting and two tasks closing at once cannot corrupt it.
+
+### Who is working on what
+
+A project that spans a dozen tasks spans a dozen agents, and nothing recorded
+which of them was where. `SessionStart` now registers the session before it
+prints the brief, and `SessionEnd` records it leaving:
+
+```bash
+iwork project agents
+```
+```
+Agents (live) in project 'auth-rewrite':
+  feat-refresh-flow
+    session 9e8d8f11-…  pid 42164  tmux pane %121
+  feat-token-api
+    session c1d195bf-…  pid 42164  tmux pane %153
+    last active 4m ago
+    session 1e0c8e77-…  pid 42164  tmux pane %136
+```
+
+`project show` carries the same thing in one word per task — `feat-token-api
+2 agents` — so every session already knows how crowded the project is without
+asking. A task can hold several agents, so this is task → *many*; a file with
+one line per task would silently lose one.
+
+Everything in a row comes from the environment the hook already runs in
+(`CLAUDE_CODE_SESSION_ID`, `CLAUDE_PID`, `TMUX_PANE`), plus `transcript_path`
+from the payload — pulled out with the same `sed` that reads the event name, so
+the hook still needs no JSON parser.
+
+**The session id is not an address.** A session is reached by the name its own
+harness gives it, and that name does not derive from the session id — which is
+why the tmux pane is recorded too. That is the field a coordinating agent can
+match against its list of live sessions to turn a row into something it can
+message. Storing the session id alone would produce a registry naming agents
+that nothing could reach.
+
+**Liveness is derived, never stored** — the same rule the rest of the project
+memory follows. `agents.tsv` is an append-only log of registrations and
+departures; `project agents` reduces it to the last row per session, drops the
+ones that said they were leaving, and then drops the ones that never got the
+chance:
+
+```bash
+kill -0 "$pid"   # the same tell project_lock uses for a dead lock holder
+```
+
+So a killed pane, a crash or a `kill -9` costs nothing: the row stays on disk
+and stops being an answer. Pids are reused, so a row can in principle outlive
+its session until something inherits its number — the pane exists precisely so
+the authoritative live-session list gets the final say.
+
+A project created before this existed has no `agents.tsv`; the first
+registration writes the header itself, so there is no migration step.
+
+Reading from the project directory itself now works without naming it, which is
+where a session coordinating the others would be run:
+
+```bash
+cd ~/dev/projects/projects/auth-rewrite
+iwork project agents          # the project is read from where you are standing
+iwork project show
+```
+
+Standing in the project beats `IWORK_PROJECT` for the same reason a task's
+`.project` link does: an env var exported once in a shell profile must not
+quietly redirect the thing in front of you.
 
 ### Joining work already in flight
 
