@@ -511,7 +511,8 @@ against any task: its row has no task, by definition.
 ### Talking to the tasks
 
 ```bash
-iwork say feat-token-api "stop on the refresh flow — the token shape changed"
+iwork say feat-token-api "when you get a chance, rename that field"
+iwork say --urgent feat-token-api "stop — the base you branched from moved"
 iwork reply "shape is opaque now; feat-refresh needs a rebase"   # from a task
 iwork inbox                                                      # what is queued for me
 ```
@@ -520,21 +521,28 @@ A master that can only watch is a dashboard. `say` queues a message for the
 agent running in a task; `reply` sends one back from a task to the master.
 Neither types into anyone's terminal.
 
-**Delivery rides the hooks that are already installed.** A message reaches a
-working agent when it finishes its next turn, which is what makes it a redirect
-rather than a note — it lands before the agent decides what to do next. One that
-is idle gets it when it is next prompted, and one that is not running at all
-gets it at its next session start. Nothing is lost either way, because the queue
-is on disk and delivery is derived from it.
+**Ordinary messages wait for a natural break.** They are read at the recipient's
+next prompt, alongside whatever comes next, so work already under way is not
+disturbed. Most of what a master has to say can wait that long, and a task
+halfway through a refactor is the worst possible moment to redirect it.
 
-The `Stop` path is the interesting one. Plain stdout on `Stop` goes to Claude
-Code's debug log and nowhere else, so a message printed there would vanish
-silently. It comes back as the *blocking reason* on exit 2 instead — the one
-form that both reaches the model and keeps the agent going rather than leaving
-it to read the message after its next human prompt. That cannot loop: the drain
-records messages delivered before the block is taken, so the `Stop` that fires
-next has nothing pending and exits 0. There is a test for exactly that, because
-a `Stop` hook that always blocks is an agent that can never finish.
+**`--urgent` takes the agent's stopping point away.** It is delivered the instant
+the current turn ends, and the agent carries straight on with it instead of
+stopping. That is worth spending when letting the work continue would waste it —
+the base it branched from has moved, the approach was settled elsewhere, the task
+is now redundant — and not for status questions or to hurry something along.
+
+Either way the message is queued on disk, so one sent to a task that is not
+running is delivered at its next session start rather than lost.
+
+The `Stop` path is what makes `--urgent` possible, and it is worth knowing why it
+looks the way it does. Plain stdout on `Stop` goes to Claude Code's debug log and
+nowhere else, so a message printed there would vanish silently. It comes back as
+the *blocking reason* on exit 2 instead — the one form that both reaches the
+model and keeps the agent going. That cannot loop: the drain records messages
+delivered before the block is taken, so the `Stop` that fires next has nothing
+urgent pending and exits 0. There is a test for exactly that, because a `Stop`
+hook that always blocks is an agent that can never finish.
 
 `inbox.tsv` follows the rules the rest of the project memory follows: append-only,
 one line per event, `sent` and `delivered` as separate rows. What is pending is

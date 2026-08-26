@@ -2530,10 +2530,10 @@ test_a_message_is_delivered_on_the_next_prompt() {
     "$(iw_in "$SB_TASKS/feat-one" inbox 2>&1)"
 }
 
-test_a_message_diverts_a_working_agent_on_stop() {
+test_an_urgent_message_diverts_a_working_agent_on_stop() {
   mk_repo backend
   iw feat/one -r backend -p myproj >/dev/null 2>&1
-  iw_in "$SB_PROJECTS/myproj" say feat-one "stop and rebase first" >/dev/null 2>&1
+  iw_in "$SB_PROJECTS/myproj" say --urgent feat-one "stop and rebase first" >/dev/null 2>&1
 
   # Plain stdout on Stop goes to the debug log and nowhere else, so the message
   # has to come back as the blocking reason on exit 2 -- which is also what
@@ -2554,7 +2554,7 @@ test_stop_without_a_message_does_not_block() {
   assert_ok "an empty inbox lets the agent stop" \
     iw_in "$SB_TASKS/feat-one" --hook <<<'{"hook_event_name":"Stop"}'
 
-  iw_in "$SB_PROJECTS/myproj" say feat-one "one thing" >/dev/null 2>&1
+  iw_in "$SB_PROJECTS/myproj" say --urgent feat-one "one thing" >/dev/null 2>&1
   printf '%s' '{"hook_event_name":"Stop"}' | iw_in "$SB_TASKS/feat-one" --hook >/dev/null 2>&1
 
   # Drained before the block was taken, so the next stop is clean.
@@ -2612,6 +2612,68 @@ test_say_refuses_a_task_outside_the_project() {
     iw_in "$SB_PROJECTS/myproj" say feat-nope "hello"
   assert_fails "reply outside a task is refused" \
     iw_in "$SB_PROJECTS/myproj" reply "hello"
+}
+
+
+test_an_ordinary_message_does_not_interrupt_work_in_progress() {
+  mk_repo backend
+  iw feat/one -r backend -p myproj >/dev/null 2>&1
+  iw_in "$SB_PROJECTS/myproj" say feat-one "when you get a chance, rename the field" >/dev/null 2>&1
+
+  # Taking the Stop costs the agent its stopping point. Most of what a master
+  # has to say does not justify that, and a task halfway through a refactor is
+  # the worst moment to redirect it.
+  assert_ok "the agent is allowed to finish" \
+    iw_in "$SB_TASKS/feat-one" --hook <<<'{"hook_event_name":"Stop"}'
+
+  # Still queued, not consumed by the stop it declined to take.
+  assert_contains "and the message is still waiting" "rename the field" \
+    "$(iw_in "$SB_TASKS/feat-one" inbox 2>&1)"
+
+  # It arrives at the next prompt, alongside whatever comes next.
+  assert_contains "arriving with the next prompt instead" "rename the field" \
+    "$(hook_fire "$SB_TASKS/feat-one" '{"hook_event_name":"UserPromptSubmit"}')"
+}
+
+test_urgency_is_reported_when_sending() {
+  mk_repo backend
+  iw feat/one -r backend -p myproj >/dev/null 2>&1
+
+  local WANT_SESSION_ID="sess-one" WANT_CLAUDE_PID="$$"
+  hook_fire "$SB_TASKS/feat-one" '{"hook_event_name":"SessionStart"}' >/dev/null
+
+  assert_contains "an ordinary message says it will wait" "next prompted" \
+    "$(iw_in "$SB_PROJECTS/myproj" say feat-one "later" 2>&1)"
+  assert_contains "and points at the escape hatch" "--urgent" \
+    "$(iw_in "$SB_PROJECTS/myproj" say feat-one "later" 2>&1)"
+  assert_contains "an urgent one says it will interrupt" "interrupt them" \
+    "$(iw_in "$SB_PROJECTS/myproj" say --urgent feat-one "now" 2>&1)"
+}
+
+test_an_urgent_stop_leaves_ordinary_messages_queued() {
+  mk_repo backend
+  iw feat/one -r backend -p myproj >/dev/null 2>&1
+  iw_in "$SB_PROJECTS/myproj" say feat-one "the calm one" >/dev/null 2>&1
+  iw_in "$SB_PROJECTS/myproj" say --urgent feat-one "the loud one" >/dev/null 2>&1
+
+  local out
+  out="$(printf '%s' '{"hook_event_name":"Stop"}' | iw_in "$SB_TASKS/feat-one" --hook 2>&1)"
+  assert_contains "the urgent one interrupts" "the loud one" "$out"
+  case "$out" in
+    *"the calm one"*) bad "an ordinary message rode along with the interruption" ;;
+    *) ok ;;
+  esac
+  assert_contains "and it is still queued for the next prompt" "the calm one" \
+    "$(iw_in "$SB_TASKS/feat-one" inbox 2>&1)"
+}
+
+test_inbox_marks_which_messages_are_urgent() {
+  mk_repo backend
+  iw feat/one -r backend -p myproj >/dev/null 2>&1
+  iw_in "$SB_PROJECTS/myproj" say --urgent feat-one "drop everything" >/dev/null 2>&1
+
+  assert_contains "the listing says which is which" "(urgent)" \
+    "$(iw_in "$SB_TASKS/feat-one" inbox 2>&1)"
 }
 
 # --- runner -------------------------------------------------------------------
