@@ -561,17 +561,22 @@ turn and is sitting at its prompt gets the message the moment it is next
 prompted, but nothing prompts it — no hook fires again until something does.
 
 That case is covered, just not by iwork. The master is itself a Claude Code
-session, and Claude Code sessions on one machine can address each other by name;
-`project agents --json` exists to supply the join key. The two listings share
-*both* keys, which is what makes the pairing certain rather than a guess:
+session, and Claude Code sessions on one machine address each other by name;
+`project agents --json` exists to supply the key that finds the name:
 
 ```
 agents.tsv     session 1e0c8e77-…                        tmux pane %136
 the harness    feat-project-memory-9c [1e0c8e] · idle ·  tmux tasks:@55.%136
 ```
 
-The harness's short id is a prefix of `CLAUDE_CODE_SESSION_ID`, and the pane
-matches exactly. So the division is: **message the session to make something
+**Pair them on the pane.** It is recorded on both sides, matches exactly, and is
+the only key that separates two agents working in the same task — which the rest
+of this section exists to say is a thing that happens. The short id beside the
+name is a prefix of `CLAUDE_CODE_SESSION_ID`, so it confirms a pairing, and it
+is what a harness wants when two sessions share a name.
+
+Then message the name, not the id — for the reason stated further up: *the
+session id is not an address*. So the division is: **message the session to make something
 happen now, queue in the inbox to make sure it happens at all.** The inbox
 outlives a session that is not running, reaches an agent whose harness offers no
 messaging, and leaves a record of what was asked; session messaging wakes an

@@ -2243,7 +2243,8 @@ test_master_hook_gives_the_project_role() {
   # The inbox cannot wake an agent that is already at its prompt; the brief has
   # to say so, or the master waits on a message that will never be read.
   assert_contains "and how to wake an idle one" "go through your own harness" "$out"
-  assert_contains "naming the join key that makes that possible" "prefix of the session id" "$out"
+  assert_contains "naming the key it pairs on" "pair them on that pane" "$out"
+  assert_contains "and that a name is what it addresses" "by name" "$out"
 
   # The two roles are mutually exclusive: a master told to stay inside one task
   # is a master that will not spawn the next one.
