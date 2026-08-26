@@ -164,6 +164,9 @@ iwork rm feat-login-bug
 # Jump back into the task (tmux window if present, else cd)
 iwork cd feat-login-bug
 
+# Open the project master: one agent whose job is the project, not a task in it
+iwork master auth-rewrite
+
 # Run an agent in the task window
 iwork claude feat-login-bug
 iwork codex feat-login-bug
@@ -368,7 +371,13 @@ Agents (live) in project 'auth-rewrite':
 asking. A task can hold several agents, so this is task → *many*; a file with
 one line per task would silently lose one.
 
-Everything in a row comes from the environment the hook already runs in
+A row also records the session's role. The project [master](#the-master-one-agent-whose-job-is-the-project)
+is listed as `(master)` rather than under a task, because it has none — and for
+the same reason it is not counted against one. The column is appended rather
+than inserted, so an `agents.tsv` written before masters existed keeps every
+field where it was and reads back as the task agents it recorded.
+
+Everything else in a row comes from the environment the hook already runs in
 (`CLAUDE_CODE_SESSION_ID`, `CLAUDE_PID`, `TMUX_PANE`), plus `transcript_path`
 from the payload — pulled out with the same `sed` that reads the event name, so
 the hook still needs no JSON parser.
@@ -410,6 +419,65 @@ iwork project show
 Standing in the project beats `IWORK_PROJECT` for the same reason a task's
 `.project` link does: an env var exported once in a shell profile must not
 quietly redirect the thing in front of you.
+
+### The master: one agent whose job is the project
+
+```bash
+iwork master auth-rewrite          # or bare `iwork master` from inside the project
+tmux attach -t projects            # from a second terminal, or a second client
+```
+
+Every other session iwork starts is scoped to one task, one branch, one set of
+worktrees, and is told to stay inside them. That is right for the work and wrong
+for the shape of the work: what the tasks should be, what order they stack in,
+when one is far enough along that the next can branch off it, whether two of them
+are converging on the same file. The master is the session for that.
+
+It gets a window of its own, named after the project, in a separate `projects`
+session — not a window in `tasks`. A separate session because it is the thing you
+want in front of you while the tasks are not: attach to it from another terminal
+or another client and leave it there. Started from outside tmux it builds that
+session in the background and tells you how to reach it.
+
+Its cwd is the project directory, which is what makes it cheap: every project
+verb already resolves the project from where you are standing, so `iwork project
+show`, `project agents`, `todo` and `decided` all work there with no arguments.
+
+**Stacked PRs are the case it earns its keep on.** `--from` already builds the
+chain; nothing knew the chain existed. The master does, because it chose the
+split — that task B branched off A, that B's PR targets A's branch rather than
+main, that when A merges the rest need rebasing. What it decides goes into the
+log as it goes, so the chain survives the session that planned it. The base a
+task was stacked on is recorded in `history.tsv` too, which is what lets the
+stack be reconstructed after the task folders are gone.
+
+Standing in the project directory changes three things, so the master never has
+to spell them out:
+
+| From the project directory | Why |
+|---|---|
+| a new task joins that project without `-p` | naming it on every line is one typo from an orphan task |
+| tasks are created detached | otherwise spawning one calls `switch-client` and drags your client into the tasks session |
+| `rm` and `project delete` refuse | they destroy worktrees and memory, and that stays yours |
+
+The last one is a guardrail rather than a sandbox — `cd` out and it is gone. It
+is there to catch the accident. The reason it cannot rely on the usual
+confirmation is that `confirm()` reads `/dev/tty`, which a tmux pane running an
+agent has: the prompt would be answered by the agent it was meant to stop.
+
+**The master's instructions come from the `SessionStart` hook**, not from a
+`CLAUDE.md` in the project directory. That is deliberate. A file would have to be
+named `CLAUDE.md` to be loaded at all, and `.project` symlinks the project into
+every task — so a task agent that opened it would inherit instructions telling it
+to spawn tasks. Delivering the role through the hook removes that path instead of
+mitigating it, and leaves nothing hand-edited for `project delete` to take with
+it. The cost is that `install-hooks` is not optional here: without it the master
+comes up as an ordinary agent in a directory of markdown, and says so rather than
+looking fine.
+
+`project agents` marks it as `(master)` and `project show` carries one line for
+it, so every task agent can see whether a coordinator is live. It is not counted
+against any task: its row has no task, by definition.
 
 ### Joining work already in flight
 
@@ -706,6 +774,7 @@ overrides.
 | `IWORK_TASKS_DIR` | `$IWORK_REPO_DIR/tasks` | Where task folders are created |
 | `IWORK_PROJECTS_DIR` | `$IWORK_REPO_DIR/projects` | Where project memory lives (see [Projects](#projects-memory-across-many-tasks)) |
 | `IWORK_TMUX_SESSION` | `tasks` | tmux session that holds task windows |
+| `IWORK_PROJECTS_TMUX_SESSION` | `projects` | tmux session that holds project master windows (see [The master](#the-master-one-agent-whose-job-is-the-project)). Must differ from `IWORK_TMUX_SESSION`, or a task lookup could answer with a master |
 | `IWORK_CONTEXT_TEMPLATE` | `~/.config/iwork/task-context.md.tmpl` | Template for the generated `CLAUDE.md`/`AGENTS.md` (seeded with a default on first use, then yours to edit) |
 | `IWORK_PROJECT_TEMPLATE` | `~/.config/iwork/project-context.md.tmpl` | Template for the project block injected into those files (same deal: seeded once, then yours) |
 | `IWORK_PROJECT` | unset | Fallback project for `todo`/`log`/`decided`/`done`/`drop`. A task's own `.project` link always wins over it; `-p` wins over both |

@@ -2224,6 +2224,181 @@ TMPL
   assert_contains "add-repo still says the list is stale" "iwork:repos" "$out"
 }
 
+# --- master ------------------------------------------------------------------
+
+test_master_hook_gives_the_project_role() {
+  mk_repo backend
+  iw feat/one -r backend -p myproj >/dev/null 2>&1
+
+  local out
+  out="$(hook_fire "$SB_PROJECTS/myproj" '{"hook_event_name":"SessionStart"}')"
+  assert_contains "says which project it is master of" \
+    "master session for project 'myproj'" "$out"
+  assert_contains "carries the project brief" "Tasks (live)" "$out"
+  assert_contains "names the verb that spawns a task" "iwork <branch> -r" "$out"
+  assert_contains "keeps rm on the operator's side" "iwork rm" "$out"
+  assert_contains "explains what the session is for" "stacks on" "$out"
+  assert_contains "and how to reach a task's agent" "not an address" "$out"
+
+  # The two roles are mutually exclusive: a master told to stay inside one task
+  # is a master that will not spawn the next one.
+  case "$out" in
+    *"this task belongs to project"*) bad "gave the master the task brief" ;;
+    *) ok ;;
+  esac
+}
+
+test_task_session_still_gets_the_task_brief() {
+  mk_repo backend
+  iw feat/one -r backend -p myproj >/dev/null 2>&1
+
+  local out
+  out="$(hook_fire "$SB_TASKS/feat-one" '{"hook_event_name":"SessionStart"}')"
+  assert_contains "a task still gets the task brief" "this task belongs to project" "$out"
+  case "$out" in
+    *"master session for project"*) bad "gave a task the master brief" ;;
+    *) ok ;;
+  esac
+}
+
+test_master_registers_with_its_role() {
+  mk_repo backend
+  iw feat/one -r backend -p myproj >/dev/null 2>&1
+
+  local WANT_SESSION_ID="sess-master" WANT_CLAUDE_PID="$$"
+  hook_fire "$SB_PROJECTS/myproj" '{"hook_event_name":"SessionStart"}' >/dev/null
+
+  local out
+  out="$(iw project agents myproj 2>&1)"
+  assert_contains "the master is listed" "sess-master" "$out"
+  assert_contains "under its role rather than as an unknown task" "(master)" "$out"
+
+  out="$(iw project show myproj 2>&1)"
+  assert_contains "project show says the master is live" "Master: live" "$out"
+
+  # It belongs to the project, not to any task in it.
+  case "$out" in
+    *"1 agent"*) bad "counted the master against a task" ;;
+    *) ok ;;
+  esac
+}
+
+test_master_deregisters_on_session_end() {
+  mk_repo backend
+  iw feat/one -r backend -p myproj >/dev/null 2>&1
+
+  local WANT_SESSION_ID="sess-master" WANT_CLAUDE_PID="$$"
+  hook_fire "$SB_PROJECTS/myproj" '{"hook_event_name":"SessionStart"}' >/dev/null
+  hook_fire "$SB_PROJECTS/myproj" '{"hook_event_name":"SessionEnd"}' >/dev/null
+
+  assert_contains "the master is gone from the listing" "(none)" \
+    "$(iw project agents myproj 2>&1)"
+  assert_contains "and project show says so" "Master: not running" \
+    "$(iw project show myproj 2>&1)"
+}
+
+test_master_resolves_the_project_from_where_it_stands() {
+  mk_repo backend
+  iw feat/one -r backend -p myproj >/dev/null 2>&1
+
+  # --no-tmux is the default in the sandbox, so this cds and execs the claude
+  # stub: what is under test is which project it resolved before doing so.
+  assert_ok "from inside a task, through its .project link" \
+    iw_in "$SB_TASKS/feat-one" master
+  assert_ok "from the project directory itself" \
+    iw_in "$SB_PROJECTS/myproj" master
+  assert_ok "named explicitly from anywhere" iw master myproj
+  assert_fails "an unknown project is refused" iw master nosuchproject
+  assert_fails "and so is a second positional" iw master myproj otherproj
+}
+
+test_master_says_when_the_hooks_are_missing() {
+  mk_repo backend
+  iw feat/one -r backend -p myproj >/dev/null 2>&1
+
+  # The role is delivered by the SessionStart hook and by nothing else, so a
+  # master started without it comes up as an ordinary agent in a markdown
+  # directory. Coming up looking fine is the failure mode worth catching.
+  assert_contains "warns that the session will have no role" "install-hooks" \
+    "$(iw master myproj 2>&1)"
+}
+
+test_master_window_is_created_and_reused() {
+  command -v tmux >/dev/null 2>&1 || { printf '    skip (no tmux)\n'; return 0; }
+  mk_repo backend
+  iw feat/one -r backend -p myproj >/dev/null 2>&1
+
+  WANT_TMUX=1 iw master myproj >/dev/null 2>&1
+
+  local windows
+  windows="$(tmux_t list-windows -t projects -F '#{window_name}' 2>/dev/null | tr '\n' ' ')"
+  assert_contains "a master window was created in the projects session" "myproj" "$windows"
+
+  # Two masters would plan against the same PROJECT.md and spawn overlapping
+  # tasks, with neither aware of the other.
+  assert_contains "a second master is refused" "already open" \
+    "$(WANT_TMUX=1 iw master myproj 2>&1)"
+
+  local count
+  count="$(tmux_t list-windows -t projects -F '#{window_name}' 2>/dev/null | grep -c myproj)"
+  assert_eq "and no second window was made" "1" "$(printf '%s' "$count" | tr -d ' ')"
+
+  # The tasks session is not where a master lives.
+  local task_windows
+  task_windows="$(tmux_t list-windows -t tasks -F '#{window_name}' 2>/dev/null | tr '\n' ' ')"
+  case "$task_windows" in
+    *myproj*) bad "the master landed in the tasks session" ;;
+    *) ok ;;
+  esac
+}
+
+test_task_created_from_the_project_directory_joins_it() {
+  mk_repo backend
+  iw feat/one -r backend -p myproj >/dev/null 2>&1
+
+  iw_in "$SB_PROJECTS/myproj" feat/two -r backend >/dev/null 2>&1
+  assert_link "the new task was attached without -p" "$SB_TASKS/feat-two/.project"
+  assert_eq "to the project it was created from" "myproj" \
+    "$(basename "$(readlink "$SB_TASKS/feat-two/.project")")"
+}
+
+test_rm_refuses_from_the_project_directory() {
+  mk_repo backend
+  iw feat/one -r backend -p myproj >/dev/null 2>&1
+
+  # confirm() reads /dev/tty, which a pane running an agent has, so the prompt
+  # that would normally catch this is answered by the agent itself.
+  assert_fails "rm refuses from the project directory" \
+    iw_in "$SB_PROJECTS/myproj" rm -f feat-one
+  assert_dir "and the task is still there" "$SB_TASKS/feat-one"
+  assert_contains "saying where it will run instead" "ask the operator" \
+    "$(iw_in "$SB_PROJECTS/myproj" rm -f feat-one 2>&1)"
+
+  # From outside the project it is the operator's again.
+  assert_ok "but not from outside the project" iw rm -f feat-one
+}
+
+test_project_delete_refuses_from_the_project_directory() {
+  mk_repo backend
+  iw feat/one -r backend -p myproj >/dev/null 2>&1
+
+  assert_fails "project delete refuses from the project directory" \
+    iw_in "$SB_PROJECTS/myproj" project delete -f myproj
+  assert_dir "and the memory is still there" "$SB_PROJECTS/myproj"
+}
+
+test_from_is_recorded_in_the_project_history() {
+  mk_repo backend
+  iw feat/one -r backend -p myproj >/dev/null 2>&1
+  iw feat/two --from feat-one -r backend -p myproj >/dev/null 2>&1
+
+  # Once the task folders are gone this is the only record that the stack
+  # existed, which is the point at which the stack matters.
+  assert_grep "the base a task was stacked on is recorded" "from=feat-one" \
+    "$SB_PROJECTS/myproj/history.tsv"
+  assert_eq "and only the stacked task records one" "1" \
+    "$(grep -c 'from=' "$SB_PROJECTS/myproj/history.tsv" | tr -d ' ')"
+}
 
 test_agents_row_with_a_pane_but_no_pid_still_lists() {
   mk_repo backend
@@ -2232,7 +2407,7 @@ test_agents_row_with_a_pane_but_no_pid_still_lists() {
   # Tab is IFS whitespace, so 'read' collapsed the empty pid into the pane and
   # this row was dropped by 'kill -0 %3'. A harness that exports a pane but no
   # pid was invisible in the listing that exists to find it.
-  printf '2026-01-01T00:00:00+0000\tregistered\tfeat-one\tsess-pane\t\t%%3\t\n' \
+  printf '2026-01-01T00:00:00+0000\tregistered\tfeat-one\tsess-pane\t\t%%3\t\ttask\n' \
     >> "$SB_PROJECTS/myproj/agents.tsv"
 
   local out

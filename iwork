@@ -3,7 +3,7 @@ set -euo pipefail
 
 SELF_PATH="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)/$(basename "${BASH_SOURCE[0]:-$0}")"
 IWORK_CONFIG_FILE="${IWORK_CONFIG_FILE:-${XDG_CONFIG_HOME:-$HOME/.config}/iwork/config}"
-IWORK_CONFIG_VARS=(IWORK_REPO_DIR IWORK_TASKS_DIR IWORK_PROJECTS_DIR IWORK_TMUX_SESSION IWORK_CONTEXT_TEMPLATE IWORK_PROJECT_TEMPLATE IWORK_EDITOR IWORK_NO_TMUX IWORK_NO_CONTEXT IWORK_DETACH IWORK_BIG IWORK_ASSUME_YES IWORK_PROJECT IWORK_SHOW_LOG_LINES)
+IWORK_CONFIG_VARS=(IWORK_REPO_DIR IWORK_TASKS_DIR IWORK_PROJECTS_DIR IWORK_TMUX_SESSION IWORK_PROJECTS_TMUX_SESSION IWORK_CONTEXT_TEMPLATE IWORK_PROJECT_TEMPLATE IWORK_EDITOR IWORK_NO_TMUX IWORK_NO_CONTEXT IWORK_DETACH IWORK_BIG IWORK_ASSUME_YES IWORK_PROJECT IWORK_SHOW_LOG_LINES)
 
 load_config() {
   local var="" restore=""
@@ -30,6 +30,7 @@ REPO_DIR="${IWORK_REPO_DIR:-}"
 TASKS_DIR="${IWORK_TASKS_DIR:-${REPO_DIR:+$REPO_DIR/tasks}}"
 PROJECTS_DIR="${IWORK_PROJECTS_DIR:-${REPO_DIR:+$REPO_DIR/projects}}"
 TASKS_SESSION="${IWORK_TMUX_SESSION:-tasks}"
+PROJECTS_SESSION="${IWORK_PROJECTS_TMUX_SESSION:-projects}"
 IWORK_NO_TMUX="${IWORK_NO_TMUX:-}"
 IWORK_NO_CONTEXT="${IWORK_NO_CONTEXT:-}"
 IWORK_DETACH="${IWORK_DETACH:-}"
@@ -50,6 +51,13 @@ CHECKPOINT_NUDGE_AFTER=40
 # and by tail -n, so a non-numeric value under 'set -u' aborts project_show
 # halfway through — which the SessionStart hook then reports as a broken hook
 # after emitting half a project brief.
+# Masters and tasks are looked up by window name in their own session, so one
+# session holding both means a task lookup can answer with a master.
+if [[ "$PROJECTS_SESSION" == "$TASKS_SESSION" ]]; then
+  echo "Warning: IWORK_PROJECTS_TMUX_SESSION must differ from IWORK_TMUX_SESSION (both '$TASKS_SESSION'); using '$TASKS_SESSION-projects'" >&2
+  PROJECTS_SESSION="$TASKS_SESSION-projects"
+fi
+
 if [[ ! "$SHOW_LOG_LINES" =~ ^[1-9][0-9]*$ ]]; then
   # Not warn(): this runs at load time, before the helpers are defined.
   echo "Warning: IWORK_SHOW_LOG_LINES must be a positive integer, got '$SHOW_LOG_LINES'; using 12" >&2
@@ -75,6 +83,7 @@ Usage: iwork [flags] <branch-name> [--from <task|branch>] -r <repo1> [repo2 ...]
        iwork [--no-tmux] cd <task>
        iwork [flags] claude <task> [claude-args...]
        iwork [flags] codex <task> [codex-args...]
+       iwork [flags] master [<project>]
        iwork init
        iwork install-hooks [settings-path]
        iwork --completion <bash|zsh>
@@ -125,7 +134,8 @@ your git repositories; task folders go in IWORK_TASKS_DIR (default:
 $IWORK_REPO_DIR/tasks). Environment variables override the config file.
 
 Inside tmux, each task maps to a window in a dedicated 'tasks' session
-(override the name with IWORK_TMUX_SESSION). Creation and park open the
+(override the name with IWORK_TMUX_SESSION); each project master maps to a
+window in a separate 'projects' session (IWORK_PROJECTS_TMUX_SESSION). Creation and park open the
 window (claude starts in the left pane, a shell in the right);
 claude/codex/cd switch to it if it exists. Claude Code hooks (see
 install-hooks) mark the window name with the agent state:
@@ -186,6 +196,9 @@ Subcommands:
                  Requires sourced shell integration from --completion
   claude         Open/switch to the task window and run claude there
   codex          Open/switch to the task window and run codex there
+  master         Open/switch to the project's master session: one agent per
+                 project whose job is the project rather than any task in it
+                 (see Master below)
   install-hooks  Add Claude Code hooks to ~/.claude/settings.json: keep tmux
                  window names in sync with agent status, inject the project
                  brief at session start, log PRs, and prompt for a flush before
@@ -251,6 +264,32 @@ Projects:
   project; attach again with a different name and it refuses rather than
   silently relinking.
 
+Master:
+  'iwork master [<project>]' opens one long-lived agent per project, in a window
+  of its own named after the project, in the 'projects' tmux session. Its cwd is
+  the project directory, so every project verb works there with no arguments.
+
+  It is the session for the shape of the work rather than the work: split a
+  large feature into tasks, decide what stacks on what, spawn them, watch them,
+  redirect one that has gone the wrong way. Stacked PRs are the case it earns
+  its keep on — '--from' builds the chain, and the master is the only thing that
+  knows the chain exists.
+
+  A separate session because it is what you want in front of you while the tasks
+  are not: attach to it from a second terminal or a second client with
+  'tmux attach -t projects'. Started from outside tmux it builds that session in
+  the background and tells you how to reach it.
+
+  Standing in the project directory changes three things, so the master does not
+  have to spell them out: a task created there joins that project, it is created
+  detached so spawning one does not drag your client into the tasks session, and
+  'rm' and 'project delete' refuse to run — they destroy worktrees and memory,
+  and that stays the operator's.
+
+  The master's instructions come from the SessionStart hook, so 'install-hooks'
+  is not optional for it: without the hooks it starts as an ordinary agent in a
+  directory of markdown, and says so.
+
 Examples:
   iwork feat/bla -r backend-api frontend
   iwork fix/login-bug -r auth-service web-app
@@ -272,6 +311,8 @@ Examples:
   iwork --big feat/huge-thing -r backend-api frontend shared-lib admin
   iwork --big --detach feat/huge-thing -r backend-api frontend
   iwork --no-tmux claude feat-bla
+  iwork master auth-rewrite
+  iwork master -m 'split the token work into stacked PRs'
   iwork install-hooks
 
 Options (all accepted before the branch name or after the repo list):
@@ -493,6 +534,15 @@ resolve_worktree_folder() {
   printf '%s\n' "$folder_path"
 }
 
+# Anything a master starts belongs in the tasks session rather than in front of
+# it: open_task_window ends in switch_to_window, which calls switch-client, so
+# without this a master spawning a task drags the operator's client out of the
+# projects session and into the tasks one.
+master_default_detach() {
+  in_master_context || return 0
+  IWORK_DETACH="${IWORK_DETACH:-1}"
+}
+
 run_tool_in_worktree() {
   local tool="$1"
   local folder="$2"
@@ -501,6 +551,7 @@ run_tool_in_worktree() {
   shift 2
   require_config
   folder_path="$(resolve_worktree_folder "$folder")"
+  master_default_detach
 
   if tmux_enabled; then
     open_task "$folder" "$tool" "$@"
@@ -1418,6 +1469,13 @@ _iwork() {
         return 0
       fi
       ;;
+    master)
+      if (( COMP_CWORD == cmd_i + 1 )); then
+        projects="$("$_bin" --complete-projects "$cur" 2>/dev/null)" || return 0
+        COMPREPLY=( $(compgen -W "$projects" -- "$cur") )
+      fi
+      return 0
+      ;;
     park)
       return 0
       ;;
@@ -1479,7 +1537,7 @@ _iwork() {
   fi
 
   if [[ -z "$cmd" ]]; then
-    COMPREPLY=( $(compgen -W "add-repo rm park list cd claude codex project todo log decided done drop init install-hooks --no-tmux --no-context --detach -d --big --from --message -m -h --help --completion" -- "$cur") )
+    COMPREPLY=( $(compgen -W "add-repo rm park list cd claude codex master project todo log decided done drop init install-hooks --no-tmux --no-context --detach -d --big --from --message -m -h --help --completion" -- "$cur") )
     return 0
   fi
 
@@ -1679,6 +1737,7 @@ _iwork() {
       'cd[cd into a worktree folder or switch to its tmux window]' \
       'claude[open the task tmux window and run claude]' \
       'codex[open the task tmux window and run codex]' \
+      'master[open the project master session that runs the tasks]' \
       'project[manage the memory shared across a project'\''s tasks]' \
       'todo[capture something that needs doing, but not in this PR]' \
       'log[append one line to the project log]' \
@@ -1765,6 +1824,13 @@ _iwork() {
         _describe -t folders 'worktree folder' folders
         return 0
       fi
+      ;;
+    master)
+      if (( CURRENT == cmd_i + 1 )); then
+        projects=("${(@f)$("$_bin" --complete-projects "$PREFIX" 2>/dev/null)}")
+        _describe -t projects 'project' projects
+      fi
+      return 0
       ;;
     park)
       return 0
@@ -2067,6 +2133,16 @@ find_task_window() {
   fi
 
   return 1
+}
+
+# A master lives only in the projects session, so there is no two-session search
+# here and no '--big' equivalent: one window per project, named after it.
+find_master_window() {
+  local project="$1"
+  local line=""
+
+  line="$(find_window_in_session "$PROJECTS_SESSION" "$project")" || return 1
+  printf '%s\n' "${line%% *}"
 }
 
 # Returns non-zero when the window cannot be selected, so callers that have a
@@ -2535,6 +2611,19 @@ project_root_from_cwd() {
   return 1
 }
 
+# Standing in a project directory and not in a task: the master's own position.
+# One predicate for all three behaviours that key off it — inferring -p when a
+# task is created, detaching so spawning one does not drag the client out of the
+# projects session, and refusing the verbs that destroy work.
+#
+# It is a guardrail, not a sandbox: an agent that cds elsewhere first is out of
+# its reach, and it is meant to catch the accident rather than the intent.
+in_master_context() {
+  [[ -n "$PROJECTS_DIR" ]] || return 1
+  task_root_from_cwd >/dev/null 2>&1 && return 1
+  project_root_from_cwd >/dev/null 2>&1
+}
+
 # The task a command should act on: the one named, or the one we are standing
 # in. Same inference 'iwork todo' already uses, so a task name only has to be
 # spelled out when it is not the current one.
@@ -2832,7 +2921,7 @@ attach_task_to_project() {
   write_project_block "$task" "$project" "$branch" "$seed"
 
   if [[ -z "$already" ]]; then
-    append_history "$project" opened "$task" "$(task_repos_csv "$task")" "$branch" ""
+    append_history "$project" opened "$task" "$(task_repos_csv "$task")" "$branch" "${BASE_SPEC:+from=$BASE_SPEC}"
     echo "Task '$task' joined project '$project'"
   else
     echo "Task '$task' is already in project '$project' (context refreshed)"
@@ -3047,7 +3136,10 @@ append_history() {
     >> "$PROJECTS_DIR/$project/history.tsv" || warn "could not append to history.tsv"
 }
 
-AGENTS_HEADER=$'# timestamp\tevent\ttask\tsession\tpid\tpane\ttranscript'
+# 'role' is appended rather than inserted: project files written before masters
+# existed keep every field where project_agents already expects it, and their
+# rows read back as the task agents they were.
+AGENTS_HEADER=$'# timestamp\tevent\ttask\tsession\tpid\tpane\ttranscript\trole'
 
 # Set from the hook payload, because the transcript path is the one field the
 # environment does not carry.
@@ -3063,6 +3155,7 @@ append_agent() {
   local project="$1"
   local event="$2"
   local task="$3"
+  local role="${4:-task}"
   local file="$PROJECTS_DIR/$project/agents.tsv"
 
   # No session id means this is not a Claude session — a bare shell running
@@ -3076,10 +3169,11 @@ append_agent() {
       { warn "could not create agents.tsv"; return 1; }
   fi
 
-  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
     "$(date +%Y-%m-%dT%H:%M:%S%z)" "$event" "$(oneline "$task")" \
     "$(oneline "$CLAUDE_CODE_SESSION_ID")" "$(oneline "${CLAUDE_PID:-}")" \
     "$(oneline "${TMUX_PANE:-}")" "$(oneline "$HOOK_TRANSCRIPT")" \
+    "$(oneline "$role")" \
     >> "$file" || { warn "could not append to agents.tsv"; return 1; }
 }
 
@@ -3243,20 +3337,20 @@ human_age() {
 # project_lock uses for a dead lock holder.
 #
 # Emits one record per live agent, fields separated by US (0x1f):
-#   task, session, pid, pane, transcript
+#   task, session, pid, pane, transcript, role
 #
 # Not tab-separated, because tab is IFS *whitespace*: 'read' collapses runs of
 # it, so one empty column shifts every field after it. A row with no pid but a
 # pane read the pane as the pid, and 'kill -0 %3' then dropped a live agent from
-# the listing that exists to find it. US is not whitespace, so empties survive.
+# the listing. US is not whitespace, so empty fields survive.
 project_agents() {
   local project="$1"
   local file="$PROJECTS_DIR/$project/agents.tsv"
-  local task="" session="" pid="" pane="" transcript=""
+  local task="" session="" pid="" pane="" transcript="" role=""
 
   [[ -f "$file" ]] || return 0
 
-  while IFS=$'\037' read -r task session pid pane transcript; do
+  while IFS=$'\037' read -r task session pid pane transcript role; do
     [[ -n "$session" ]] || continue
 
     # A pid that cannot be signalled is a session that is gone. An empty pid is
@@ -3270,19 +3364,20 @@ project_agents() {
       continue
     fi
 
-    printf '%s\037%s\037%s\037%s\037%s\n' "$task" "$session" "$pid" "$pane" "$transcript"
+    printf '%s\037%s\037%s\037%s\037%s\037%s\n' "$task" "$session" "$pid" "$pane" "$transcript" "${role:-task}"
   done < <(awk -F'\t' '
     /^#/ { next }
     NF >= 4 && $4 != "" {
       if (!($4 in seen)) { seen[$4] = 1; order[++n] = $4 }
       event[$4] = $2; task[$4] = $3; pid[$4] = $5; pane[$4] = $6; trans[$4] = $7
+      role[$4] = ($8 == "" ? "task" : $8)
     }
     END {
       OFS = "\037"
       for (i = 1; i <= n; i++) {
         s = order[i]
         if (event[s] == "ended") continue
-        print task[s], s, pid[s], pane[s], trans[s]
+        print task[s], s, pid[s], pane[s], trans[s], role[s]
       }
     }
   ' "$file" 2>/dev/null)
@@ -3290,20 +3385,27 @@ project_agents() {
 
 project_agents_show() {
   local project="$1"
-  local task="" session="" pid="" pane="" transcript=""
-  local found="" age="" last=""
+  local task="" session="" pid="" pane="" transcript="" role=""
+  local found="" age="" last="" label=""
 
   echo "Agents (live) in project '$project':"
 
   # Grouped by task, because "who is working on what" is the question this
-  # answers; a task with two agents should name itself once.
-  while IFS=$'\037' read -r task session pid pane transcript; do
+  # answers; a task with two agents should name itself once. The master has no
+  # task, so it is grouped under its role instead of under a blank line.
+  while IFS=$'\037' read -r task session pid pane transcript role; do
     [[ -n "$session" ]] || continue
     found=1
 
-    if [[ "$task" != "$last" ]]; then
-      printf '  %s\n' "${task:-unknown}"
-      last="$task"
+    if [[ "$role" == "master" ]]; then
+      label="(master)"
+    else
+      label="${task:-(no task)}"
+    fi
+
+    if [[ "$label" != "$last" ]]; then
+      printf '  %s\n' "$label"
+      last="$label"
     fi
 
     printf '    session %s' "$session"
@@ -3314,7 +3416,7 @@ project_agents_show() {
     if [[ -n "$transcript" ]] && age="$(file_age_seconds "$transcript")"; then
       printf '    last active %s ago\n' "$(human_age "$age")"
     fi
-  done < <(project_agents "$project" | sort -t $'\037' -k1,1 -s)
+  done < <(project_agents "$project" | sort -t $'\037' -k6,6 -k1,1 -s)
 
   if [[ -z "$found" ]]; then
     echo "  (none)"
@@ -3350,8 +3452,16 @@ project_show() {
   fi
 
   echo ""
+  if project_agents "$project" | awk -F'\037' '$6 == "master" { found = 1 } END { exit !found }'; then
+    echo "Master: live"
+  else
+    echo "Master: not running"
+  fi
+
+  echo ""
   echo "Tasks (live):"
   found=""
+  # Field 1 is the task; a master's is empty, so it counts against no task.
   agent_tasks="$(project_agents "$project" | cut -d $'\037' -f1 || true)"
   while IFS= read -r line; do
     [[ -n "$line" ]] || continue
@@ -3491,14 +3601,50 @@ project_grep() {
   fi
 }
 
+# The window an agent runs in: the tool on the left, a shell on the right, both
+# rooted at $dir, creating $session if it is not there yet. Prints the window id.
+#
+# Finding an existing window is the caller's job, not this function's: a task can
+# be in either of two sessions while a master is only ever in one.
+spawn_agent_window() {
+  local session="$1"
+  local name="$2"
+  local dir="$3"
+  local tool="$4"
+  shift 4
+  local window_id=""
+  local pane_id=""
+  local tool_cmd=""
+
+  if tmux has-session -t "=$session" 2>/dev/null; then
+    # -d keeps the new window from becoming the session's active window, which
+    # would move the client if it is already viewing that session.
+    if ! IFS=' ' read -r window_id pane_id < <(tmux new-window ${IWORK_DETACH:+-d} -t "=$session" -n "$name" -c "$dir" -P -F '#{window_id} #{pane_id}' 2>/dev/null); then
+      warn "could not create tmux window '$name'"
+      return 1
+    fi
+  else
+    if ! IFS=' ' read -r window_id pane_id < <(tmux new-session -d -s "$session" -n "$name" -c "$dir" -P -F '#{window_id} #{pane_id}' 2>/dev/null); then
+      warn "could not create tmux session '$session'"
+      return 1
+    fi
+  fi
+
+  tmux split-window -h -t "$pane_id" -c "$dir" 2>/dev/null || warn "could not split tmux window '$name'"
+  tmux select-pane -t "$pane_id" 2>/dev/null || true
+
+  printf -v tool_cmd '%q ' "$tool" "$@"
+  tmux send-keys -t "$pane_id" "$tool_cmd" Enter 2>/dev/null || warn "could not start $tool in tmux window '$name'"
+
+  printf '%s\n' "$window_id"
+}
+
 open_task_window() {
   local folder="$1"
   local tool="$2"
   shift 2
   local folder_path="$TASKS_DIR/$folder"
   local window_id=""
-  local pane_id=""
-  local tool_cmd=""
 
   tmux_enabled || return 0
   [[ -d "$folder_path" ]] || return 0
@@ -3515,29 +3661,44 @@ open_task_window() {
     return 0
   fi
 
-  if tmux has-session -t "=$TASKS_SESSION" 2>/dev/null; then
-    # -d keeps the new window from becoming the session's active window, which
-    # would move the client if it is already viewing the tasks session.
-    if ! IFS=' ' read -r window_id pane_id < <(tmux new-window ${IWORK_DETACH:+-d} -t "=$TASKS_SESSION" -n "$folder" -c "$folder_path" -P -F '#{window_id} #{pane_id}' 2>/dev/null); then
-      warn "could not create tmux window '$folder'"
-      return 0
-    fi
-  else
-    if ! IFS=' ' read -r window_id pane_id < <(tmux new-session -d -s "$TASKS_SESSION" -n "$folder" -c "$folder_path" -P -F '#{window_id} #{pane_id}' 2>/dev/null); then
-      warn "could not create tmux session '$TASKS_SESSION'"
-      return 0
-    fi
-  fi
-
-  tmux split-window -h -t "$pane_id" -c "$folder_path" 2>/dev/null || warn "could not split tmux window '$folder'"
-  tmux select-pane -t "$pane_id" 2>/dev/null || true
-
-  printf -v tool_cmd '%q ' "$tool" "$@"
-  tmux send-keys -t "$pane_id" "$tool_cmd" Enter 2>/dev/null || warn "could not start $tool in tmux window '$folder'"
+  window_id="$(spawn_agent_window "$TASKS_SESSION" "$folder" "$folder_path" "$tool" "$@")" || return 0
 
   if [[ -n "$IWORK_DETACH" ]]; then
     echo "Started $tool in detached tmux window '$folder' (session '$TASKS_SESSION')"
     echo "  attach with: iwork cd $folder"
+    return 0
+  fi
+
+  switch_to_window "$window_id" || true
+}
+
+open_master_window() {
+  local project="$1"
+  local tool="$2"
+  shift 2
+  local project_path="$PROJECTS_DIR/$project"
+  local window_id=""
+
+  tmux_enabled || return 0
+  [[ -d "$project_path" ]] || return 0
+
+  if window_id="$(find_master_window "$project")"; then
+    # One master per project. A second one would plan against the same
+    # PROJECT.md and spawn overlapping tasks, with neither aware of the other.
+    warn_message_undelivered "a master is already open for project '$project'"
+    if [[ -n "$IWORK_DETACH" ]]; then
+      echo "master for project '$project' is already open (not switching)"
+      return 0
+    fi
+    switch_to_window "$window_id" || true
+    return 0
+  fi
+
+  window_id="$(spawn_agent_window "$PROJECTS_SESSION" "$project" "$project_path" "$tool" "$@")" || return 0
+
+  if [[ -n "$IWORK_DETACH" ]]; then
+    echo "Started $tool as master for project '$project' (session '$PROJECTS_SESSION')"
+    echo "  attach with: tmux attach -t $PROJECTS_SESSION"
     return 0
   fi
 
@@ -3676,6 +3837,7 @@ extend_task_session() {
 
 HOOK_TASK=""
 HOOK_PROJECT=""
+HOOK_ROLE=""
 
 # Which task and project the hook fired in, from its working directory. Silent
 # and non-fatal throughout: a hook must never break a session, so every path out
@@ -3683,17 +3845,69 @@ HOOK_PROJECT=""
 hook_project_context() {
   HOOK_TASK=""
   HOOK_PROJECT=""
+  HOOK_ROLE=""
 
   [[ -n "$TASKS_DIR" && -n "$PROJECTS_DIR" ]] || return 1
 
   HOOK_TASK="$(task_root_from_cwd 2>/dev/null || true)"
-  [[ -n "$HOOK_TASK" ]] || return 1
 
-  HOOK_PROJECT="$(task_project_name "$HOOK_TASK" 2>/dev/null || true)"
-  [[ -n "$HOOK_PROJECT" ]] || return 1
+  # Standing in the project rather than in one of its tasks is the master.
+  # Requiring a task here left every project-memory hook dead in the one session
+  # that is entirely about project memory.
+  if [[ -z "$HOOK_TASK" ]]; then
+    HOOK_PROJECT="$(project_root_from_cwd 2>/dev/null || true)"
+    [[ -n "$HOOK_PROJECT" ]] || return 1
+    HOOK_ROLE="master"
+  else
+    HOOK_PROJECT="$(task_project_name "$HOOK_TASK" 2>/dev/null || true)"
+    [[ -n "$HOOK_PROJECT" ]] || return 1
+    HOOK_ROLE="task"
+  fi
 
   project_exists "$HOOK_PROJECT" || return 1
   return 0
+}
+
+# The master's role is defined here rather than in a CLAUDE.md next to
+# PROJECT.md. A file would have to be named CLAUDE.md to be loaded at all, and
+# link_task_project symlinks this directory into every task as '.project' — so a
+# task agent that opened it would inherit instructions telling it to spawn tasks.
+# Delivering the role through the hook removes that path instead of mitigating
+# it, and leaves nothing hand-edited for 'project delete' to take with it.
+hook_master_brief() {
+  echo "iwork: you are the master session for project '$HOOK_PROJECT'."
+  echo ""
+  project_show "$HOOK_PROJECT" 2>/dev/null || true
+  echo ""
+  echo "Your job is the project, not any one task in it: what the tasks should be,"
+  echo "what order they stack in, when one is far enough along that the next can"
+  echo "branch off it, and whether two of them are converging on the same code."
+  echo "You do not write the code. Everything you do to a task goes through iwork."
+  echo ""
+  echo "Yours to run:"
+  echo "  iwork <branch> -r <repo...> [--from <task|branch>] [-m '<first prompt>']"
+  echo "      Spawn a task. The project and --detach are filled in for you here,"
+  echo "      so it lands in its own window without moving you out of this one."
+  echo "  iwork add-repo <task> -r <repo...>   widen a task that is already running"
+  echo "  iwork list                           every task, with its agent's state"
+  echo "  iwork project agents                 who is live, and in which task"
+  echo "  iwork project show|grep|cat          the shared memory"
+  echo "  iwork decided \"...\"  iwork todo \"...\"   record as you go"
+  echo ""
+  echo "Not yours: 'iwork rm' and 'iwork project delete' destroy worktrees and"
+  echo "memory that may hold uncommitted work in a window nobody is watching, so"
+  echo "they refuse to run from here. Ask the operator rather than working around"
+  echo "them. 'iwork park' is theirs as well."
+  echo ""
+  echo "Stacking is the reason this session exists. --from branches one task off"
+  echo "another, so a chain of PRs can be opened before the first of them merges."
+  echo "Nothing else knows that chain exists — you chose it — so write it down as"
+  echo "you build it: 'iwork decided \"B stacks on A; its PR targets A's branch\"'."
+  echo ""
+  echo "To reach a task's agent, 'iwork project agents' lists the live sessions and"
+  echo "the tmux pane each one occupies. Match a pane against your own list of live"
+  echo "sessions to get the name its harness answers to, then message that. The"
+  echo "session id in the listing is not an address."
 }
 
 # Stdout becomes context, so the agent starts already knowing the project state
@@ -3703,7 +3917,12 @@ hook_session_start() {
 
   # Registered before the brief is printed, so this session appears in the very
   # list it is about to read rather than one session behind.
-  append_agent "$HOOK_PROJECT" registered "$HOOK_TASK" 2>/dev/null || true
+  append_agent "$HOOK_PROJECT" registered "$HOOK_TASK" "$HOOK_ROLE" 2>/dev/null || true
+
+  if [[ "$HOOK_ROLE" == "master" ]]; then
+    hook_master_brief
+    return 0
+  fi
 
   echo "iwork: this task belongs to project '$HOOK_PROJECT'. Its shared memory:"
   echo ""
@@ -3723,7 +3942,7 @@ hook_session_start() {
 hook_session_end() {
   hook_project_context || return 0
 
-  append_agent "$HOOK_PROJECT" ended "$HOOK_TASK" 2>/dev/null || true
+  append_agent "$HOOK_PROJECT" ended "$HOOK_TASK" "$HOOK_ROLE" 2>/dev/null || true
 }
 
 # Fires exactly when the reasoning is about to be dropped, which is the one
@@ -3904,12 +4123,50 @@ run_init() {
       echo '# IWORK_TASKS_DIR="$IWORK_REPO_DIR/tasks"'
     fi
     echo '# IWORK_TMUX_SESSION=tasks'
+    echo '# IWORK_PROJECTS_TMUX_SESSION=projects'
     echo '# IWORK_CONTEXT_TEMPLATE="$HOME/.config/iwork/task-context.md.tmpl"'
   } > "$IWORK_CONFIG_FILE" || die "could not write $IWORK_CONFIG_FILE"
 
   echo "Wrote $IWORK_CONFIG_FILE"
   echo "  repo dir:  $repo_dir"
   echo "  tasks dir: ${tasks_dir:-$repo_dir/tasks}"
+}
+
+# Best effort, for a warning only: install_claude_hooks writes the iwork path
+# verbatim into the settings file, so its presence is the cheapest tell that the
+# hooks are there. Never fatal — a false negative costs one line of noise.
+hooks_installed() {
+  local settings="$HOME/.claude/settings.json"
+
+  [[ -f "$settings" ]] || return 1
+  grep -qF -- "$SELF_PATH" "$settings" 2>/dev/null
+}
+
+start_master() {
+  local project="$1"
+  local dir="$PROJECTS_DIR/$project"
+
+  [[ -d "$dir" ]] || die "no such project: $project"
+
+  # The role is delivered by the SessionStart hook and by nothing else, so
+  # without the hooks this comes up as an ordinary agent sitting in a directory
+  # of markdown, with no idea that it is meant to be running the project.
+  hooks_installed ||
+    warn "the iwork Claude hooks are not installed, so this session gets no role and no project brief. Run 'iwork install-hooks' first."
+
+  # A master is meant to be reachable from another terminal or another client,
+  # so starting one from outside tmux is ordinary rather than a reason to do
+  # nothing: build the session in the background and say how to reach it.
+  if [[ -z "$IWORK_NO_TMUX" ]] && ! in_tmux; then
+    IWORK_DETACH=1
+  fi
+
+  if ! tmux_enabled; then
+    cd "$dir"
+    exec claude ${AGENT_ARGS[@]+"${AGENT_ARGS[@]}"}
+  fi
+
+  open_master_window "$project" claude ${AGENT_ARGS[@]+"${AGENT_ARGS[@]}"}
 }
 
 install_claude_hooks() {
@@ -4174,6 +4431,12 @@ cmd_project() {
       [[ -n "$proj" ]] || die "usage: iwork project delete [-f] <project>"
       require_config
       require_projects_dir
+      # Destroys strictly more than rm does, and -f skips the confirmation that
+      # a pane running an agent would answer itself. See the note on rm.
+      if in_master_context; then
+        die "'project delete' does not run from a project directory: it destroys the memory, and this is where the master sits.
+  Run it from outside the project, or ask the operator."
+      fi
       delete_project "$proj" "$force"
       ;;
     ""|-h|--help)
@@ -4471,6 +4734,19 @@ if [[ "${1:-}" == "rm" ]]; then
 
   require_config
 
+  # A master sits in the project directory. rm deletes worktrees that may hold
+  # uncommitted work in a window nobody is watching, and the confirmation that
+  # would normally catch that is no help here: confirm() reads /dev/tty, which a
+  # pane running an agent has, so the agent answers its own prompt. Spawning and
+  # redirecting tasks is the master's; tearing them down is the operator's.
+  #
+  # A guardrail rather than a sandbox — cd out and it is gone. It is here to
+  # catch the accident.
+  if in_master_context; then
+    die "'rm' does not run from a project directory: it destroys worktrees, and this is where the master sits.
+  Run it from outside the project, or ask the operator."
+  fi
+
   # rm deletes worktrees, so inferring the task from the directory has to be
   # asked for. A bare 'iwork rm' meaning "this one" is one typo away from
   # destroying the task you are standing in, and -f skips the confirmation
@@ -4536,6 +4812,37 @@ if [[ "${1:-}" == "cd" && "${2:-}" != "-r" ]]; then
   die "'iwork cd' must be run through sourced shell integration. Run: source <(iwork --completion bash) or source <(iwork --completion zsh)"
 fi
 
+if [[ "${1:-}" == "master" && "${2:-}" != "-r" ]]; then
+  shift
+  master_project=""
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -p|--project)
+        [[ $# -ge 2 ]] || die "expected a project name after $1"
+        master_project="$2"
+        shift 2
+        ;;
+      -*)
+        die "unknown option '$1'"
+        ;;
+      *)
+        [[ -z "$master_project" ]] || die "usage: iwork master [<project>]"
+        master_project="$1"
+        shift
+        ;;
+    esac
+  done
+
+  # Same resolution order as every other project verb: named, then the task's
+  # own link, then the project you are standing in, then IWORK_PROJECT.
+  resolve_project_context "$master_project"
+
+  agent_message_args
+  start_master "$RESOLVED_PROJECT"
+  exit 0
+fi
+
 if [[ "${1:-}" == "claude" && "${2:-}" != "-r" ]]; then
   if [[ $# -lt 2 ]]; then
     die "usage: iwork claude <task> [claude-args...]"
@@ -4561,6 +4868,14 @@ require_config
 validate_branch "$branch"
 
 parse_task_args "expected -r <repos> after branch name" "$@"
+
+# A master stands in its own project, so a task spawned from there belongs to it
+# without having to say so — and naming it on every line is one typo away from
+# an orphan task.
+if in_master_context; then
+  [[ -n "$PROJECT_FLAG" ]] || PROJECT_FLAG="$(project_root_from_cwd)"
+  master_default_detach
+fi
 
 # Folder name: replace / with -
 folder_name="${branch//\//-}"
