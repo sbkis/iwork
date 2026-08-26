@@ -164,6 +164,9 @@ iwork rm feat-login-bug
 # Jump back into the task (tmux window if present, else cd)
 iwork cd feat-login-bug
 
+# Open the project master: one agent whose job is the project, not a task in it
+iwork master auth-rewrite
+
 # Run an agent in the task window
 iwork claude feat-login-bug
 iwork codex feat-login-bug
@@ -368,7 +371,13 @@ Agents (live) in project 'auth-rewrite':
 asking. A task can hold several agents, so this is task → *many*; a file with
 one line per task would silently lose one.
 
-Everything in a row comes from the environment the hook already runs in
+A row also records the session's role. The project [master](#the-master-one-agent-whose-job-is-the-project)
+is listed as `(master)` rather than under a task, because it has none — and for
+the same reason it is not counted against one. The column is appended rather
+than inserted, so an `agents.tsv` written before masters existed keeps every
+field where it was and reads back as the task agents it recorded.
+
+Everything else in a row comes from the environment the hook already runs in
 (`CLAUDE_CODE_SESSION_ID`, `CLAUDE_PID`, `TMUX_PANE`), plus `transcript_path`
 from the payload — pulled out with the same `sed` that reads the event name, so
 the hook still needs no JSON parser.
@@ -379,6 +388,35 @@ why the tmux pane is recorded too. That is the field a coordinating agent can
 match against its list of live sessions to turn a row into something it can
 message. Storing the session id alone would produce a registry naming agents
 that nothing could reach.
+
+### Joining the listing to something you can message
+
+```bash
+iwork project agents --json    # one object per live session, with api_version
+iwork project agents --tsv     # the same fields for awk, cut and fzf
+```
+
+Reading the listing tells you who is live. Acting on it means turning a row into
+a name your harness will accept, and that is a join: match a row against your own
+list of live sessions — on the session id if your harness exposes one, otherwise
+on the tmux pane — and message the name that comes back.
+
+The session id is a join key, not an address. `--json` exists so the
+[master](#the-master-one-agent-whose-job-is-the-project) can do that join
+mechanically instead of by eye; the columns are `task`, `role`, `session`, `pid`,
+`pane`, `transcript`, `last_active_seconds`, and absent values are `null` rather
+than `""` so a consumer testing for a pane does not have to know that an empty
+string means there is none. `api_version` is there for the reason any
+out-of-process consumer needs one — to detect skew rather than guess.
+
+There is deliberately no `iwork say <task> "..."`. Typing into another agent's
+pane is not safe, and iwork already knows it: `open_task_window` refuses to
+deliver `-m` into a window that is already open, because the pane may be sitting
+at a shell rather than at an agent. `agents.tsv` is better evidence than that
+path has — a registered session, a pid `kill -0` confirms, a transcript whose
+mtime shows activity — but none of it says the pane is at a prompt rather than
+mid-tool-call, and a stray Enter into a permission dialog answers it. The join
+above goes through the harness, which knows.
 
 **Liveness is derived, never stored** — the same rule the rest of the project
 memory follows. `agents.tsv` is an append-only log of registrations and
@@ -410,6 +448,142 @@ iwork project show
 Standing in the project beats `IWORK_PROJECT` for the same reason a task's
 `.project` link does: an env var exported once in a shell profile must not
 quietly redirect the thing in front of you.
+
+### The master: one agent whose job is the project
+
+```bash
+iwork master auth-rewrite          # or bare `iwork master` from inside the project
+tmux attach -t projects            # from a second terminal, or a second client
+```
+
+Every other session iwork starts is scoped to one task, one branch, one set of
+worktrees, and is told to stay inside them. That is right for the work and wrong
+for the shape of the work: what the tasks should be, what order they stack in,
+when one is far enough along that the next can branch off it, whether two of them
+are converging on the same file. The master is the session for that.
+
+It gets a window of its own, named after the project, in a separate `projects`
+session — not a window in `tasks`. A separate session because it is the thing you
+want in front of you while the tasks are not: attach to it from another terminal
+or another client and leave it there. Started from outside tmux it builds that
+session in the background and tells you how to reach it.
+
+Its cwd is the project directory, which is what makes it cheap: every project
+verb already resolves the project from where you are standing, so `iwork project
+show`, `project agents`, `todo` and `decided` all work there with no arguments.
+
+**Stacked PRs are the case it earns its keep on.** `--from` already builds the
+chain; nothing knew the chain existed. The master does, because it chose the
+split — that task B branched off A, that B's PR targets A's branch rather than
+main, that when A merges the rest need rebasing. What it decides goes into the
+log as it goes, so the chain survives the session that planned it. The base a
+task was stacked on is recorded in `history.tsv` too, which is what lets the
+stack be reconstructed after the task folders are gone.
+
+Standing in the project directory changes three things, so the master never has
+to spell them out:
+
+| From the project directory | Why |
+|---|---|
+| a new task joins that project without `-p` | naming it on every line is one typo from an orphan task |
+| tasks are created detached | otherwise spawning one calls `switch-client` and drags your client into the tasks session |
+| `rm` and `project delete` refuse | they destroy worktrees and memory, and that stays yours |
+
+The last one is a guardrail rather than a sandbox — `cd` out and it is gone. It
+is there to catch the accident. The reason it cannot rely on the usual
+confirmation is that `confirm()` reads `/dev/tty`, which a tmux pane running an
+agent has: the prompt would be answered by the agent it was meant to stop.
+
+**The master's instructions come from the `SessionStart` hook**, not from a
+`CLAUDE.md` in the project directory. That is deliberate. A file would have to be
+named `CLAUDE.md` to be loaded at all, and `.project` symlinks the project into
+every task — so a task agent that opened it would inherit instructions telling it
+to spawn tasks. Delivering the role through the hook removes that path instead of
+mitigating it, and leaves nothing hand-edited for `project delete` to take with
+it. The cost is that `install-hooks` is not optional here: without it the master
+comes up as an ordinary agent in a directory of markdown, and says so rather than
+looking fine.
+
+`project agents` marks it as `(master)` and `project show` carries one line for
+it, so every task agent can see whether a coordinator is live. It is not counted
+against any task: its row has no task, by definition.
+
+### Talking to the tasks
+
+```bash
+iwork say feat-token-api "when you get a chance, rename that field"
+iwork say --urgent feat-token-api "stop — the base you branched from moved"
+iwork reply "shape is opaque now; feat-refresh needs a rebase"   # from a task
+iwork inbox                                                      # what is queued for me
+```
+
+A master that can only watch is a dashboard. `say` queues a message for the
+agent running in a task; `reply` sends one back from a task to the master.
+Neither types into anyone's terminal.
+
+**Ordinary messages wait for a natural break.** They are read at the recipient's
+next prompt, alongside whatever comes next, so work already under way is not
+disturbed. Most of what a master has to say can wait that long, and a task
+halfway through a refactor is the worst possible moment to redirect it.
+
+**`--urgent` takes the agent's stopping point away.** It is delivered the instant
+the current turn ends, and the agent carries straight on with it instead of
+stopping. That is worth spending when letting the work continue would waste it —
+the base it branched from has moved, the approach was settled elsewhere, the task
+is now redundant — and not for status questions or to hurry something along.
+
+Either way the message is queued on disk, so one sent to a task that is not
+running is delivered at its next session start rather than lost.
+
+The `Stop` path is what makes `--urgent` possible, and it is worth knowing why it
+looks the way it does. Plain stdout on `Stop` goes to Claude Code's debug log and
+nowhere else, so a message printed there would vanish silently. It comes back as
+the *blocking reason* on exit 2 instead — the one form that both reaches the
+model and keeps the agent going. That cannot loop: the drain records messages
+delivered before the block is taken, so the `Stop` that fires next has nothing
+urgent pending and exits 0. There is a test for exactly that, because a `Stop`
+hook that always blocks is an agent that can never finish.
+
+`inbox.tsv` follows the rules the rest of the project memory follows: append-only,
+one line per event, `sent` and `delivered` as separate rows. What is pending is
+derived by reducing the file on read, never stored — the same reason
+`project agents` derives liveness rather than keeping a registry that starts
+lying the moment a delivery is missed. Drains take the project lock, and re-read
+under it, so two hooks firing at once cannot deliver the same message twice.
+
+The recipient of a `reply` is the empty task name, which is the master's address
+by construction: a task can never be addressed by an empty name, and the master
+has no task. A literal `master` recipient would have collided with a task of
+that name.
+
+**What the inbox does not do is wake anyone.** An agent that has finished its
+turn and is sitting at its prompt gets the message the moment it is next
+prompted, but nothing prompts it — no hook fires again until something does.
+
+That case is covered, just not by iwork. The master is itself a Claude Code
+session, and Claude Code sessions on one machine address each other by name;
+`project agents --json` exists to supply the key that finds the name:
+
+```
+agents.tsv     session 1e0c8e77-…                        tmux pane %136
+the harness    feat-project-memory-9c [1e0c8e] · idle ·  tmux tasks:@55.%136
+```
+
+**Pair them on the pane.** It is recorded on both sides, matches exactly, and is
+the only key that separates two agents working in the same task — which the rest
+of this section exists to say is a thing that happens. The short id beside the
+name is a prefix of `CLAUDE_CODE_SESSION_ID`, so it confirms a pairing, and it
+is what a harness wants when two sessions share a name.
+
+Then message the name, not the id — for the reason stated further up: *the
+session id is not an address*. So the division is: **message the session to make something
+happen now, queue in the inbox to make sure it happens at all.** The inbox
+outlives a session that is not running, reaches an agent whose harness offers no
+messaging, and leaves a record of what was asked; session messaging wakes an
+agent that is sitting idle. A master doing real work uses both.
+
+Typing into another agent's pane remains something iwork will not do on your
+behalf — see the note above. It is not needed for this.
 
 ### Joining work already in flight
 
@@ -706,6 +880,7 @@ overrides.
 | `IWORK_TASKS_DIR` | `$IWORK_REPO_DIR/tasks` | Where task folders are created |
 | `IWORK_PROJECTS_DIR` | `$IWORK_REPO_DIR/projects` | Where project memory lives (see [Projects](#projects-memory-across-many-tasks)) |
 | `IWORK_TMUX_SESSION` | `tasks` | tmux session that holds task windows |
+| `IWORK_PROJECTS_TMUX_SESSION` | `projects` | tmux session that holds project master windows (see [The master](#the-master-one-agent-whose-job-is-the-project)). Must differ from `IWORK_TMUX_SESSION`, or a task lookup could answer with a master |
 | `IWORK_CONTEXT_TEMPLATE` | `~/.config/iwork/task-context.md.tmpl` | Template for the generated `CLAUDE.md`/`AGENTS.md` (seeded with a default on first use, then yours to edit) |
 | `IWORK_PROJECT_TEMPLATE` | `~/.config/iwork/project-context.md.tmpl` | Template for the project block injected into those files (same deal: seeded once, then yours) |
 | `IWORK_PROJECT` | unset | Fallback project for `todo`/`log`/`decided`/`done`/`drop`. A task's own `.project` link always wins over it; `-p` wins over both |

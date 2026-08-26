@@ -2224,6 +2224,463 @@ TMPL
   assert_contains "add-repo still says the list is stale" "iwork:repos" "$out"
 }
 
+
+# --- master ------------------------------------------------------------------
+
+test_master_hook_gives_the_project_role() {
+  mk_repo backend
+  iw feat/one -r backend -p myproj >/dev/null 2>&1
+
+  local out
+  out="$(hook_fire "$SB_PROJECTS/myproj" '{"hook_event_name":"SessionStart"}')"
+  assert_contains "says which project it is master of" \
+    "master session for project 'myproj'" "$out"
+  assert_contains "carries the project brief" "Tasks (live)" "$out"
+  assert_contains "names the verb that spawns a task" "iwork <branch> -r" "$out"
+  assert_contains "keeps rm on the operator's side" "iwork rm" "$out"
+  assert_contains "explains what the session is for" "stacks on" "$out"
+  assert_contains "and how to reach a task's agent" "iwork say <task>" "$out"
+  # The inbox cannot wake an agent that is already at its prompt; the brief has
+  # to say so, or the master waits on a message that will never be read.
+  assert_contains "and how to wake an idle one" "go through your own harness" "$out"
+  assert_contains "naming the key it pairs on" "pair them on that pane" "$out"
+  assert_contains "and that a name is what it addresses" "by name" "$out"
+
+  # The two roles are mutually exclusive: a master told to stay inside one task
+  # is a master that will not spawn the next one.
+  case "$out" in
+    *"this task belongs to project"*) bad "gave the master the task brief" ;;
+    *) ok ;;
+  esac
+}
+
+test_task_session_still_gets_the_task_brief() {
+  mk_repo backend
+  iw feat/one -r backend -p myproj >/dev/null 2>&1
+
+  local out
+  out="$(hook_fire "$SB_TASKS/feat-one" '{"hook_event_name":"SessionStart"}')"
+  assert_contains "a task still gets the task brief" "this task belongs to project" "$out"
+  case "$out" in
+    *"master session for project"*) bad "gave a task the master brief" ;;
+    *) ok ;;
+  esac
+}
+
+test_master_registers_with_its_role() {
+  mk_repo backend
+  iw feat/one -r backend -p myproj >/dev/null 2>&1
+
+  local WANT_SESSION_ID="sess-master" WANT_CLAUDE_PID="$$"
+  hook_fire "$SB_PROJECTS/myproj" '{"hook_event_name":"SessionStart"}' >/dev/null
+
+  local out
+  out="$(iw project agents myproj 2>&1)"
+  assert_contains "the master is listed" "sess-master" "$out"
+  assert_contains "under its role rather than as an unknown task" "(master)" "$out"
+
+  out="$(iw project show myproj 2>&1)"
+  assert_contains "project show says the master is live" "Master: live" "$out"
+
+  # It belongs to the project, not to any task in it.
+  case "$out" in
+    *"1 agent"*) bad "counted the master against a task" ;;
+    *) ok ;;
+  esac
+}
+
+test_master_deregisters_on_session_end() {
+  mk_repo backend
+  iw feat/one -r backend -p myproj >/dev/null 2>&1
+
+  local WANT_SESSION_ID="sess-master" WANT_CLAUDE_PID="$$"
+  hook_fire "$SB_PROJECTS/myproj" '{"hook_event_name":"SessionStart"}' >/dev/null
+  hook_fire "$SB_PROJECTS/myproj" '{"hook_event_name":"SessionEnd"}' >/dev/null
+
+  assert_contains "the master is gone from the listing" "(none)" \
+    "$(iw project agents myproj 2>&1)"
+  assert_contains "and project show says so" "Master: not running" \
+    "$(iw project show myproj 2>&1)"
+}
+
+test_master_resolves_the_project_from_where_it_stands() {
+  mk_repo backend
+  iw feat/one -r backend -p myproj >/dev/null 2>&1
+
+  # --no-tmux is the default in the sandbox, so this cds and execs the claude
+  # stub: what is under test is which project it resolved before doing so.
+  assert_ok "from inside a task, through its .project link" \
+    iw_in "$SB_TASKS/feat-one" master
+  assert_ok "from the project directory itself" \
+    iw_in "$SB_PROJECTS/myproj" master
+  assert_ok "named explicitly from anywhere" iw master myproj
+  assert_fails "an unknown project is refused" iw master nosuchproject
+  assert_fails "and so is a second positional" iw master myproj otherproj
+}
+
+test_master_says_when_the_hooks_are_missing() {
+  mk_repo backend
+  iw feat/one -r backend -p myproj >/dev/null 2>&1
+
+  # The role is delivered by the SessionStart hook and by nothing else, so a
+  # master started without it comes up as an ordinary agent in a markdown
+  # directory. Coming up looking fine is the failure mode worth catching.
+  assert_contains "warns that the session will have no role" "install-hooks" \
+    "$(iw master myproj 2>&1)"
+}
+
+test_master_window_is_created_and_reused() {
+  command -v tmux >/dev/null 2>&1 || { printf '    skip (no tmux)\n'; return 0; }
+  mk_repo backend
+  iw feat/one -r backend -p myproj >/dev/null 2>&1
+
+  WANT_TMUX=1 iw master myproj >/dev/null 2>&1
+
+  local windows
+  windows="$(tmux_t list-windows -t projects -F '#{window_name}' 2>/dev/null | tr '\n' ' ')"
+  assert_contains "a master window was created in the projects session" "myproj" "$windows"
+
+  # Two masters would plan against the same PROJECT.md and spawn overlapping
+  # tasks, with neither aware of the other.
+  assert_contains "a second master is refused" "already open" \
+    "$(WANT_TMUX=1 iw master myproj 2>&1)"
+
+  local count
+  count="$(tmux_t list-windows -t projects -F '#{window_name}' 2>/dev/null | grep -c myproj)"
+  assert_eq "and no second window was made" "1" "$(printf '%s' "$count" | tr -d ' ')"
+
+  # The tasks session is not where a master lives.
+  local task_windows
+  task_windows="$(tmux_t list-windows -t tasks -F '#{window_name}' 2>/dev/null | tr '\n' ' ')"
+  case "$task_windows" in
+    *myproj*) bad "the master landed in the tasks session" ;;
+    *) ok ;;
+  esac
+}
+
+test_task_created_from_the_project_directory_joins_it() {
+  mk_repo backend
+  iw feat/one -r backend -p myproj >/dev/null 2>&1
+
+  iw_in "$SB_PROJECTS/myproj" feat/two -r backend >/dev/null 2>&1
+  assert_link "the new task was attached without -p" "$SB_TASKS/feat-two/.project"
+  assert_eq "to the project it was created from" "myproj" \
+    "$(basename "$(readlink "$SB_TASKS/feat-two/.project")")"
+}
+
+test_rm_refuses_from_the_project_directory() {
+  mk_repo backend
+  iw feat/one -r backend -p myproj >/dev/null 2>&1
+
+  # confirm() reads /dev/tty, which a pane running an agent has, so the prompt
+  # that would normally catch this is answered by the agent itself.
+  assert_fails "rm refuses from the project directory" \
+    iw_in "$SB_PROJECTS/myproj" rm -f feat-one
+  assert_dir "and the task is still there" "$SB_TASKS/feat-one"
+  assert_contains "saying where it will run instead" "ask the operator" \
+    "$(iw_in "$SB_PROJECTS/myproj" rm -f feat-one 2>&1)"
+
+  # From outside the project it is the operator's again.
+  assert_ok "but not from outside the project" iw rm -f feat-one
+}
+
+test_project_delete_refuses_from_the_project_directory() {
+  mk_repo backend
+  iw feat/one -r backend -p myproj >/dev/null 2>&1
+
+  assert_fails "project delete refuses from the project directory" \
+    iw_in "$SB_PROJECTS/myproj" project delete -f myproj
+  assert_dir "and the memory is still there" "$SB_PROJECTS/myproj"
+}
+
+test_from_is_recorded_in_the_project_history() {
+  mk_repo backend
+  iw feat/one -r backend -p myproj >/dev/null 2>&1
+  iw feat/two --from feat-one -r backend -p myproj >/dev/null 2>&1
+
+  # Once the task folders are gone this is the only record that the stack
+  # existed, which is the point at which the stack matters.
+  assert_grep "the base a task was stacked on is recorded" "from=feat-one" \
+    "$SB_PROJECTS/myproj/history.tsv"
+  assert_eq "and only the stacked task records one" "1" \
+    "$(grep -c 'from=' "$SB_PROJECTS/myproj/history.tsv" | tr -d ' ')"
+}
+
+test_agents_row_with_a_pane_but_no_pid_still_lists() {
+  mk_repo backend
+  iw feat/one -r backend -p myproj >/dev/null 2>&1
+
+  # Tab is IFS whitespace, so 'read' collapsed the empty pid into the pane and
+  # this row was dropped by 'kill -0 %3'. A harness that exports a pane but no
+  # pid was invisible in the listing that exists to find it.
+  printf '2026-01-01T00:00:00+0000\tregistered\tfeat-one\tsess-pane\t\t%%3\t\ttask\n' \
+    >> "$SB_PROJECTS/myproj/agents.tsv"
+
+  local out
+  out="$(iw project agents myproj 2>&1)"
+  assert_contains "a row with a pane but no pid is still listed" "sess-pane" "$out"
+  assert_contains "and its pane is the field that survives" "%3" "$out"
+}
+
+
+test_agents_json_is_parseable_and_joinable() {
+  mk_repo backend
+  iw feat/one -r backend -p myproj >/dev/null 2>&1
+
+  local WANT_SESSION_ID="sess-task" WANT_CLAUDE_PID="$$" WANT_PANE="%7"
+  hook_fire "$SB_TASKS/feat-one" '{"hook_event_name":"SessionStart"}' >/dev/null
+
+  local out
+  out="$(iw project agents --json myproj 2>&1)"
+  assert_ok "the json parses" python3 -c 'import json,sys; json.load(sys.stdin)' <<<"$out"
+  assert_contains "carries a version for consumers to check" '"api_version": 1' "$out"
+  assert_contains "names the project" '"project": "myproj"' "$out"
+  assert_contains "carries the session id to join on" '"session": "sess-task"' "$out"
+  assert_contains "and the pane to fall back to" '"pane": "%7"' "$out"
+  assert_contains "with the role" '"role": "task"' "$out"
+
+  # An empty column is null rather than "", so a consumer testing for a pane
+  # does not have to know that "" means there is none.
+  printf '2026-01-01T00:00:00+0000\tregistered\t\tsess-bare\t\t\t\tmaster\n' \
+    >> "$SB_PROJECTS/myproj/agents.tsv"
+  out="$(iw project agents --json myproj 2>&1)"
+  assert_ok "still parses with empty columns" python3 -c 'import json,sys; json.load(sys.stdin)' <<<"$out"
+  assert_contains "a master has no task" '"task": null' "$out"
+  assert_contains "and an absent pane is null" '"pane": null' "$out"
+}
+
+test_agents_json_is_empty_but_valid_with_no_agents() {
+  mk_repo backend
+  iw feat/one -r backend -p myproj >/dev/null 2>&1
+
+  local out
+  out="$(iw project agents --json myproj 2>&1)"
+  assert_ok "an empty listing is still valid json" \
+    python3 -c 'import json,sys; d=json.load(sys.stdin); sys.exit(0 if d["agents"]==[] else 1)' <<<"$out"
+}
+
+test_agents_tsv_keeps_empty_columns_as_columns() {
+  mk_repo backend
+  iw feat/one -r backend -p myproj >/dev/null 2>&1
+
+  printf '2026-01-01T00:00:00+0000\tregistered\tfeat-one\tsess-pane\t\t%%3\t\ttask\n' \
+    >> "$SB_PROJECTS/myproj/agents.tsv"
+
+  local out
+  out="$(iw project agents --tsv myproj 2>&1)"
+  # Columns: task, role, session, pid, pane, transcript, last_active_seconds.
+  assert_eq "the pane stays in column 5 despite the empty pid" "%3" \
+    "$(printf '%s\n' "$out" | awk -F'\t' '$3 == "sess-pane" { print $5 }')"
+  assert_eq "and the role in column 2" "task" \
+    "$(printf '%s\n' "$out" | awk -F'\t' '$3 == "sess-pane" { print $2 }')"
+}
+
+test_agents_format_flags_are_exclusive() {
+  mk_repo backend
+  iw feat/one -r backend -p myproj >/dev/null 2>&1
+
+  assert_fails "--json and --tsv together are refused" \
+    iw project agents --json --tsv myproj
+  assert_fails "an unknown format flag is still refused" \
+    iw project agents --yaml myproj
+}
+
+
+# --- messaging ---------------------------------------------------------------
+
+test_say_queues_a_message_for_a_task() {
+  mk_repo backend
+  iw feat/one -r backend -p myproj >/dev/null 2>&1
+
+  local out
+  out="$(iw_in "$SB_PROJECTS/myproj" say feat-one "stop work on the refresh flow" 2>&1)"
+  assert_contains "the message is queued" "Queued m" "$out"
+  assert_contains "and says nobody is live to read it yet" "will be delivered when one starts" "$out"
+  assert_grep "it is recorded as sent" "sent" "$SB_PROJECTS/myproj/inbox.tsv"
+  assert_grep "addressed to the task" "feat-one" "$SB_PROJECTS/myproj/inbox.tsv"
+  assert_grep "and attributed to the master" "master" "$SB_PROJECTS/myproj/inbox.tsv"
+}
+
+test_inbox_shows_what_is_pending_without_consuming_it() {
+  mk_repo backend
+  iw feat/one -r backend -p myproj >/dev/null 2>&1
+  iw_in "$SB_PROJECTS/myproj" say feat-one "rebase onto feat-zero" >/dev/null 2>&1
+
+  local out
+  out="$(iw_in "$SB_TASKS/feat-one" inbox 2>&1)"
+  assert_contains "the task sees the message" "rebase onto feat-zero" "$out"
+
+  # Reading must not consume: the hook is what delivers.
+  assert_contains "and it is still pending afterwards" "rebase onto feat-zero" \
+    "$(iw_in "$SB_TASKS/feat-one" inbox 2>&1)"
+}
+
+test_a_message_is_delivered_on_the_next_prompt() {
+  mk_repo backend
+  iw feat/one -r backend -p myproj >/dev/null 2>&1
+  iw_in "$SB_PROJECTS/myproj" say feat-one "switch to opaque tokens" >/dev/null 2>&1
+
+  # UserPromptSubmit puts plain stdout in front of the model.
+  local out
+  out="$(hook_fire "$SB_TASKS/feat-one" '{"hook_event_name":"UserPromptSubmit"}')"
+  assert_contains "the message arrives with the prompt" "switch to opaque tokens" "$out"
+  assert_contains "and says how to answer" "iwork reply" "$out"
+
+  # Delivered once, not on every turn.
+  case "$(hook_fire "$SB_TASKS/feat-one" '{"hook_event_name":"UserPromptSubmit"}')" in
+    *"switch to opaque tokens"*) bad "redelivered a message that was already read" ;;
+    *) ok ;;
+  esac
+  assert_contains "and the inbox is empty" "(none)" \
+    "$(iw_in "$SB_TASKS/feat-one" inbox 2>&1)"
+}
+
+test_an_urgent_message_diverts_a_working_agent_on_stop() {
+  mk_repo backend
+  iw feat/one -r backend -p myproj >/dev/null 2>&1
+  iw_in "$SB_PROJECTS/myproj" say --urgent feat-one "stop and rebase first" >/dev/null 2>&1
+
+  # Plain stdout on Stop goes to the debug log and nowhere else, so the message
+  # has to come back as the blocking reason on exit 2 -- which is also what
+  # keeps the agent going instead of leaving it to read this next time.
+  local out rc
+  out="$(printf '%s' '{"hook_event_name":"Stop"}' | iw_in "$SB_TASKS/feat-one" --hook 2>&1)"
+  rc=$?
+  assert_eq "the stop is blocked so the agent carries on" "2" "$rc"
+  assert_contains "with the message as the reason" "stop and rebase first" "$out"
+}
+
+test_stop_without_a_message_does_not_block() {
+  mk_repo backend
+  iw feat/one -r backend -p myproj >/dev/null 2>&1
+
+  # The failure mode worth catching: a Stop hook that always blocks is an agent
+  # that can never finish.
+  assert_ok "an empty inbox lets the agent stop" \
+    iw_in "$SB_TASKS/feat-one" --hook <<<'{"hook_event_name":"Stop"}'
+
+  iw_in "$SB_PROJECTS/myproj" say --urgent feat-one "one thing" >/dev/null 2>&1
+  printf '%s' '{"hook_event_name":"Stop"}' | iw_in "$SB_TASKS/feat-one" --hook >/dev/null 2>&1
+
+  # Drained before the block was taken, so the next stop is clean.
+  assert_ok "and it stops on the turn after a delivery" \
+    iw_in "$SB_TASKS/feat-one" --hook <<<'{"hook_event_name":"Stop"}'
+}
+
+test_reply_reaches_the_master() {
+  mk_repo backend
+  iw feat/one -r backend -p myproj >/dev/null 2>&1
+
+  local out
+  out="$(iw_in "$SB_TASKS/feat-one" reply "token shape is now opaque" 2>&1)"
+  assert_contains "the reply is queued for the master" "master of project 'myproj'" "$out"
+
+  # The master reads it from the project directory, where it has no task.
+  out="$(hook_fire "$SB_PROJECTS/myproj" '{"hook_event_name":"UserPromptSubmit"}')"
+  assert_contains "and the master receives it" "token shape is now opaque" "$out"
+  assert_contains "attributed to the task it came from" "feat-one" "$out"
+}
+
+test_a_task_does_not_receive_another_tasks_messages() {
+  mk_repo backend
+  iw feat/one -r backend -p myproj >/dev/null 2>&1
+  iw feat/two -r backend -p myproj >/dev/null 2>&1
+  iw_in "$SB_PROJECTS/myproj" say feat-one "for one only" >/dev/null 2>&1
+
+  case "$(hook_fire "$SB_TASKS/feat-two" '{"hook_event_name":"UserPromptSubmit"}')" in
+    *"for one only"*) bad "delivered a message to the wrong task" ;;
+    *) ok ;;
+  esac
+  assert_contains "and the addressee still gets it" "for one only" \
+    "$(hook_fire "$SB_TASKS/feat-one" '{"hook_event_name":"UserPromptSubmit"}')"
+}
+
+test_a_message_queued_while_nobody_is_running_arrives_at_session_start() {
+  mk_repo backend
+  iw feat/one -r backend -p myproj >/dev/null 2>&1
+  iw_in "$SB_PROJECTS/myproj" say feat-one "read this when you wake up" >/dev/null 2>&1
+
+  assert_contains "a queued message survives until a session starts" \
+    "read this when you wake up" \
+    "$(hook_fire "$SB_TASKS/feat-one" '{"hook_event_name":"SessionStart"}')"
+}
+
+test_say_refuses_a_task_outside_the_project() {
+  mk_repo backend
+  iw feat/one -r backend -p myproj >/dev/null 2>&1
+  iw feat/other -r backend -p otherproj >/dev/null 2>&1
+
+  # A message filed in the wrong project is one nobody ever looks for.
+  assert_fails "a task in another project is refused" \
+    iw_in "$SB_PROJECTS/myproj" say feat-other "hello"
+  assert_fails "and so is one that does not exist" \
+    iw_in "$SB_PROJECTS/myproj" say feat-nope "hello"
+  assert_fails "reply outside a task is refused" \
+    iw_in "$SB_PROJECTS/myproj" reply "hello"
+}
+
+
+test_an_ordinary_message_does_not_interrupt_work_in_progress() {
+  mk_repo backend
+  iw feat/one -r backend -p myproj >/dev/null 2>&1
+  iw_in "$SB_PROJECTS/myproj" say feat-one "when you get a chance, rename the field" >/dev/null 2>&1
+
+  # Taking the Stop costs the agent its stopping point. Most of what a master
+  # has to say does not justify that, and a task halfway through a refactor is
+  # the worst moment to redirect it.
+  assert_ok "the agent is allowed to finish" \
+    iw_in "$SB_TASKS/feat-one" --hook <<<'{"hook_event_name":"Stop"}'
+
+  # Still queued, not consumed by the stop it declined to take.
+  assert_contains "and the message is still waiting" "rename the field" \
+    "$(iw_in "$SB_TASKS/feat-one" inbox 2>&1)"
+
+  # It arrives at the next prompt, alongside whatever comes next.
+  assert_contains "arriving with the next prompt instead" "rename the field" \
+    "$(hook_fire "$SB_TASKS/feat-one" '{"hook_event_name":"UserPromptSubmit"}')"
+}
+
+test_urgency_is_reported_when_sending() {
+  mk_repo backend
+  iw feat/one -r backend -p myproj >/dev/null 2>&1
+
+  local WANT_SESSION_ID="sess-one" WANT_CLAUDE_PID="$$"
+  hook_fire "$SB_TASKS/feat-one" '{"hook_event_name":"SessionStart"}' >/dev/null
+
+  assert_contains "an ordinary message says it will wait" "next prompted" \
+    "$(iw_in "$SB_PROJECTS/myproj" say feat-one "later" 2>&1)"
+  assert_contains "and points at the escape hatch" "--urgent" \
+    "$(iw_in "$SB_PROJECTS/myproj" say feat-one "later" 2>&1)"
+  assert_contains "an urgent one says it will interrupt" "interrupt them" \
+    "$(iw_in "$SB_PROJECTS/myproj" say --urgent feat-one "now" 2>&1)"
+}
+
+test_an_urgent_stop_leaves_ordinary_messages_queued() {
+  mk_repo backend
+  iw feat/one -r backend -p myproj >/dev/null 2>&1
+  iw_in "$SB_PROJECTS/myproj" say feat-one "the calm one" >/dev/null 2>&1
+  iw_in "$SB_PROJECTS/myproj" say --urgent feat-one "the loud one" >/dev/null 2>&1
+
+  local out
+  out="$(printf '%s' '{"hook_event_name":"Stop"}' | iw_in "$SB_TASKS/feat-one" --hook 2>&1)"
+  assert_contains "the urgent one interrupts" "the loud one" "$out"
+  case "$out" in
+    *"the calm one"*) bad "an ordinary message rode along with the interruption" ;;
+    *) ok ;;
+  esac
+  assert_contains "and it is still queued for the next prompt" "the calm one" \
+    "$(iw_in "$SB_TASKS/feat-one" inbox 2>&1)"
+}
+
+test_inbox_marks_which_messages_are_urgent() {
+  mk_repo backend
+  iw feat/one -r backend -p myproj >/dev/null 2>&1
+  iw_in "$SB_PROJECTS/myproj" say --urgent feat-one "drop everything" >/dev/null 2>&1
+
+  assert_contains "the listing says which is which" "(urgent)" \
+    "$(iw_in "$SB_TASKS/feat-one" inbox 2>&1)"
+}
+
 # --- runner -------------------------------------------------------------------
 
 echo "iwork tests  ($IWORK_SRC)"
