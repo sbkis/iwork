@@ -508,6 +508,52 @@ looking fine.
 it, so every task agent can see whether a coordinator is live. It is not counted
 against any task: its row has no task, by definition.
 
+### Talking to the tasks
+
+```bash
+iwork say feat-token-api "stop on the refresh flow — the token shape changed"
+iwork reply "shape is opaque now; feat-refresh needs a rebase"   # from a task
+iwork inbox                                                      # what is queued for me
+```
+
+A master that can only watch is a dashboard. `say` queues a message for the
+agent running in a task; `reply` sends one back from a task to the master.
+Neither types into anyone's terminal.
+
+**Delivery rides the hooks that are already installed.** A message reaches a
+working agent when it finishes its next turn, which is what makes it a redirect
+rather than a note — it lands before the agent decides what to do next. One that
+is idle gets it when it is next prompted, and one that is not running at all
+gets it at its next session start. Nothing is lost either way, because the queue
+is on disk and delivery is derived from it.
+
+The `Stop` path is the interesting one. Plain stdout on `Stop` goes to Claude
+Code's debug log and nowhere else, so a message printed there would vanish
+silently. It comes back as the *blocking reason* on exit 2 instead — the one
+form that both reaches the model and keeps the agent going rather than leaving
+it to read the message after its next human prompt. That cannot loop: the drain
+records messages delivered before the block is taken, so the `Stop` that fires
+next has nothing pending and exits 0. There is a test for exactly that, because
+a `Stop` hook that always blocks is an agent that can never finish.
+
+`inbox.tsv` follows the rules the rest of the project memory follows: append-only,
+one line per event, `sent` and `delivered` as separate rows. What is pending is
+derived by reducing the file on read, never stored — the same reason
+`project agents` derives liveness rather than keeping a registry that starts
+lying the moment a delivery is missed. Drains take the project lock, and re-read
+under it, so two hooks firing at once cannot deliver the same message twice.
+
+The recipient of a `reply` is the empty task name, which is the master's address
+by construction: a task can never be addressed by an empty name, and the master
+has no task. A literal `master` recipient would have collided with a task of
+that name.
+
+**What this does not do:** reach an agent that is sitting idle *right now*. It
+will get the message the moment it is next prompted, but nothing wakes it. For
+that, `project agents --json` still gives you the pane and session id to go
+through the harness with. Typing into another agent's pane remains something
+iwork will not do on your behalf — see the note above.
+
 ### Joining work already in flight
 
 ```bash

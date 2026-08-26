@@ -2480,6 +2480,140 @@ test_agents_format_flags_are_exclusive() {
     iw project agents --yaml myproj
 }
 
+
+# --- messaging ---------------------------------------------------------------
+
+test_say_queues_a_message_for_a_task() {
+  mk_repo backend
+  iw feat/one -r backend -p myproj >/dev/null 2>&1
+
+  local out
+  out="$(iw_in "$SB_PROJECTS/myproj" say feat-one "stop work on the refresh flow" 2>&1)"
+  assert_contains "the message is queued" "Queued m" "$out"
+  assert_contains "and says nobody is live to read it yet" "will be delivered when one starts" "$out"
+  assert_grep "it is recorded as sent" "sent" "$SB_PROJECTS/myproj/inbox.tsv"
+  assert_grep "addressed to the task" "feat-one" "$SB_PROJECTS/myproj/inbox.tsv"
+  assert_grep "and attributed to the master" "master" "$SB_PROJECTS/myproj/inbox.tsv"
+}
+
+test_inbox_shows_what_is_pending_without_consuming_it() {
+  mk_repo backend
+  iw feat/one -r backend -p myproj >/dev/null 2>&1
+  iw_in "$SB_PROJECTS/myproj" say feat-one "rebase onto feat-zero" >/dev/null 2>&1
+
+  local out
+  out="$(iw_in "$SB_TASKS/feat-one" inbox 2>&1)"
+  assert_contains "the task sees the message" "rebase onto feat-zero" "$out"
+
+  # Reading must not consume: the hook is what delivers.
+  assert_contains "and it is still pending afterwards" "rebase onto feat-zero" \
+    "$(iw_in "$SB_TASKS/feat-one" inbox 2>&1)"
+}
+
+test_a_message_is_delivered_on_the_next_prompt() {
+  mk_repo backend
+  iw feat/one -r backend -p myproj >/dev/null 2>&1
+  iw_in "$SB_PROJECTS/myproj" say feat-one "switch to opaque tokens" >/dev/null 2>&1
+
+  # UserPromptSubmit puts plain stdout in front of the model.
+  local out
+  out="$(hook_fire "$SB_TASKS/feat-one" '{"hook_event_name":"UserPromptSubmit"}')"
+  assert_contains "the message arrives with the prompt" "switch to opaque tokens" "$out"
+  assert_contains "and says how to answer" "iwork reply" "$out"
+
+  # Delivered once, not on every turn.
+  case "$(hook_fire "$SB_TASKS/feat-one" '{"hook_event_name":"UserPromptSubmit"}')" in
+    *"switch to opaque tokens"*) bad "redelivered a message that was already read" ;;
+    *) ok ;;
+  esac
+  assert_contains "and the inbox is empty" "(none)" \
+    "$(iw_in "$SB_TASKS/feat-one" inbox 2>&1)"
+}
+
+test_a_message_diverts_a_working_agent_on_stop() {
+  mk_repo backend
+  iw feat/one -r backend -p myproj >/dev/null 2>&1
+  iw_in "$SB_PROJECTS/myproj" say feat-one "stop and rebase first" >/dev/null 2>&1
+
+  # Plain stdout on Stop goes to the debug log and nowhere else, so the message
+  # has to come back as the blocking reason on exit 2 -- which is also what
+  # keeps the agent going instead of leaving it to read this next time.
+  local out rc
+  out="$(printf '%s' '{"hook_event_name":"Stop"}' | iw_in "$SB_TASKS/feat-one" --hook 2>&1)"
+  rc=$?
+  assert_eq "the stop is blocked so the agent carries on" "2" "$rc"
+  assert_contains "with the message as the reason" "stop and rebase first" "$out"
+}
+
+test_stop_without_a_message_does_not_block() {
+  mk_repo backend
+  iw feat/one -r backend -p myproj >/dev/null 2>&1
+
+  # The failure mode worth catching: a Stop hook that always blocks is an agent
+  # that can never finish.
+  assert_ok "an empty inbox lets the agent stop" \
+    iw_in "$SB_TASKS/feat-one" --hook <<<'{"hook_event_name":"Stop"}'
+
+  iw_in "$SB_PROJECTS/myproj" say feat-one "one thing" >/dev/null 2>&1
+  printf '%s' '{"hook_event_name":"Stop"}' | iw_in "$SB_TASKS/feat-one" --hook >/dev/null 2>&1
+
+  # Drained before the block was taken, so the next stop is clean.
+  assert_ok "and it stops on the turn after a delivery" \
+    iw_in "$SB_TASKS/feat-one" --hook <<<'{"hook_event_name":"Stop"}'
+}
+
+test_reply_reaches_the_master() {
+  mk_repo backend
+  iw feat/one -r backend -p myproj >/dev/null 2>&1
+
+  local out
+  out="$(iw_in "$SB_TASKS/feat-one" reply "token shape is now opaque" 2>&1)"
+  assert_contains "the reply is queued for the master" "master of project 'myproj'" "$out"
+
+  # The master reads it from the project directory, where it has no task.
+  out="$(hook_fire "$SB_PROJECTS/myproj" '{"hook_event_name":"UserPromptSubmit"}')"
+  assert_contains "and the master receives it" "token shape is now opaque" "$out"
+  assert_contains "attributed to the task it came from" "feat-one" "$out"
+}
+
+test_a_task_does_not_receive_another_tasks_messages() {
+  mk_repo backend
+  iw feat/one -r backend -p myproj >/dev/null 2>&1
+  iw feat/two -r backend -p myproj >/dev/null 2>&1
+  iw_in "$SB_PROJECTS/myproj" say feat-one "for one only" >/dev/null 2>&1
+
+  case "$(hook_fire "$SB_TASKS/feat-two" '{"hook_event_name":"UserPromptSubmit"}')" in
+    *"for one only"*) bad "delivered a message to the wrong task" ;;
+    *) ok ;;
+  esac
+  assert_contains "and the addressee still gets it" "for one only" \
+    "$(hook_fire "$SB_TASKS/feat-one" '{"hook_event_name":"UserPromptSubmit"}')"
+}
+
+test_a_message_queued_while_nobody_is_running_arrives_at_session_start() {
+  mk_repo backend
+  iw feat/one -r backend -p myproj >/dev/null 2>&1
+  iw_in "$SB_PROJECTS/myproj" say feat-one "read this when you wake up" >/dev/null 2>&1
+
+  assert_contains "a queued message survives until a session starts" \
+    "read this when you wake up" \
+    "$(hook_fire "$SB_TASKS/feat-one" '{"hook_event_name":"SessionStart"}')"
+}
+
+test_say_refuses_a_task_outside_the_project() {
+  mk_repo backend
+  iw feat/one -r backend -p myproj >/dev/null 2>&1
+  iw feat/other -r backend -p otherproj >/dev/null 2>&1
+
+  # A message filed in the wrong project is one nobody ever looks for.
+  assert_fails "a task in another project is refused" \
+    iw_in "$SB_PROJECTS/myproj" say feat-other "hello"
+  assert_fails "and so is one that does not exist" \
+    iw_in "$SB_PROJECTS/myproj" say feat-nope "hello"
+  assert_fails "reply outside a task is refused" \
+    iw_in "$SB_PROJECTS/myproj" reply "hello"
+}
+
 # --- runner -------------------------------------------------------------------
 
 echo "iwork tests  ($IWORK_SRC)"
