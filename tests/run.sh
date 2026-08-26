@@ -2224,6 +2224,7 @@ TMPL
   assert_contains "add-repo still says the list is stale" "iwork:repos" "$out"
 }
 
+
 # --- master ------------------------------------------------------------------
 
 test_master_hook_gives_the_project_role() {
@@ -2414,6 +2415,69 @@ test_agents_row_with_a_pane_but_no_pid_still_lists() {
   out="$(iw project agents myproj 2>&1)"
   assert_contains "a row with a pane but no pid is still listed" "sess-pane" "$out"
   assert_contains "and its pane is the field that survives" "%3" "$out"
+}
+
+
+test_agents_json_is_parseable_and_joinable() {
+  mk_repo backend
+  iw feat/one -r backend -p myproj >/dev/null 2>&1
+
+  local WANT_SESSION_ID="sess-task" WANT_CLAUDE_PID="$$" WANT_PANE="%7"
+  hook_fire "$SB_TASKS/feat-one" '{"hook_event_name":"SessionStart"}' >/dev/null
+
+  local out
+  out="$(iw project agents --json myproj 2>&1)"
+  assert_ok "the json parses" python3 -c 'import json,sys; json.load(sys.stdin)' <<<"$out"
+  assert_contains "carries a version for consumers to check" '"api_version": 1' "$out"
+  assert_contains "names the project" '"project": "myproj"' "$out"
+  assert_contains "carries the session id to join on" '"session": "sess-task"' "$out"
+  assert_contains "and the pane to fall back to" '"pane": "%7"' "$out"
+  assert_contains "with the role" '"role": "task"' "$out"
+
+  # An empty column is null rather than "", so a consumer testing for a pane
+  # does not have to know that "" means there is none.
+  printf '2026-01-01T00:00:00+0000\tregistered\t\tsess-bare\t\t\t\tmaster\n' \
+    >> "$SB_PROJECTS/myproj/agents.tsv"
+  out="$(iw project agents --json myproj 2>&1)"
+  assert_ok "still parses with empty columns" python3 -c 'import json,sys; json.load(sys.stdin)' <<<"$out"
+  assert_contains "a master has no task" '"task": null' "$out"
+  assert_contains "and an absent pane is null" '"pane": null' "$out"
+}
+
+test_agents_json_is_empty_but_valid_with_no_agents() {
+  mk_repo backend
+  iw feat/one -r backend -p myproj >/dev/null 2>&1
+
+  local out
+  out="$(iw project agents --json myproj 2>&1)"
+  assert_ok "an empty listing is still valid json" \
+    python3 -c 'import json,sys; d=json.load(sys.stdin); sys.exit(0 if d["agents"]==[] else 1)' <<<"$out"
+}
+
+test_agents_tsv_keeps_empty_columns_as_columns() {
+  mk_repo backend
+  iw feat/one -r backend -p myproj >/dev/null 2>&1
+
+  printf '2026-01-01T00:00:00+0000\tregistered\tfeat-one\tsess-pane\t\t%%3\t\ttask\n' \
+    >> "$SB_PROJECTS/myproj/agents.tsv"
+
+  local out
+  out="$(iw project agents --tsv myproj 2>&1)"
+  # Columns: task, role, session, pid, pane, transcript, last_active_seconds.
+  assert_eq "the pane stays in column 5 despite the empty pid" "%3" \
+    "$(printf '%s\n' "$out" | awk -F'\t' '$3 == "sess-pane" { print $5 }')"
+  assert_eq "and the role in column 2" "task" \
+    "$(printf '%s\n' "$out" | awk -F'\t' '$3 == "sess-pane" { print $2 }')"
+}
+
+test_agents_format_flags_are_exclusive() {
+  mk_repo backend
+  iw feat/one -r backend -p myproj >/dev/null 2>&1
+
+  assert_fails "--json and --tsv together are refused" \
+    iw project agents --json --tsv myproj
+  assert_fails "an unknown format flag is still refused" \
+    iw project agents --yaml myproj
 }
 
 # --- runner -------------------------------------------------------------------

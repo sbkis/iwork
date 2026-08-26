@@ -90,6 +90,7 @@ Usage: iwork [flags] <branch-name> [--from <task|branch>] -r <repo1> [repo2 ...]
 
        iwork project list
        iwork project show [-n <count>] [-p <project> | <project>]
+       iwork project agents [--json|--tsv] [-p <project> | <project>]
        iwork project grep [-p <project>] <pattern> [ripgrep-args...]
        iwork project cat [-p <project>] <path-inside-the-project>
        iwork project add <project> [<task>]
@@ -1428,6 +1429,10 @@ _iwork() {
       fi
       case "$sub" in
         show|agents|grep|cat|delete)
+          if [[ "$sub" == "agents" && "$cur" == -* ]]; then
+            COMPREPLY=( $(compgen -W "--json --tsv -p --project" -- "$cur") )
+            return 0
+          fi
           if (( COMP_CWORD == 3 )); then
             projects="$("$_bin" --complete-projects "$cur" 2>/dev/null)" || return 0
             COMPREPLY=( $(compgen -W "$projects" -- "$cur") )
@@ -1782,6 +1787,13 @@ _iwork() {
       fi
       case "$sub" in
         show|agents|grep|cat|delete)
+          if [[ "$sub" == "agents" && "$PREFIX" == -* ]]; then
+            _values 'option' \
+              '--json[one object per live session, with a version to check]' \
+              '--tsv[the same fields, tab-separated, for awk and cut]' \
+              '-p[project to read]'
+            return 0
+          fi
           if (( CURRENT == 4 )); then
             projects=("${(@f)$("$_bin" --complete-projects "$PREFIX" 2>/dev/null)}")
             _describe -t projects 'project' projects
@@ -3429,6 +3441,88 @@ project_agents_show() {
   echo "  to find the name, then message that."
 }
 
+# Minimal JSON string escaping. oneline() strips CR, LF and tab from everything
+# that reaches agents.tsv, so the backslash and the quote are the only
+# characters left that can break a string. No dependency: a consumer's jq must
+# not become iwork's.
+json_string() {
+  local text="$1"
+
+  text="${text//\\/\\\\}"
+  text="${text//\"/\\\"}"
+  printf '"%s"' "$text"
+}
+
+# JSON has no "empty means absent" convention, and a caller testing for a pane
+# should not have to know that "" means there is none.
+json_string_or_null() {
+  [[ -n "$1" ]] || { printf 'null'; return 0; }
+  json_string "$1"
+}
+
+json_number_or_null() {
+  [[ "$1" =~ ^[0-9]+$ ]] || { printf 'null'; return 0; }
+  printf '%s' "$1"
+}
+
+# The machine-readable counterpart to project_agents_show: same rows, same
+# order, but a caller can join on them instead of reading them.
+#
+# api_version is here for the reason an out-of-process consumer always needs
+# one — to detect skew rather than guess at it.
+project_agents_json() {
+  local project="$1"
+  local task="" session="" pid="" pane="" transcript="" role=""
+  local first=1
+  local age=""
+
+  printf '{\n'
+  printf '  "api_version": 1,\n'
+  printf '  "project": %s,\n' "$(json_string "$project")"
+  printf '  "agents": [\n'
+
+  while IFS=$'\037' read -r task session pid pane transcript role; do
+    [[ -n "$session" ]] || continue
+    (( first )) || printf ',\n'
+    first=0
+
+    age=""
+    [[ -n "$transcript" ]] && age="$(file_age_seconds "$transcript" 2>/dev/null || true)"
+
+    printf '    {"task": %s, "role": %s, "session": %s, "pid": %s, "pane": %s, "transcript": %s, "last_active_seconds": %s}' \
+      "$(json_string_or_null "$task")" \
+      "$(json_string "${role:-task}")" \
+      "$(json_string "$session")" \
+      "$(json_number_or_null "$pid")" \
+      "$(json_string_or_null "$pane")" \
+      "$(json_string_or_null "$transcript")" \
+      "$(json_number_or_null "$age")"
+  done < <(project_agents "$project" | sort -t $'\037' -k6,6 -k1,1 -s)
+
+  (( first )) || printf '\n'
+  printf '  ]\n}\n'
+}
+
+# Columns: task, role, session, pid, pane, transcript, last_active_seconds.
+# No header, because this is the form that goes through cut, awk and fzf. Tab is
+# safe here in a way it is not for 'read': those three do not collapse runs of
+# it, so an empty column stays a column.
+project_agents_tsv() {
+  local project="$1"
+  local task="" session="" pid="" pane="" transcript="" role=""
+  local age=""
+
+  while IFS=$'\037' read -r task session pid pane transcript role; do
+    [[ -n "$session" ]] || continue
+
+    age=""
+    [[ -n "$transcript" ]] && age="$(file_age_seconds "$transcript" 2>/dev/null || true)"
+
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+      "$task" "${role:-task}" "$session" "$pid" "$pane" "$transcript" "$age"
+  done < <(project_agents "$project" | sort -t $'\037' -k6,6 -k1,1 -s)
+}
+
 project_show() {
   local project="$1"
   local dir="$PROJECTS_DIR/$project"
@@ -3904,10 +3998,12 @@ hook_master_brief() {
   echo "Nothing else knows that chain exists — you chose it — so write it down as"
   echo "you build it: 'iwork decided \"B stacks on A; its PR targets A's branch\"'."
   echo ""
-  echo "To reach a task's agent, 'iwork project agents' lists the live sessions and"
-  echo "the tmux pane each one occupies. Match a pane against your own list of live"
-  echo "sessions to get the name its harness answers to, then message that. The"
-  echo "session id in the listing is not an address."
+  echo "To reach a task's agent: 'iwork project agents --json' gives one object per"
+  echo "live session, with its session id, tmux pane and transcript. Join that"
+  echo "against your own list of live sessions — on the session id if your harness"
+  echo "exposes one, otherwise on the tmux pane — to get the name it answers to,"
+  echo "and message that name. The session id is a join key, not an address: it is"
+  echo "not something you can send to."
 }
 
 # Stdout becomes context, so the agent starts already knowing the project state
@@ -4289,6 +4385,7 @@ Reading — safe to run at any time:
   iwork project cat <path>       print one file from it, e.g. notes/api.md
   iwork project agents           the sessions live in this project right now,
                                  and the task each one is working in
+     add --json or --tsv to get the same rows as fields you can join on
   iwork project list             every project
 
 Recording — one atomic line each; use these instead of editing the files, which
@@ -4318,6 +4415,7 @@ cmd_project() {
   local branch=""
   local force=""
   local count=""
+  local format=""
   local rc=0
 
   shift || true
@@ -4355,6 +4453,7 @@ cmd_project() {
       project_show "$RESOLVED_PROJECT"
       ;;
     agents)
+      format=""
       while [[ $# -gt 0 ]]; do
         case "$1" in
           -p|--project)
@@ -4362,16 +4461,25 @@ cmd_project() {
             proj="$2"
             shift 2
             ;;
+          --json|--tsv)
+            [[ -z "$format" ]] || die "pass one of --json or --tsv, not both"
+            format="${1#--}"
+            shift
+            ;;
           -*) die "unknown option '$1'" ;;
           *)
-            [[ -z "$proj" ]] || die "usage: iwork project agents [<project>]"
+            [[ -z "$proj" ]] || die "usage: iwork project agents [--json|--tsv] [<project>]"
             proj="$1"
             shift
             ;;
         esac
       done
       resolve_project_context "$proj"
-      project_agents_show "$RESOLVED_PROJECT"
+      case "$format" in
+        json) project_agents_json "$RESOLVED_PROJECT" ;;
+        tsv) project_agents_tsv "$RESOLVED_PROJECT" ;;
+        *) project_agents_show "$RESOLVED_PROJECT" ;;
+      esac
       ;;
     cat)
       if [[ "${1:-}" == "-p" || "${1:-}" == "--project" ]]; then

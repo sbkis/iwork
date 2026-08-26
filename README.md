@@ -389,6 +389,35 @@ match against its list of live sessions to turn a row into something it can
 message. Storing the session id alone would produce a registry naming agents
 that nothing could reach.
 
+### Joining the listing to something you can message
+
+```bash
+iwork project agents --json    # one object per live session, with api_version
+iwork project agents --tsv     # the same fields for awk, cut and fzf
+```
+
+Reading the listing tells you who is live. Acting on it means turning a row into
+a name your harness will accept, and that is a join: match a row against your own
+list of live sessions — on the session id if your harness exposes one, otherwise
+on the tmux pane — and message the name that comes back.
+
+The session id is a join key, not an address. `--json` exists so the
+[master](#the-master-one-agent-whose-job-is-the-project) can do that join
+mechanically instead of by eye; the columns are `task`, `role`, `session`, `pid`,
+`pane`, `transcript`, `last_active_seconds`, and absent values are `null` rather
+than `""` so a consumer testing for a pane does not have to know that an empty
+string means there is none. `api_version` is there for the reason any
+out-of-process consumer needs one — to detect skew rather than guess.
+
+There is deliberately no `iwork say <task> "..."`. Typing into another agent's
+pane is not safe, and iwork already knows it: `open_task_window` refuses to
+deliver `-m` into a window that is already open, because the pane may be sitting
+at a shell rather than at an agent. `agents.tsv` is better evidence than that
+path has — a registered session, a pid `kill -0` confirms, a transcript whose
+mtime shows activity — but none of it says the pane is at a prompt rather than
+mid-tool-call, and a stray Enter into a permission dialog answers it. The join
+above goes through the harness, which knows.
+
 **Liveness is derived, never stored** — the same rule the rest of the project
 memory follows. `agents.tsv` is an append-only log of registrations and
 departures; `project agents` reduces it to the last row per session, drops the
