@@ -2224,6 +2224,23 @@ TMPL
   assert_contains "add-repo still says the list is stale" "iwork:repos" "$out"
 }
 
+
+test_agents_row_with_a_pane_but_no_pid_still_lists() {
+  mk_repo backend
+  iw feat/one -r backend -p myproj >/dev/null 2>&1
+
+  # Tab is IFS whitespace, so 'read' collapsed the empty pid into the pane and
+  # this row was dropped by 'kill -0 %3'. A harness that exports a pane but no
+  # pid was invisible in the listing that exists to find it.
+  printf '2026-01-01T00:00:00+0000\tregistered\tfeat-one\tsess-pane\t\t%%3\t\n' \
+    >> "$SB_PROJECTS/myproj/agents.tsv"
+
+  local out
+  out="$(iw project agents myproj 2>&1)"
+  assert_contains "a row with a pane but no pid is still listed" "sess-pane" "$out"
+  assert_contains "and its pane is the field that survives" "%3" "$out"
+}
+
 # --- runner -------------------------------------------------------------------
 
 echo "iwork tests  ($IWORK_SRC)"

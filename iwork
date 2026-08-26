@@ -3242,7 +3242,13 @@ human_age() {
 # running starts lying the moment a pane is closed. 'kill -0' is the same tell
 # project_lock uses for a dead lock holder.
 #
-# Emits: task \t session \t pid \t pane \t transcript
+# Emits one record per live agent, fields separated by US (0x1f):
+#   task, session, pid, pane, transcript
+#
+# Not tab-separated, because tab is IFS *whitespace*: 'read' collapses runs of
+# it, so one empty column shifts every field after it. A row with no pid but a
+# pane read the pane as the pid, and 'kill -0 %3' then dropped a live agent from
+# the listing that exists to find it. US is not whitespace, so empties survive.
 project_agents() {
   local project="$1"
   local file="$PROJECTS_DIR/$project/agents.tsv"
@@ -3250,7 +3256,7 @@ project_agents() {
 
   [[ -f "$file" ]] || return 0
 
-  while IFS=$'\t' read -r task session pid pane transcript; do
+  while IFS=$'\037' read -r task session pid pane transcript; do
     [[ -n "$session" ]] || continue
 
     # A pid that cannot be signalled is a session that is gone. An empty pid is
@@ -3264,7 +3270,7 @@ project_agents() {
       continue
     fi
 
-    printf '%s\t%s\t%s\t%s\t%s\n' "$task" "$session" "$pid" "$pane" "$transcript"
+    printf '%s\037%s\037%s\037%s\037%s\n' "$task" "$session" "$pid" "$pane" "$transcript"
   done < <(awk -F'\t' '
     /^#/ { next }
     NF >= 4 && $4 != "" {
@@ -3272,10 +3278,11 @@ project_agents() {
       event[$4] = $2; task[$4] = $3; pid[$4] = $5; pane[$4] = $6; trans[$4] = $7
     }
     END {
+      OFS = "\037"
       for (i = 1; i <= n; i++) {
         s = order[i]
         if (event[s] == "ended") continue
-        printf "%s\t%s\t%s\t%s\t%s\n", task[s], s, pid[s], pane[s], trans[s]
+        print task[s], s, pid[s], pane[s], trans[s]
       }
     }
   ' "$file" 2>/dev/null)
@@ -3290,7 +3297,7 @@ project_agents_show() {
 
   # Grouped by task, because "who is working on what" is the question this
   # answers; a task with two agents should name itself once.
-  while IFS=$'\t' read -r task session pid pane transcript; do
+  while IFS=$'\037' read -r task session pid pane transcript; do
     [[ -n "$session" ]] || continue
     found=1
 
@@ -3307,7 +3314,7 @@ project_agents_show() {
     if [[ -n "$transcript" ]] && age="$(file_age_seconds "$transcript")"; then
       printf '    last active %s ago\n' "$(human_age "$age")"
     fi
-  done < <(project_agents "$project" | sort -t $'\t' -k1,1 -s)
+  done < <(project_agents "$project" | sort -t $'\037' -k1,1 -s)
 
   if [[ -z "$found" ]]; then
     echo "  (none)"
@@ -3345,7 +3352,7 @@ project_show() {
   echo ""
   echo "Tasks (live):"
   found=""
-  agent_tasks="$(project_agents "$project" | cut -f1 || true)"
+  agent_tasks="$(project_agents "$project" | cut -d $'\037' -f1 || true)"
   while IFS= read -r line; do
     [[ -n "$line" ]] || continue
     found=1
