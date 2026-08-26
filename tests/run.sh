@@ -2239,7 +2239,11 @@ test_master_hook_gives_the_project_role() {
   assert_contains "names the verb that spawns a task" "iwork <branch> -r" "$out"
   assert_contains "keeps rm on the operator's side" "iwork rm" "$out"
   assert_contains "explains what the session is for" "stacks on" "$out"
-  assert_contains "and how to reach a task's agent" "not an address" "$out"
+  assert_contains "and how to reach a task's agent" "iwork say <task>" "$out"
+  # The inbox cannot wake an agent that is already at its prompt; the brief has
+  # to say so, or the master waits on a message that will never be read.
+  assert_contains "and how to wake an idle one" "go through your own harness" "$out"
+  assert_contains "naming the join key that makes that possible" "prefix of the session id" "$out"
 
   # The two roles are mutually exclusive: a master told to stay inside one task
   # is a master that will not spawn the next one.

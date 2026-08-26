@@ -556,11 +556,29 @@ by construction: a task can never be addressed by an empty name, and the master
 has no task. A literal `master` recipient would have collided with a task of
 that name.
 
-**What this does not do:** reach an agent that is sitting idle *right now*. It
-will get the message the moment it is next prompted, but nothing wakes it. For
-that, `project agents --json` still gives you the pane and session id to go
-through the harness with. Typing into another agent's pane remains something
-iwork will not do on your behalf — see the note above.
+**What the inbox does not do is wake anyone.** An agent that has finished its
+turn and is sitting at its prompt gets the message the moment it is next
+prompted, but nothing prompts it — no hook fires again until something does.
+
+That case is covered, just not by iwork. The master is itself a Claude Code
+session, and Claude Code sessions on one machine can address each other by name;
+`project agents --json` exists to supply the join key. The two listings share
+*both* keys, which is what makes the pairing certain rather than a guess:
+
+```
+agents.tsv     session 1e0c8e77-…                        tmux pane %136
+the harness    feat-project-memory-9c [1e0c8e] · idle ·  tmux tasks:@55.%136
+```
+
+The harness's short id is a prefix of `CLAUDE_CODE_SESSION_ID`, and the pane
+matches exactly. So the division is: **message the session to make something
+happen now, queue in the inbox to make sure it happens at all.** The inbox
+outlives a session that is not running, reaches an agent whose harness offers no
+messaging, and leaves a record of what was asked; session messaging wakes an
+agent that is sitting idle. A master doing real work uses both.
+
+Typing into another agent's pane remains something iwork will not do on your
+behalf — see the note above. It is not needed for this.
 
 ### Joining work already in flight
 

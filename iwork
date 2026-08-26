@@ -4204,11 +4204,18 @@ hook_master_brief() {
   echo "Either way the message is queued, so nothing is lost if nobody is there."
   echo "Tasks answer with 'iwork reply', which comes back to you the same way."
   echo ""
-  echo "For something that cannot wait for the current turn to end, 'iwork project"
-  echo "agents --json' gives each live session's id, tmux pane and transcript."
-  echo "Join that against your own list of live sessions — on the session id if"
-  echo "your harness exposes one, otherwise on the pane — and message the name it"
-  echo "answers to. The session id is a join key, not an address."
+  echo "Neither of those wakes an agent that has finished and is sitting at its"
+  echo "prompt: no hook fires again until something prompts it. To make one start"
+  echo "work now, go through your own harness instead:"
+  echo "  1. 'iwork project agents --json' gives every live session's id and pane"
+  echo "  2. list your own live sessions — the two share both keys, since the"
+  echo "     listing's short id is a prefix of the session id and the tmux pane"
+  echo "     matches exactly, so a row and a session can be paired with certainty"
+  echo "  3. message that session by the name your harness gives it"
+  echo ""
+  echo "That is the path for 'go and do this now'. The inbox is the durable one:"
+  echo "it outlives a session that is not running, it reaches an agent whose"
+  echo "harness offers no messaging, and it leaves a record of what was asked."
 }
 
 # Stdout becomes context, so the agent starts already knowing the project state
