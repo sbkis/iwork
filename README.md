@@ -540,7 +540,7 @@ hook fires there until something prompts it.
 instruction as its first prompt:
 
 ```bash
-iwork --detach claude feat-token-api -m "rebase onto feat-zero, the shape changed"
+iwork --detach -m "rebase onto feat-zero, the shape changed" claude feat-token-api
 ```
 
 **For anything that should outlive the conversation, use the log.** `iwork
