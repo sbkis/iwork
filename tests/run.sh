@@ -2242,9 +2242,14 @@ test_master_hook_gives_the_project_role() {
   assert_contains "and how to reach a task's agent" "iwork say <task>" "$out"
   # The inbox cannot wake an agent that is already at its prompt; the brief has
   # to say so, or the master waits on a message that will never be read.
-  assert_contains "and how to wake an idle one" "go through your own harness" "$out"
-  assert_contains "naming the key it pairs on" "pair them on that pane" "$out"
-  assert_contains "and that a name is what it addresses" "by name" "$out"
+  # The queue cannot wake an idle agent, and most agents are idle most of the
+  # time. A master that does not know to use its own session messaging waits
+  # forever on a message nobody will read.
+  assert_contains "names the live channel" "SendMessage" "$out"
+  assert_contains "and how to find who to send to" "ListAgents" "$out"
+  assert_contains "naming the key it pairs on" "on the pane" "$out"
+  assert_contains "and says to verify it landed" "did not land" "$out"
+  assert_contains "with iwork say demoted to the durable one" "durable channel" "$out"
 
   # The two roles are mutually exclusive: a master told to stay inside one task
   # is a master that will not spawn the next one.
@@ -2640,19 +2645,25 @@ test_an_ordinary_message_does_not_interrupt_work_in_progress() {
     "$(hook_fire "$SB_TASKS/feat-one" '{"hook_event_name":"UserPromptSubmit"}')"
 }
 
-test_urgency_is_reported_when_sending() {
+test_urgency_is_reported_for_a_working_agent() {
+  command -v tmux >/dev/null 2>&1 || { printf '    skip (no tmux)\n'; return 0; }
   mk_repo backend
-  iw feat/one -r backend -p myproj >/dev/null 2>&1
+  WANT_TMUX=1 iw --detach feat/one -r backend -p myproj >/dev/null 2>&1
 
   local WANT_SESSION_ID="sess-one" WANT_CLAUDE_PID="$$"
   hook_fire "$SB_TASKS/feat-one" '{"hook_event_name":"SessionStart"}' >/dev/null
 
-  assert_contains "an ordinary message says it will wait" "next prompted" \
-    "$(iw_in "$SB_PROJECTS/myproj" say feat-one "later" 2>&1)"
-  assert_contains "and points at the escape hatch" "--urgent" \
-    "$(iw_in "$SB_PROJECTS/myproj" say feat-one "later" 2>&1)"
-  assert_contains "an urgent one says it will interrupt" "interrupt them" \
-    "$(iw_in "$SB_PROJECTS/myproj" say --urgent feat-one "now" 2>&1)"
+  # '*' is the marker the hooks put on a window whose agent is mid-turn. Without
+  # it there is nothing to interrupt, and the sender is told so instead.
+  tmux_t rename-window -t 'tasks:feat-one' '*feat-one' 2>/dev/null || {
+    printf '    skip (could not mark the window)\n'; return 0; }
+
+  assert_contains "an ordinary message waits for the next prompt" "next prompt" \
+    "$(WANT_TMUX=1 iw_in "$SB_PROJECTS/myproj" say feat-one "later" 2>&1)"
+  assert_contains "and names the escape hatch" "--urgent" \
+    "$(WANT_TMUX=1 iw_in "$SB_PROJECTS/myproj" say feat-one "later" 2>&1)"
+  assert_contains "an urgent one interrupts the turn" "interrupts it" \
+    "$(WANT_TMUX=1 iw_in "$SB_PROJECTS/myproj" say --urgent feat-one "now" 2>&1)"
 }
 
 test_an_urgent_stop_leaves_ordinary_messages_queued() {
@@ -2679,6 +2690,24 @@ test_inbox_marks_which_messages_are_urgent() {
 
   assert_contains "the listing says which is which" "(urgent)" \
     "$(iw_in "$SB_TASKS/feat-one" inbox 2>&1)"
+}
+
+
+test_say_to_an_idle_agent_says_it_will_not_arrive() {
+  mk_repo backend
+  iw feat/one -r backend -p myproj >/dev/null 2>&1
+
+  local WANT_SESSION_ID="sess-one" WANT_CLAUDE_PID="$$" WANT_PANE="%9"
+  hook_fire "$SB_TASKS/feat-one" '{"hook_event_name":"SessionStart"}' >/dev/null
+
+  # No tmux window at all reads as not-busy, which is the same answer an idle
+  # one gives: nothing is going to fire a hook there.
+  local out
+  out="$(iw_in "$SB_PROJECTS/myproj" say feat-one "do the thing" 2>&1)"
+  assert_contains "it says the message will not arrive on its own" "It is idle" "$out"
+  assert_contains "and that urgent does not help" "--urgent" "$out"
+  assert_contains "and hands over the pane to wake it with" "%9" "$out"
+  assert_contains "and the session id beside it" "sess-one" "$out"
 }
 
 # --- runner -------------------------------------------------------------------

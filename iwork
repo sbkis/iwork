@@ -4185,40 +4185,31 @@ hook_master_brief() {
   echo "Nothing else knows that chain exists — you chose it — so write it down as"
   echo "you build it: 'iwork decided \"B stacks on A; its PR targets A's branch\"'."
   echo ""
-  echo "To reach a task's agent:"
-  echo "  iwork say <task> \"<message>\"            it reads this at its next prompt"
-  echo "  iwork say --urgent <task> \"<message>\"   it stops what it is doing"
-  echo "  iwork inbox                             what is queued for you, unread"
+  echo "Reaching a task's agent — use your own session messaging, not iwork:"
+  echo "  1. ListAgents gives every live session: the name it answers to, whether"
+  echo "     it is idle or working, and the tmux pane it occupies."
+  echo "  2. 'iwork project agents --json' gives the pane for each task here."
+  echo "  3. Pair the two on the pane — it is the only key that separates two"
+  echo "     agents working in the same task — then SendMessage to the name."
+  echo "  4. Run ListAgents again. That session should have flipped to working."
+  echo "     If it did not, the message did not land; do not assume it did."
   echo ""
-  echo "Default to the first. An ordinary message waits for the agent's next prompt"
-  echo "and is read alongside whatever comes next, so work already under way is not"
-  echo "disturbed — most of what you have to say can wait that long, and a task"
-  echo "halfway through a refactor is the worst moment to redirect it."
+  echo "That is the channel that makes something happen. It is also the only one"
+  echo "that reaches an agent sitting idle at its prompt, which most of them are"
+  echo "most of the time — an agent that has finished its turn is waiting for"
+  echo "someone to speak to it, and nothing else will."
   echo ""
-  echo "--urgent takes the agent's stopping point away: it is delivered the instant"
-  echo "the current turn ends and the agent carries straight on with it. Spend that"
-  echo "when letting the work continue would waste it — the base it is building on"
-  echo "has moved, the approach is settled elsewhere, the task is now redundant."
-  echo "Not for status questions, and not to hurry something along."
+  echo "'iwork say <task> \"...\"' is the durable channel, not the live one. It"
+  echo "writes to disk and a hook delivers it later: when the agent's next turn"
+  echo "ends if you passed --urgent, at its next prompt otherwise, or at its next"
+  echo "session start if nothing is running there now. Reach for it when there is"
+  echo "no live session to message, when the agent is not a Claude session, or"
+  echo "when the request should be on the record. It wakes nobody, and it tells"
+  echo "you so rather than letting you believe it arrived."
   echo ""
-  echo "Either way the message is queued, so nothing is lost if nobody is there."
-  echo "Tasks answer with 'iwork reply', which comes back to you the same way."
-  echo ""
-  echo "Neither of those wakes an agent that has finished and is sitting at its"
-  echo "prompt: no hook fires again until something prompts it. To make one start"
-  echo "work now, go through your own harness instead:"
-  echo "  1. 'iwork project agents --json' gives every live session's tmux pane"
-  echo "  2. list your own live sessions and pair them on that pane: it is"
-  echo "     recorded on both sides and matches exactly, and it is the only key"
-  echo "     that separates two agents working in the same task"
-  echo "  3. message that session by name — a name is what a harness takes as an"
-  echo "     address, and the short id shown beside it is there to tell apart two"
-  echo "     sessions that share one. It is a prefix of the session id in the"
-  echo "     listing above, so it confirms a pairing you made on the pane."
-  echo ""
-  echo "That is the path for 'go and do this now'. The inbox is the durable one:"
-  echo "it outlives a session that is not running, it reaches an agent whose"
-  echo "harness offers no messaging, and it leaves a record of what was asked."
+  echo "Tasks answer with 'iwork reply', which reaches you the same way — queued,"
+  echo "not live. Run 'iwork inbox' when you come back to a project, and expect"
+  echo "a task with something urgent to message your session instead."
 }
 
 # Stdout becomes context, so the agent starts already knowing the project state
@@ -4245,11 +4236,17 @@ hook_session_start() {
   echo "sibling tasks are appending to the same files right now. Record as you go:"
   echo "  iwork decided \"<what you settled and why>\""
   echo "  iwork todo \"<needs doing, but not in this PR>\""
-  echo "The project master may send you instructions; they arrive on their own, with"
-  echo "a prompt or — if it marked them urgent — the moment your current turn ends."
-  echo "Answer with 'iwork reply \"<...>\"', which is the channel for anything it"
-  echo "should know before it plans the next task. Add --urgent only if carrying on"
-  echo "would waste its work."
+  echo "This project may have a master session running it. It can message you"
+  echo "directly, and it can queue instructions that arrive with a prompt or — if"
+  echo "marked urgent — the moment your current turn ends."
+  echo ""
+  echo "Answer with 'iwork reply \"<...>\"' for anything it should know before it"
+  echo "plans the next task. That is queued, not live: it reaches the master when"
+  echo "the master is next prompted, which may be a while. If it needs to act on"
+  echo "this before then — you are blocked, or the base you are building on has"
+  echo "moved under a sibling task — find its session with ListAgents (it is named"
+  echo "after the project) and SendMessage it as well. Queue it either way, so"
+  echo "there is a record if nobody is running."
   echo "'iwork project -h' lists every command that is yours. Task management"
   echo "(rm, park, add-repo) is the operator's — do not run it uninvited."
   hook_deliver_inbox
@@ -4859,20 +4856,82 @@ sender_label() {
 # it is delivered at the recipient's next SessionStart if nobody is live now —
 # but "sent into the void" and "sent to a running agent" are different enough
 # that the sender should not have to guess which happened.
+# busy / waiting / open, from the status marker the hooks keep on the window
+# name. Empty when there is no window to read it from.
+window_state() {
+  local session="$1"
+  local name="$2"
+  local line=""
+
+  line="$(find_window_in_session "$session" "$name")" || return 0
+
+  case "${line#* }" in
+    '*'*) printf 'busy' ;;
+    '!'*) printf 'waiting' ;;
+    *) printf 'open' ;;
+  esac
+}
+
+task_window_state() {
+  local folder="$1"
+  local state=""
+
+  state="$(window_state "$(task_session_name "$folder")" "$folder")"
+  [[ -n "$state" ]] || state="$(window_state "$TASKS_SESSION" "$folder")"
+  printf '%s' "$state"
+}
+
+# What the sender needs to go and do, when the queue alone will not get there.
+wake_hint() {
+  local project="$1"
+  local dest="$2"
+  local task="" session="" pid="" pane="" transcript="" role=""
+
+  while IFS=$'\037' read -r task session pid pane transcript role; do
+    [[ "$task" == "$dest" ]] || continue
+    printf '    session %s' "$session"
+    [[ -n "$pane" ]] && printf '  tmux pane %s' "$pane"
+    printf '\n'
+  done < <(project_agents "$project")
+
+  echo "    Pair that pane against your own list of live sessions and message the"
+  echo "    name it answers to. 'iwork project agents --json' has the rest."
+}
+
 report_delivery_window() {
   local project="$1"
   local dest="$2"
   local urgency="${3:-normal}"
   local live=""
+  local state=""
 
   live="$(project_agents "$project" | awk -F'\037' -v d="$dest" '$1 == d { n++ } END { print n + 0 }')"
 
   if (( live > 0 )); then
-    if [[ "$urgency" == "urgent" ]]; then
-      echo "  It will interrupt them at the end of their current turn."
+    if [[ -z "$dest" ]]; then
+      state="$(window_state "$PROJECTS_SESSION" "$project")"
     else
-      echo "  They will see it when they are next prompted; work already in"
-      echo "  progress is not interrupted. Use --urgent if it cannot wait."
+      state="$(task_window_state "$dest")"
+    fi
+
+    # An agent that has finished its turn is the case the queue cannot serve:
+    # delivery rides hooks, and no hook fires again until something prompts it.
+    # --urgent is no help either — it is taken at the end of a turn, and there
+    # is no turn to end. Saying "they will see it" here is how a master ends up
+    # waiting on a message that will never be read.
+    if [[ "$state" != "busy" ]]; then
+      echo "  It is idle, so nothing will deliver this on its own — --urgent"
+      echo "  included, since that is taken when a turn ends and none is running."
+      echo "  Message its session directly to make it start now:"
+      wake_hint "$project" "$dest"
+      return 0
+    fi
+
+    if [[ "$urgency" == "urgent" ]]; then
+      echo "  It is working; this interrupts it when the current turn ends."
+    else
+      echo "  It is working; it will read this at its next prompt, so what it is"
+      echo "  doing now is not disturbed. --urgent interrupts it instead."
     fi
     return 0
   fi

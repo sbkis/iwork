@@ -556,31 +556,43 @@ by construction: a task can never be addressed by an empty name, and the master
 has no task. A literal `master` recipient would have collided with a task of
 that name.
 
-**What the inbox does not do is wake anyone.** An agent that has finished its
-turn and is sitting at its prompt gets the message the moment it is next
-prompted, but nothing prompts it — no hook fires again until something does.
+**The inbox wakes nobody, and most agents are idle most of the time.** An agent
+that has finished its turn is sitting at its prompt waiting to be spoken to. No
+hook fires there until something prompts it, so a queued message just sits — and
+`--urgent` does not help either, because it is taken when a turn *ends* and there
+is no turn running. That is the case "go and do this now" falls into, which is
+most of what a master is for.
 
-That case is covered, just not by iwork. The master is itself a Claude Code
-session, and Claude Code sessions on one machine address each other by name;
-`project agents --json` exists to supply the key that finds the name:
+So the live channel is not iwork at all. The master is itself a Claude Code
+session, and Claude Code sessions on one machine message each other directly:
+
+1. `ListAgents` — every live session, the name it answers to, whether it is idle
+   or working, and its tmux pane
+2. `iwork project agents --json` — the pane for each task in this project
+3. pair on the pane, then `SendMessage` to the name
+4. `ListAgents` again — that session should have flipped to working
 
 ```
 agents.tsv     session 1e0c8e77-…                        tmux pane %136
 the harness    feat-project-memory-9c [1e0c8e] · idle ·  tmux tasks:@55.%136
 ```
 
-**Pair them on the pane.** It is recorded on both sides, matches exactly, and is
-the only key that separates two agents working in the same task — which the rest
-of this section exists to say is a thing that happens. The short id beside the
-name is a prefix of `CLAUDE_CODE_SESSION_ID`, so it confirms a pairing, and it
-is what a harness wants when two sessions share a name.
+Pair on the **pane**: it is recorded on both sides, matches exactly, and is the
+only key that separates two agents working in the same task. The short id beside
+the name is a prefix of `CLAUDE_CODE_SESSION_ID`, so it confirms a pairing, and
+it is what a harness wants when two sessions share a name.
 
-Then message the name, not the id — for the reason stated further up: *the
-session id is not an address*. So the division is: **message the session to make something
-happen now, queue in the inbox to make sure it happens at all.** The inbox
-outlives a session that is not running, reaches an agent whose harness offers no
-messaging, and leaves a record of what was asked; session messaging wakes an
-agent that is sitting idle. A master doing real work uses both.
+**`iwork say` is the durable channel, not the live one.** It writes to disk and a
+hook delivers it later — at the end of the next turn with `--urgent`, at the next
+prompt otherwise, at the next session start if nothing is running. It earns its
+place where messaging cannot reach: a task with no live session, an agent that is
+not a Claude session, and anything that should be on the record. When you send to
+an idle agent it says so, and hands you the pane and session id to wake it with,
+rather than letting you believe it arrived.
+
+The division, then: **message the session to make something happen, queue it to
+make sure it is not lost.** A master doing real work uses both, and its brief
+says so in that order.
 
 Typing into another agent's pane remains something iwork will not do on your
 behalf — see the note above. It is not needed for this.
