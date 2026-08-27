@@ -97,10 +97,6 @@ Usage: iwork [flags] <branch-name> [--from <task|branch>] -r <repo1> [repo2 ...]
        iwork project rm [<project>] [<task>]
        iwork project delete [-f] <project>
 
-       iwork say [--urgent] <task> "<message>"
-       iwork reply [--urgent] "<message>"
-       iwork inbox [-p <project>]
-
        iwork todo "<what needs doing>" [-p <project>]
        iwork log [--decision|--shipped|--note] "<what>" [-p <project>]
        iwork decided "<what and why>" [-p <project>]
@@ -210,11 +206,6 @@ Subcommands:
                  a compaction. Safe to re-run; it only adds what is missing
   project        Manage projects: the memory shared by the tasks of one
                  longer-horizon effort (see Projects below)
-  say            Queue a message for the agent running in a task. It is read at
-                 that agent's next prompt; --urgent instead delivers it the
-                 moment its current turn ends, taking its stopping point away
-  reply          Answer the project master from inside a task
-  inbox          Show the messages queued for you that are not yet delivered
   todo           Capture something that needs doing but not in this PR
   log            Append one line to the project log (--decision, --shipped,
                  --note; default --note)
@@ -369,6 +360,25 @@ warn() {
 # with a dash from being read as an option, and it ends a variadic option like
 # claude's --add-dir, which otherwise swallows a trailing prompt as one more
 # directory. AGENT_ARGS is empty when no message was given.
+# -m after the subcommand is forwarded to the agent as one of its own flags.
+# claude rejects it, so the pane is left at a shell and the window reads as
+# 'open' in the listing — the same as a task you opened by hand. Nothing says
+# the agent never started, and the message goes nowhere.
+reject_trailing_message_flag() {
+  local tool="$1"
+  local arg=""
+
+  shift
+  for arg in "$@"; do
+    case "$arg" in
+      -m|--message)
+        die "-m is an iwork flag, not a $tool one, so it has to come first:
+  iwork -m \"<message>\" $tool <task>"
+        ;;
+    esac
+  done
+}
+
 agent_message_args() {
   AGENT_ARGS=()
   [[ -z "$INITIAL_MESSAGE" ]] || AGENT_ARGS=(-- "$INITIAL_MESSAGE")
@@ -1469,11 +1479,7 @@ _iwork() {
       fi
       return 0
       ;;
-    cd|claude|codex|say)
-      if [[ "$cmd" == "say" && "$cur" == -* ]]; then
-        COMPREPLY=( $(compgen -W "--urgent -u" -- "$cur") )
-        return 0
-      fi
+    cd|claude|codex)
       if (( COMP_CWORD == cmd_i + 1 )); then
         folders="$("$_bin" --complete-worktree-folders "$cur" 2>/dev/null)" || return 0
         COMPREPLY=( $(compgen -W "$folders" -- "$cur") )
@@ -1555,7 +1561,7 @@ _iwork() {
   fi
 
   if [[ -z "$cmd" ]]; then
-    COMPREPLY=( $(compgen -W "add-repo rm park list cd claude codex master project say reply inbox todo log decided done drop init install-hooks --no-tmux --no-context --detach -d --big --from --message -m -h --help --completion" -- "$cur") )
+    COMPREPLY=( $(compgen -W "add-repo rm park list cd claude codex master project todo log decided done drop init install-hooks --no-tmux --no-context --detach -d --big --from --message -m -h --help --completion" -- "$cur") )
     return 0
   fi
 
@@ -1756,10 +1762,6 @@ _iwork() {
       'claude[open the task tmux window and run claude]' \
       'codex[open the task tmux window and run codex]' \
       'master[open the project master session that runs the tasks]' \
-      'say[queue a message for the agent running in a task]' \
-      '--urgent[say/reply: deliver as soon as the current turn ends]' \
-      'reply[answer the project master from inside a task]' \
-      'inbox[show the messages queued for you]' \
       'project[manage the memory shared across a project'\''s tasks]' \
       'todo[capture something that needs doing, but not in this PR]' \
       'log[append one line to the project log]' \
@@ -1840,11 +1842,7 @@ _iwork() {
         '--note[record a plain note]'
       return 0
       ;;
-    cd|claude|codex|say)
-      if [[ "$cmd" == "say" && "$PREFIX" == -* ]]; then
-        _values 'option' '--urgent[deliver as soon as the current turn ends]'
-        return 0
-      fi
+    cd|claude|codex)
       if (( CURRENT == cmd_i + 1 )); then
         folders=("${(@f)$("$_bin" --complete-worktree-folders "$PREFIX" 2>/dev/null)}")
         _describe -t folders 'worktree folder' folders
@@ -2542,11 +2540,6 @@ EOF
       die "could not write $dir/agents.tsv"
   fi
 
-  if [[ ! -f "$dir/inbox.tsv" ]]; then
-    printf '%s\n' "$INBOX_HEADER" > "$dir/inbox.tsv" ||
-      die "could not write $dir/inbox.tsv"
-  fi
-
   if [[ ! -f "$dir/notes/.keep" ]]; then
     : > "$dir/notes/.keep" 2>/dev/null || true
   fi
@@ -3055,23 +3048,15 @@ oneline() {
 # 32 bits, not 16: closed todos stay in the file and keep matching, so the id
 # space never frees, and at 16 bits a project that accumulated a couple of
 # hundred todos hit collisions — which made both of them unclosable.
-new_entry_id() {
-  local prefix="$1"
-  local text="$2"
+new_todo_id() {
+  local text="$1"
   local sum=""
 
   sum="$(printf '%s|%s|%s|%s' "$text" "$(date +%s)" "$$" "${RANDOM:-0}" |
     cksum | awk '{print $1}')"
-  printf '%s%08x' "$prefix" "$(( sum % 4294967296 ))"
+  printf 't%08x' "$(( sum % 4294967296 ))"
 }
 
-new_todo_id() {
-  new_entry_id t "$1"
-}
-
-new_message_id() {
-  new_entry_id m "$1"
-}
 
 validate_todo_id() {
   [[ "$1" =~ ^t[0-9a-f]{1,8}$ ]] || die "'$1' is not a todo id (expected something like t1a2f9c04)"
@@ -3222,151 +3207,6 @@ append_agent() {
     "$(oneline "${TMUX_PANE:-}")" "$(oneline "$HOOK_TRANSCRIPT")" \
     "$(oneline "$role")" \
     >> "$file" || { warn "could not append to agents.tsv"; return 1; }
-}
-
-INBOX_HEADER=$'# timestamp\tevent\tid\tto\tfrom\ttext\turgency'
-
-# One append per line, under O_APPEND, for the same reason capture is: the
-# master and a dozen tasks can all be writing here at once.
-#
-# 'to' is a task name, or empty for the project master — a task cannot be
-# addressed by an empty name, and the master has no task, so the two never
-# collide the way a literal "master" recipient would against a task of that name.
-append_inbox() {
-  local project="$1"
-  local event="$2"
-  local id="$3"
-  local to="$4"
-  local from="$5"
-  local text="$6"
-  local urgency="${7:-normal}"
-  local file="$PROJECTS_DIR/$project/inbox.tsv"
-
-  if [[ ! -f "$file" ]]; then
-    printf '%s\n' "$INBOX_HEADER" >> "$file" 2>/dev/null ||
-      { warn "could not create inbox.tsv"; return 1; }
-  fi
-
-  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
-    "$(date +%Y-%m-%dT%H:%M:%S%z)" "$event" "$id" "$(oneline "$to")" \
-    "$(oneline "$from")" "$(oneline "$text")" "$(oneline "$urgency")" \
-    >> "$file" || { warn "could not append to inbox.tsv"; return 1; }
-}
-
-# What is addressed to $dest and has no 'delivered' row yet. Derived on every
-# call rather than stored, the same way project_agents derives liveness: a file
-# that remembers what was pending starts lying the moment a delivery is missed.
-#
-# Emits: id US timestamp US from US text US urgency
-#
-# $3 filters: empty for everything addressed to $dest, "urgent" for only the
-# messages that have asked to interrupt work in progress.
-inbox_pending() {
-  local project="$1"
-  local dest="$2"
-  local only="${3:-}"
-  local file="$PROJECTS_DIR/$project/inbox.tsv"
-
-  [[ -f "$file" ]] || return 0
-
-  awk -F'\t' -v dest="$dest" -v only="$only" '
-    /^#/ { next }
-    NF >= 4 && $3 != "" {
-      if ($2 == "delivered") { done[$3] = 1; next }
-      if ($2 != "sent") next
-      if ($4 != dest) next
-      if (!($3 in seen)) { seen[$3] = 1; order[++n] = $3 }
-      stamp[$3] = $1; from[$3] = $5; text[$3] = $6
-      urg[$3] = ($7 == "" ? "normal" : $7)
-    }
-    END {
-      OFS = "\037"
-      for (i = 1; i <= n; i++) {
-        id = order[i]
-        if (id in done) continue
-        if (only != "" && urg[id] != only) continue
-        print id, stamp[id], from[id], text[id], urg[id]
-      }
-    }
-  ' "$file" 2>/dev/null
-}
-
-# Prints the pending messages for $dest and records them delivered, so the next
-# hook to fire does not repeat them. Marking happens before the caller acts on
-# the output, which is what stops the Stop hook blocking forever: the block is
-# only ever taken on a message that has just stopped being pending.
-inbox_drain() {
-  local project="$1"
-  local dest="$2"
-  local only="${3:-}"
-  local pending=""
-  local id="" stamp="" from="" text="" urgency=""
-  local body=""
-  local count=0
-
-  pending="$(inbox_pending "$project" "$dest" "$only")"
-  [[ -n "$pending" ]] || return 0
-
-  project_lock "$project" || return 1
-
-  # Re-read under the lock: a sibling hook may have drained the same messages
-  # between the check above and here.
-  pending="$(inbox_pending "$project" "$dest" "$only")"
-  if [[ -z "$pending" ]]; then
-    project_unlock
-    return 0
-  fi
-
-  while IFS=$'\037' read -r id stamp from text urgency; do
-    [[ -n "$id" ]] || continue
-    count=$((count + 1))
-    if [[ "$urgency" == "urgent" ]]; then
-      body+="  [$id] from ${from:-unknown} (urgent): $text"$'\n'
-    else
-      body+="  [$id] from ${from:-unknown}: $text"$'\n'
-    fi
-    append_inbox "$project" delivered "$id" "$dest" "$from" "" "$urgency" || true
-  done <<< "$pending"
-
-  project_unlock
-
-  (( count > 0 )) || return 0
-
-  if [[ "$only" == "urgent" ]]; then
-    printf 'iwork: %d urgent message(s) in project %s — act on these before continuing:\n' \
-      "$count" "$project"
-  else
-    printf 'iwork: %d message(s) waiting for you in project %s:\n' "$count" "$project"
-  fi
-  printf '%s' "$body"
-  if [[ -z "$dest" ]]; then
-    printf 'Reply with: iwork say <task> "<...>"\n'
-  else
-    printf 'Reply with: iwork reply "<...>"\n'
-  fi
-}
-
-# The non-destructive read, for when someone wants to look without consuming.
-inbox_show() {
-  local project="$1"
-  local dest="$2"
-  local id="" stamp="" from="" text=""
-  local found=""
-
-  if [[ -z "$dest" ]]; then
-    echo "Pending messages for the master of project '$project':"
-  else
-    echo "Pending messages for task '$dest' in project '$project':"
-  fi
-
-  while IFS=$'\037' read -r id stamp from text urgency; do
-    [[ -n "$id" ]] || continue
-    found=1
-    printf '  [%s] %s  from %s%s\n    %s\n' "$id" "$stamp" "${from:-unknown}" \
-      "$([[ "$urgency" == "urgent" ]] && printf '  (urgent)')" "$text"
-  done < <(inbox_pending "$project" "$dest")
-
-  [[ -n "$found" ]] || echo "  (none)"
 }
 
 flip_todo() {
@@ -4142,13 +3982,6 @@ hook_project_context() {
   return 0
 }
 
-# The inbox address of the session a hook fired in: its task name, or empty for
-# the master. Call only after hook_project_context has succeeded.
-hook_inbox_dest() {
-  [[ "$HOOK_ROLE" == "task" ]] && printf '%s' "$HOOK_TASK"
-  return 0
-}
-
 # The master's role is defined here rather than in a CLAUDE.md next to
 # PROJECT.md. A file would have to be named CLAUDE.md to be loaded at all, and
 # link_task_project symlinks this directory into every task as '.project' — so a
@@ -4185,40 +4018,30 @@ hook_master_brief() {
   echo "Nothing else knows that chain exists — you chose it — so write it down as"
   echo "you build it: 'iwork decided \"B stacks on A; its PR targets A's branch\"'."
   echo ""
-  echo "To reach a task's agent:"
-  echo "  iwork say <task> \"<message>\"            it reads this at its next prompt"
-  echo "  iwork say --urgent <task> \"<message>\"   it stops what it is doing"
-  echo "  iwork inbox                             what is queued for you, unread"
+  echo "Reaching a task's agent — this is your own tooling, not iwork's:"
+  echo "  1. ListAgents gives every live session: the name it answers to, its"
+  echo "     state, and the tmux pane it occupies. 'idle' and 'waiting' both take"
+  echo "     a message; 'busy' takes it at the end of the current turn; 'shell'"
+  echo "     means that pane is not running an agent at all, so start one there"
+  echo "     instead of messaging it."
+  echo "  2. 'iwork project agents --json' gives the pane for each task here."
+  echo "  3. Pair the two on the pane — it is the only key that separates two"
+  echo "     agents working in the same task — then SendMessage to the name."
+  echo "  4. Run ListAgents again. That session should have flipped to working."
+  echo "     If it did not, the message did not land; do not assume it did."
   echo ""
-  echo "Default to the first. An ordinary message waits for the agent's next prompt"
-  echo "and is read alongside whatever comes next, so work already under way is not"
-  echo "disturbed — most of what you have to say can wait that long, and a task"
-  echo "halfway through a refactor is the worst moment to redirect it."
+  echo "Most agents are idle most of the time: one that has finished its turn is"
+  echo "waiting to be spoken to, and nothing but a message will start it again."
   echo ""
-  echo "--urgent takes the agent's stopping point away: it is delivered the instant"
-  echo "the current turn ends and the agent carries straight on with it. Spend that"
-  echo "when letting the work continue would waste it — the base it is building on"
-  echo "has moved, the approach is settled elsewhere, the task is now redundant."
-  echo "Not for status questions, and not to hurry something along."
+  echo "For a task with no session running, don't message — start one, with the"
+  echo "instruction as its first prompt:"
+  echo "  iwork --detach -m \"<what to do>\" claude <task>"
+  echo "  The -m goes before the subcommand. After it, it is passed to claude as"
+  echo "  a claude flag, which fails in a pane you are not watching."
   echo ""
-  echo "Either way the message is queued, so nothing is lost if nobody is there."
-  echo "Tasks answer with 'iwork reply', which comes back to you the same way."
-  echo ""
-  echo "Neither of those wakes an agent that has finished and is sitting at its"
-  echo "prompt: no hook fires again until something prompts it. To make one start"
-  echo "work now, go through your own harness instead:"
-  echo "  1. 'iwork project agents --json' gives every live session's tmux pane"
-  echo "  2. list your own live sessions and pair them on that pane: it is"
-  echo "     recorded on both sides and matches exactly, and it is the only key"
-  echo "     that separates two agents working in the same task"
-  echo "  3. message that session by name — a name is what a harness takes as an"
-  echo "     address, and the short id shown beside it is there to tell apart two"
-  echo "     sessions that share one. It is a prefix of the session id in the"
-  echo "     listing above, so it confirms a pairing you made on the pane."
-  echo ""
-  echo "That is the path for 'go and do this now'. The inbox is the durable one:"
-  echo "it outlives a session that is not running, it reaches an agent whose"
-  echo "harness offers no messaging, and it leaves a record of what was asked."
+  echo "Anything a task should still know after everyone has gone home belongs in"
+  echo "the project log, not in a message: 'iwork decided', 'iwork todo'. That is"
+  echo "what every session reads on the way in."
 }
 
 # Stdout becomes context, so the agent starts already knowing the project state
@@ -4232,7 +4055,6 @@ hook_session_start() {
 
   if [[ "$HOOK_ROLE" == "master" ]]; then
     hook_master_brief
-    hook_deliver_inbox
     return 0
   fi
 
@@ -4245,54 +4067,17 @@ hook_session_start() {
   echo "sibling tasks are appending to the same files right now. Record as you go:"
   echo "  iwork decided \"<what you settled and why>\""
   echo "  iwork todo \"<needs doing, but not in this PR>\""
-  echo "The project master may send you instructions; they arrive on their own, with"
-  echo "a prompt or — if it marked them urgent — the moment your current turn ends."
-  echo "Answer with 'iwork reply \"<...>\"', which is the channel for anything it"
-  echo "should know before it plans the next task. Add --urgent only if carrying on"
-  echo "would waste its work."
+  echo "This project may have a master session running it, named after the"
+  echo "project. It can message you directly. To tell it something it should act"
+  echo "on now — you are blocked, or the base you build on moved — find it with"
+  echo "ListAgents and SendMessage it. Anything it merely needs to know before it"
+  echo "plans the next task goes in the log: 'iwork decided', 'iwork todo'."
   echo "'iwork project -h' lists every command that is yours. Task management"
   echo "(rm, park, add-repo) is the operator's — do not run it uninvited."
-  hook_deliver_inbox
 }
 
 # SessionStart and UserPromptSubmit both put plain stdout in front of the model,
 # so a queued message can simply be printed there.
-hook_deliver_inbox() {
-  local pending=""
-
-  pending="$(inbox_drain "$HOOK_PROJECT" "$(hook_inbox_dest)" 2>/dev/null || true)"
-  [[ -n "$pending" ]] || return 0
-
-  echo ""
-  printf '%s\n' "$pending"
-}
-
-# Stop is the only moment a message can reach an agent that is mid-piece rather
-# than waiting on its next prompt — and taking it costs the agent its stopping
-# point, so only an urgent message is delivered here. An ordinary one waits for
-# the next prompt, where it is read alongside whatever comes next instead of
-# landing in the middle of something half-finished.
-#
-# Plain stdout on Stop goes to the debug log and nowhere else, so a message
-# printed there would vanish. Exit 2 is the path that both shows the text (as
-# the blocking reason, on stderr) and keeps the agent going.
-#
-# It cannot loop: inbox_drain records the messages delivered before this returns
-# them, so the Stop that fires next has nothing urgent pending and exits 0.
-hook_stop() {
-  local pending=""
-
-  hook_project_context || return 0
-
-  pending="$(inbox_drain "$HOOK_PROJECT" "$(hook_inbox_dest)" urgent 2>/dev/null || true)"
-  [[ -n "$pending" ]] || return 0
-
-  # It said 'waiting for you' a moment ago and is about to carry on.
-  mark_task_window UserPromptSubmit || true
-
-  printf '%s\n' "$pending" >&2
-  exit 2
-}
 
 # The counterpart to the registration above. Nothing is printed: a session that
 # is ending has nobody left to read it.
@@ -4430,18 +4215,6 @@ handle_claude_hook() {
       ;;
     PostToolUse)
       hook_post_tool_use "$input" || true
-      exit 0
-      ;;
-    UserPromptSubmit)
-      mark_task_window "$event" || true
-      if hook_project_context; then
-        hook_deliver_inbox || true
-      fi
-      exit 0
-      ;;
-    Stop)
-      mark_task_window "$event" || true
-      hook_stop || true
       exit 0
       ;;
   esac
@@ -4670,15 +4443,6 @@ sibling tasks are appending to while you work:
   iwork drop <todo-id>           abandon one
      add --nth <n> if an id somehow matches more than one todo
 
-Messaging — between the master and the tasks of one project:
-  iwork say <task> "<message>"    queue a message for that task's agent
-  iwork reply "<message>"         answer the master from inside a task
-  iwork inbox                     what is queued for you, without consuming it
-     Delivery is automatic. An ordinary message is read at the recipient's next
-     prompt, so work already under way is not disturbed; --urgent delivers it as
-     soon as the current turn ends and the agent carries on with it. Prefer the
-     first — most of what you have to say can wait that long.
-
 Managing — the operator's, not an agent's; these change or destroy tasks, so do
 not run them unless you were asked to directly:
   iwork project add <project> [<task>]   attach a task that already exists
@@ -4824,8 +4588,9 @@ cmd_project() {
       # Destroys strictly more than rm does, and -f skips the confirmation that
       # a pane running an agent would answer itself. See the note on rm.
       if in_master_context; then
-        die "'project delete' does not run from a project directory: it destroys the memory, and this is where the master sits.
-  Run it from outside the project, or ask the operator."
+        die "'project delete' does not run from a project directory: it destroys the
+  memory, and a master agent sits here. Run it from anywhere else — 'cd' out
+  first — or, if you are an agent, ask the person running this."
       fi
       delete_project "$proj" "$force"
       ;;
@@ -4836,156 +4601,6 @@ cmd_project() {
       die "unknown 'iwork project' subcommand: $sub (run 'iwork project -h')"
       ;;
   esac
-}
-
-# Who is sending: the task you are standing in, the master if you are in the
-# project, and otherwise the person at the keyboard.
-sender_label() {
-  local task=""
-
-  task="$(task_root_from_cwd 2>/dev/null || true)"
-  if [[ -n "$task" ]]; then
-    printf '%s' "$task"
-    return 0
-  fi
-  if in_master_context; then
-    printf 'master'
-    return 0
-  fi
-  printf 'operator'
-}
-
-# Says whether anyone is there to read it. The message is queued either way —
-# it is delivered at the recipient's next SessionStart if nobody is live now —
-# but "sent into the void" and "sent to a running agent" are different enough
-# that the sender should not have to guess which happened.
-report_delivery_window() {
-  local project="$1"
-  local dest="$2"
-  local urgency="${3:-normal}"
-  local live=""
-
-  live="$(project_agents "$project" | awk -F'\037' -v d="$dest" '$1 == d { n++ } END { print n + 0 }')"
-
-  if (( live > 0 )); then
-    if [[ "$urgency" == "urgent" ]]; then
-      echo "  It will interrupt them at the end of their current turn."
-    else
-      echo "  They will see it when they are next prompted; work already in"
-      echo "  progress is not interrupted. Use --urgent if it cannot wait."
-    fi
-    return 0
-  fi
-
-  if [[ -z "$dest" ]]; then
-    echo "  No master is running; it will be delivered when one starts."
-  else
-    echo "  No agent is live in '$dest'; it will be delivered when one starts there."
-  fi
-}
-
-cmd_say() {
-  local dest=""
-  local text=""
-  local nargs=0
-  local id=""
-  local urgency="normal"
-
-  while [[ $# -gt 0 ]]; do
-    case "$1" in
-      -u|--urgent) urgency="urgent"; shift; continue ;;
-      -*) die "unknown option '$1'" ;;
-      *)
-        nargs=$((nargs + 1))
-        case "$nargs" in
-          1) dest="$1" ;;
-          2) text="$1" ;;
-          *) die "usage: iwork say <task> \"<message>\"" ;;
-        esac
-        shift
-        ;;
-    esac
-  done
-
-  (( nargs == 2 )) || die "usage: iwork say [--urgent] <task> \"<message>\""
-  validate_worktree_folder_name "$dest"
-  resolve_project_context ""
-
-  [[ -d "$TASKS_DIR/$dest" ]] || die "no such task: $dest"
-
-  # Cross-project delivery would put a message somewhere its recipient never
-  # looks: the inbox belongs to one project, and so does its reader.
-  local dest_project=""
-  dest_project="$(task_project_name "$dest" || true)"
-  [[ "$dest_project" == "$RESOLVED_PROJECT" ]] ||
-    die "task '$dest' is not in project '$RESOLVED_PROJECT'${dest_project:+ (it is in '$dest_project')}"
-
-  text="$(oneline "$text")"
-  [[ -n "$text" ]] || die "nothing to send"
-
-  id="$(new_message_id "$text")"
-  append_inbox "$RESOLVED_PROJECT" sent "$id" "$dest" "$(sender_label)" "$text" "$urgency" ||
-    die "could not queue the message"
-
-  echo "Queued $id for '$dest' in project '$RESOLVED_PROJECT'"
-  report_delivery_window "$RESOLVED_PROJECT" "$dest" "$urgency"
-}
-
-cmd_reply() {
-  local text=""
-  local id=""
-  local urgency="normal"
-
-  while [[ $# -gt 0 ]]; do
-    case "$1" in
-      -u|--urgent) urgency="urgent"; shift ;;
-      -*) die "unknown option '$1'" ;;
-      *)
-        [[ -z "$text" ]] || die "usage: iwork reply [--urgent] \"<message>\""
-        text="$1"
-        shift
-        ;;
-    esac
-  done
-
-  [[ -n "$text" ]] || die "usage: iwork reply [--urgent] \"<message>\""
-
-  resolve_project_context ""
-  [[ -n "$RESOLVED_TASK" ]] ||
-    die "'reply' addresses the project master from inside a task; there is no task here.
-  Use 'iwork say <task> \"<message>\"' to address one instead."
-
-  text="$(oneline "$text")"
-  [[ -n "$text" ]] || die "nothing to send"
-
-  id="$(new_message_id "$text")"
-  append_inbox "$RESOLVED_PROJECT" sent "$id" "" "$RESOLVED_TASK" "$text" "$urgency" ||
-    die "could not queue the message"
-
-  echo "Queued $id for the master of project '$RESOLVED_PROJECT'"
-  report_delivery_window "$RESOLVED_PROJECT" "" "$urgency"
-}
-
-cmd_inbox() {
-  local proj=""
-
-  while [[ $# -gt 0 ]]; do
-    case "$1" in
-      -p|--project)
-        [[ $# -ge 2 ]] || die "expected a project name after $1"
-        proj="$2"
-        shift 2
-        ;;
-      -*) die "unknown option '$1'" ;;
-      *) die "usage: iwork inbox [-p <project>]" ;;
-    esac
-  done
-
-  resolve_project_context "$proj"
-
-  local dest=""
-  [[ -n "$RESOLVED_TASK" ]] && dest="$RESOLVED_TASK"
-  inbox_show "$RESOLVED_PROJECT" "$dest"
 }
 
 cmd_capture() {
@@ -5090,7 +4705,7 @@ if [[ $# -eq 0 ]]; then
 fi
 
 case "${1:-}" in
-  rm|list|cd|init|install-hooks|project|todo|log|decided|done|drop|say|reply|inbox)
+  rm|list|cd|init|install-hooks|project|todo|log|decided|done|drop)
     warn_message_undelivered "'$1' does not start an agent"
     ;;
 esac
@@ -5176,21 +4791,6 @@ case "${1:-}" in
     capture_verb="$1"
     shift
     cmd_capture "$capture_verb" "$@"
-    exit 0
-    ;;
-  say)
-    shift
-    cmd_say "$@"
-    exit 0
-    ;;
-  reply)
-    shift
-    cmd_reply "$@"
-    exit 0
-    ;;
-  inbox)
-    shift
-    cmd_inbox "$@"
     exit 0
     ;;
 esac
@@ -5298,8 +4898,9 @@ if [[ "${1:-}" == "rm" ]]; then
   # A guardrail rather than a sandbox — cd out and it is gone. It is here to
   # catch the accident.
   if in_master_context; then
-    die "'rm' does not run from a project directory: it destroys worktrees, and this is where the master sits.
-  Run it from outside the project, or ask the operator."
+    die "'rm' does not run from a project directory: it destroys worktrees, and a
+  master agent sits here. Run it from anywhere else — 'cd' out first — or, if
+  you are an agent, ask the person running this."
   fi
 
   # rm deletes worktrees, so inferring the task from the directory has to be
@@ -5403,6 +5004,7 @@ if [[ "${1:-}" == "claude" && "${2:-}" != "-r" ]]; then
     die "usage: iwork claude <task> [claude-args...]"
   fi
 
+  reject_trailing_message_flag claude "${@:3}"
   agent_message_args
   run_tool_in_worktree claude "$2" "${@:3}" ${AGENT_ARGS[@]+"${AGENT_ARGS[@]}"}
 fi
@@ -5412,6 +5014,7 @@ if [[ "${1:-}" == "codex" && "${2:-}" != "-r" ]]; then
     die "usage: iwork codex <task> [codex-args...]"
   fi
 
+  reject_trailing_message_flag codex "${@:3}"
   agent_message_args
   run_tool_in_worktree codex "$2" "${@:3}" ${AGENT_ARGS[@]+"${AGENT_ARGS[@]}"}
 fi

@@ -2224,7 +2224,6 @@ TMPL
   assert_contains "add-repo still says the list is stale" "iwork:repos" "$out"
 }
 
-
 # --- master ------------------------------------------------------------------
 
 test_master_hook_gives_the_project_role() {
@@ -2239,12 +2238,22 @@ test_master_hook_gives_the_project_role() {
   assert_contains "names the verb that spawns a task" "iwork <branch> -r" "$out"
   assert_contains "keeps rm on the operator's side" "iwork rm" "$out"
   assert_contains "explains what the session is for" "stacks on" "$out"
-  assert_contains "and how to reach a task's agent" "iwork say <task>" "$out"
+  assert_contains "and how to reach a task's agent" "Reaching a task's agent" "$out"
   # The inbox cannot wake an agent that is already at its prompt; the brief has
   # to say so, or the master waits on a message that will never be read.
-  assert_contains "and how to wake an idle one" "go through your own harness" "$out"
-  assert_contains "naming the key it pairs on" "pair them on that pane" "$out"
-  assert_contains "and that a name is what it addresses" "by name" "$out"
+  # The queue cannot wake an idle agent, and most agents are idle most of the
+  # time. A master that does not know to use its own session messaging waits
+  # forever on a message nobody will read.
+  assert_contains "names the live channel" "SendMessage" "$out"
+  assert_contains "and how to find who to send to" "ListAgents" "$out"
+  assert_contains "naming the key it pairs on" "on the pane" "$out"
+  assert_contains "and says to verify it landed" "did not land" "$out"
+  # A task with nothing running is started with its instruction, not messaged.
+  assert_contains "and what to do when nothing is running there" "claude <task>" "$out"
+  # -m after the subcommand is forwarded to claude, which rejects it; the brief
+  # got this wrong once and the failure is silent.
+  assert_contains "with the flag where it actually works" '-m "<what to do>" claude' "$out"
+  assert_contains "with durable notes going to the log instead" "iwork decided" "$out"
 
   # The two roles are mutually exclusive: a master told to stay inside one task
   # is a master that will not spawn the next one.
@@ -2377,7 +2386,7 @@ test_rm_refuses_from_the_project_directory() {
   assert_fails "rm refuses from the project directory" \
     iw_in "$SB_PROJECTS/myproj" rm -f feat-one
   assert_dir "and the task is still there" "$SB_TASKS/feat-one"
-  assert_contains "saying where it will run instead" "ask the operator" \
+  assert_contains "saying where it will run instead" "cd' out first" \
     "$(iw_in "$SB_PROJECTS/myproj" rm -f feat-one 2>&1)"
 
   # From outside the project it is the operator's again.
@@ -2421,7 +2430,6 @@ test_agents_row_with_a_pane_but_no_pid_still_lists() {
   assert_contains "a row with a pane but no pid is still listed" "sess-pane" "$out"
   assert_contains "and its pane is the field that survives" "%3" "$out"
 }
-
 
 test_agents_json_is_parseable_and_joinable() {
   mk_repo backend
@@ -2486,199 +2494,18 @@ test_agents_format_flags_are_exclusive() {
 }
 
 
-# --- messaging ---------------------------------------------------------------
-
-test_say_queues_a_message_for_a_task() {
+test_message_flag_after_the_subcommand_is_refused() {
   mk_repo backend
-  iw feat/one -r backend -p myproj >/dev/null 2>&1
+  iw feat/one -r backend >/dev/null 2>&1
 
-  local out
-  out="$(iw_in "$SB_PROJECTS/myproj" say feat-one "stop work on the refresh flow" 2>&1)"
-  assert_contains "the message is queued" "Queued m" "$out"
-  assert_contains "and says nobody is live to read it yet" "will be delivered when one starts" "$out"
-  assert_grep "it is recorded as sent" "sent" "$SB_PROJECTS/myproj/inbox.tsv"
-  assert_grep "addressed to the task" "feat-one" "$SB_PROJECTS/myproj/inbox.tsv"
-  assert_grep "and attributed to the master" "master" "$SB_PROJECTS/myproj/inbox.tsv"
-}
-
-test_inbox_shows_what_is_pending_without_consuming_it() {
-  mk_repo backend
-  iw feat/one -r backend -p myproj >/dev/null 2>&1
-  iw_in "$SB_PROJECTS/myproj" say feat-one "rebase onto feat-zero" >/dev/null 2>&1
-
-  local out
-  out="$(iw_in "$SB_TASKS/feat-one" inbox 2>&1)"
-  assert_contains "the task sees the message" "rebase onto feat-zero" "$out"
-
-  # Reading must not consume: the hook is what delivers.
-  assert_contains "and it is still pending afterwards" "rebase onto feat-zero" \
-    "$(iw_in "$SB_TASKS/feat-one" inbox 2>&1)"
-}
-
-test_a_message_is_delivered_on_the_next_prompt() {
-  mk_repo backend
-  iw feat/one -r backend -p myproj >/dev/null 2>&1
-  iw_in "$SB_PROJECTS/myproj" say feat-one "switch to opaque tokens" >/dev/null 2>&1
-
-  # UserPromptSubmit puts plain stdout in front of the model.
-  local out
-  out="$(hook_fire "$SB_TASKS/feat-one" '{"hook_event_name":"UserPromptSubmit"}')"
-  assert_contains "the message arrives with the prompt" "switch to opaque tokens" "$out"
-  assert_contains "and says how to answer" "iwork reply" "$out"
-
-  # Delivered once, not on every turn.
-  case "$(hook_fire "$SB_TASKS/feat-one" '{"hook_event_name":"UserPromptSubmit"}')" in
-    *"switch to opaque tokens"*) bad "redelivered a message that was already read" ;;
-    *) ok ;;
-  esac
-  assert_contains "and the inbox is empty" "(none)" \
-    "$(iw_in "$SB_TASKS/feat-one" inbox 2>&1)"
-}
-
-test_an_urgent_message_diverts_a_working_agent_on_stop() {
-  mk_repo backend
-  iw feat/one -r backend -p myproj >/dev/null 2>&1
-  iw_in "$SB_PROJECTS/myproj" say --urgent feat-one "stop and rebase first" >/dev/null 2>&1
-
-  # Plain stdout on Stop goes to the debug log and nowhere else, so the message
-  # has to come back as the blocking reason on exit 2 -- which is also what
-  # keeps the agent going instead of leaving it to read this next time.
-  local out rc
-  out="$(printf '%s' '{"hook_event_name":"Stop"}' | iw_in "$SB_TASKS/feat-one" --hook 2>&1)"
-  rc=$?
-  assert_eq "the stop is blocked so the agent carries on" "2" "$rc"
-  assert_contains "with the message as the reason" "stop and rebase first" "$out"
-}
-
-test_stop_without_a_message_does_not_block() {
-  mk_repo backend
-  iw feat/one -r backend -p myproj >/dev/null 2>&1
-
-  # The failure mode worth catching: a Stop hook that always blocks is an agent
-  # that can never finish.
-  assert_ok "an empty inbox lets the agent stop" \
-    iw_in "$SB_TASKS/feat-one" --hook <<<'{"hook_event_name":"Stop"}'
-
-  iw_in "$SB_PROJECTS/myproj" say --urgent feat-one "one thing" >/dev/null 2>&1
-  printf '%s' '{"hook_event_name":"Stop"}' | iw_in "$SB_TASKS/feat-one" --hook >/dev/null 2>&1
-
-  # Drained before the block was taken, so the next stop is clean.
-  assert_ok "and it stops on the turn after a delivery" \
-    iw_in "$SB_TASKS/feat-one" --hook <<<'{"hook_event_name":"Stop"}'
-}
-
-test_reply_reaches_the_master() {
-  mk_repo backend
-  iw feat/one -r backend -p myproj >/dev/null 2>&1
-
-  local out
-  out="$(iw_in "$SB_TASKS/feat-one" reply "token shape is now opaque" 2>&1)"
-  assert_contains "the reply is queued for the master" "master of project 'myproj'" "$out"
-
-  # The master reads it from the project directory, where it has no task.
-  out="$(hook_fire "$SB_PROJECTS/myproj" '{"hook_event_name":"UserPromptSubmit"}')"
-  assert_contains "and the master receives it" "token shape is now opaque" "$out"
-  assert_contains "attributed to the task it came from" "feat-one" "$out"
-}
-
-test_a_task_does_not_receive_another_tasks_messages() {
-  mk_repo backend
-  iw feat/one -r backend -p myproj >/dev/null 2>&1
-  iw feat/two -r backend -p myproj >/dev/null 2>&1
-  iw_in "$SB_PROJECTS/myproj" say feat-one "for one only" >/dev/null 2>&1
-
-  case "$(hook_fire "$SB_TASKS/feat-two" '{"hook_event_name":"UserPromptSubmit"}')" in
-    *"for one only"*) bad "delivered a message to the wrong task" ;;
-    *) ok ;;
-  esac
-  assert_contains "and the addressee still gets it" "for one only" \
-    "$(hook_fire "$SB_TASKS/feat-one" '{"hook_event_name":"UserPromptSubmit"}')"
-}
-
-test_a_message_queued_while_nobody_is_running_arrives_at_session_start() {
-  mk_repo backend
-  iw feat/one -r backend -p myproj >/dev/null 2>&1
-  iw_in "$SB_PROJECTS/myproj" say feat-one "read this when you wake up" >/dev/null 2>&1
-
-  assert_contains "a queued message survives until a session starts" \
-    "read this when you wake up" \
-    "$(hook_fire "$SB_TASKS/feat-one" '{"hook_event_name":"SessionStart"}')"
-}
-
-test_say_refuses_a_task_outside_the_project() {
-  mk_repo backend
-  iw feat/one -r backend -p myproj >/dev/null 2>&1
-  iw feat/other -r backend -p otherproj >/dev/null 2>&1
-
-  # A message filed in the wrong project is one nobody ever looks for.
-  assert_fails "a task in another project is refused" \
-    iw_in "$SB_PROJECTS/myproj" say feat-other "hello"
-  assert_fails "and so is one that does not exist" \
-    iw_in "$SB_PROJECTS/myproj" say feat-nope "hello"
-  assert_fails "reply outside a task is refused" \
-    iw_in "$SB_PROJECTS/myproj" reply "hello"
-}
-
-
-test_an_ordinary_message_does_not_interrupt_work_in_progress() {
-  mk_repo backend
-  iw feat/one -r backend -p myproj >/dev/null 2>&1
-  iw_in "$SB_PROJECTS/myproj" say feat-one "when you get a chance, rename the field" >/dev/null 2>&1
-
-  # Taking the Stop costs the agent its stopping point. Most of what a master
-  # has to say does not justify that, and a task halfway through a refactor is
-  # the worst moment to redirect it.
-  assert_ok "the agent is allowed to finish" \
-    iw_in "$SB_TASKS/feat-one" --hook <<<'{"hook_event_name":"Stop"}'
-
-  # Still queued, not consumed by the stop it declined to take.
-  assert_contains "and the message is still waiting" "rename the field" \
-    "$(iw_in "$SB_TASKS/feat-one" inbox 2>&1)"
-
-  # It arrives at the next prompt, alongside whatever comes next.
-  assert_contains "arriving with the next prompt instead" "rename the field" \
-    "$(hook_fire "$SB_TASKS/feat-one" '{"hook_event_name":"UserPromptSubmit"}')"
-}
-
-test_urgency_is_reported_when_sending() {
-  mk_repo backend
-  iw feat/one -r backend -p myproj >/dev/null 2>&1
-
-  local WANT_SESSION_ID="sess-one" WANT_CLAUDE_PID="$$"
-  hook_fire "$SB_TASKS/feat-one" '{"hook_event_name":"SessionStart"}' >/dev/null
-
-  assert_contains "an ordinary message says it will wait" "next prompted" \
-    "$(iw_in "$SB_PROJECTS/myproj" say feat-one "later" 2>&1)"
-  assert_contains "and points at the escape hatch" "--urgent" \
-    "$(iw_in "$SB_PROJECTS/myproj" say feat-one "later" 2>&1)"
-  assert_contains "an urgent one says it will interrupt" "interrupt them" \
-    "$(iw_in "$SB_PROJECTS/myproj" say --urgent feat-one "now" 2>&1)"
-}
-
-test_an_urgent_stop_leaves_ordinary_messages_queued() {
-  mk_repo backend
-  iw feat/one -r backend -p myproj >/dev/null 2>&1
-  iw_in "$SB_PROJECTS/myproj" say feat-one "the calm one" >/dev/null 2>&1
-  iw_in "$SB_PROJECTS/myproj" say --urgent feat-one "the loud one" >/dev/null 2>&1
-
-  local out
-  out="$(printf '%s' '{"hook_event_name":"Stop"}' | iw_in "$SB_TASKS/feat-one" --hook 2>&1)"
-  assert_contains "the urgent one interrupts" "the loud one" "$out"
-  case "$out" in
-    *"the calm one"*) bad "an ordinary message rode along with the interruption" ;;
-    *) ok ;;
-  esac
-  assert_contains "and it is still queued for the next prompt" "the calm one" \
-    "$(iw_in "$SB_TASKS/feat-one" inbox 2>&1)"
-}
-
-test_inbox_marks_which_messages_are_urgent() {
-  mk_repo backend
-  iw feat/one -r backend -p myproj >/dev/null 2>&1
-  iw_in "$SB_PROJECTS/myproj" say --urgent feat-one "drop everything" >/dev/null 2>&1
-
-  assert_contains "the listing says which is which" "(urgent)" \
-    "$(iw_in "$SB_TASKS/feat-one" inbox 2>&1)"
+  # It used to be forwarded to claude, which errors in a pane nobody is
+  # watching: the window is left at a shell and the listing says 'open', which
+  # is what a task you opened by hand looks like.
+  assert_fails "-m after the task name is refused" \
+    iw claude feat-one -m "do the thing"
+  assert_contains "and says where it goes instead" 'iwork -m "<message>" claude' \
+    "$(iw claude feat-one -m "do the thing" 2>&1)"
+  assert_fails "same for codex" iw codex feat-one --message "do the thing"
 }
 
 # --- runner -------------------------------------------------------------------
