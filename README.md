@@ -510,80 +510,46 @@ against any task: its row has no task, by definition.
 
 ### Talking to the tasks
 
-```bash
-iwork say feat-token-api "when you get a chance, rename that field"
-iwork say --urgent feat-token-api "stop — the base you branched from moved"
-iwork reply "shape is opaque now; feat-refresh needs a rebase"   # from a task
-iwork inbox                                                      # what is queued for me
-```
+A master that can only watch is a dashboard. Directing a task is done with Claude
+Code's own session messaging, not with anything iwork adds — iwork's job is to
+tell you *which* session is which:
 
-A master that can only watch is a dashboard. `say` queues a message for the
-agent running in a task; `reply` sends one back from a task to the master.
-Neither types into anyone's terminal.
-
-**Ordinary messages wait for a natural break.** They are read at the recipient's
-next prompt, alongside whatever comes next, so work already under way is not
-disturbed. Most of what a master has to say can wait that long, and a task
-halfway through a refactor is the worst possible moment to redirect it.
-
-**`--urgent` takes the agent's stopping point away.** It is delivered the instant
-the current turn ends, and the agent carries straight on with it instead of
-stopping. That is worth spending when letting the work continue would waste it —
-the base it branched from has moved, the approach was settled elsewhere, the task
-is now redundant — and not for status questions or to hurry something along.
-
-Either way the message is queued on disk, so one sent to a task that is not
-running is delivered at its next session start rather than lost.
-
-The `Stop` path is what makes `--urgent` possible, and it is worth knowing why it
-looks the way it does. Plain stdout on `Stop` goes to Claude Code's debug log and
-nowhere else, so a message printed there would vanish silently. It comes back as
-the *blocking reason* on exit 2 instead — the one form that both reaches the
-model and keeps the agent going. That cannot loop: the drain records messages
-delivered before the block is taken, so the `Stop` that fires next has nothing
-urgent pending and exits 0. There is a test for exactly that, because a `Stop`
-hook that always blocks is an agent that can never finish.
-
-`inbox.tsv` follows the rules the rest of the project memory follows: append-only,
-one line per event, `sent` and `delivered` as separate rows. What is pending is
-derived by reducing the file on read, never stored — the same reason
-`project agents` derives liveness rather than keeping a registry that starts
-lying the moment a delivery is missed. Drains take the project lock, and re-read
-under it, so two hooks firing at once cannot deliver the same message twice.
-
-The recipient of a `reply` is the empty task name, which is the master's address
-by construction: a task can never be addressed by an empty name, and the master
-has no task. A literal `master` recipient would have collided with a task of
-that name.
-
-**What the inbox does not do is wake anyone.** An agent that has finished its
-turn and is sitting at its prompt gets the message the moment it is next
-prompted, but nothing prompts it — no hook fires again until something does.
-
-That case is covered, just not by iwork. The master is itself a Claude Code
-session, and Claude Code sessions on one machine address each other by name;
-`project agents --json` exists to supply the key that finds the name:
+1. `ListAgents` — every live session, the name it answers to, whether it is idle
+   or working, and its tmux pane
+2. `iwork project agents --json` — the pane for each task in this project
+3. pair on the pane, then `SendMessage` to the name
+4. `ListAgents` again — that session should have flipped to working
 
 ```
 agents.tsv     session 1e0c8e77-…                        tmux pane %136
 the harness    feat-project-memory-9c [1e0c8e] · idle ·  tmux tasks:@55.%136
 ```
 
-**Pair them on the pane.** It is recorded on both sides, matches exactly, and is
-the only key that separates two agents working in the same task — which the rest
-of this section exists to say is a thing that happens. The short id beside the
-name is a prefix of `CLAUDE_CODE_SESSION_ID`, so it confirms a pairing, and it
-is what a harness wants when two sessions share a name.
+Pair on the **pane**: it is recorded on both sides, matches exactly, and is the
+only key that separates two agents working in the same task. The short id beside
+the name is a prefix of `CLAUDE_CODE_SESSION_ID`, so it confirms a pairing, and
+it is what a harness wants when two sessions share a name. Step 4 is not
+ceremony — an agent that is idle looks exactly like one that got your message and
+ignored it.
 
-Then message the name, not the id — for the reason stated further up: *the
-session id is not an address*. So the division is: **message the session to make something
-happen now, queue in the inbox to make sure it happens at all.** The inbox
-outlives a session that is not running, reaches an agent whose harness offers no
-messaging, and leaves a record of what was asked; session messaging wakes an
-agent that is sitting idle. A master doing real work uses both.
+Most agents are idle most of the time. One that has finished its turn is sitting
+at its prompt waiting to be spoken to, and nothing else will start it again — no
+hook fires there until something prompts it.
 
-Typing into another agent's pane remains something iwork will not do on your
-behalf — see the note above. It is not needed for this.
+**For a task with no session running, don't message — start one**, with the
+instruction as its first prompt:
+
+```bash
+iwork --detach claude feat-token-api -m "rebase onto feat-zero, the shape changed"
+```
+
+**For anything that should outlive the conversation, use the log.** `iwork
+decided` and `iwork todo` are read by every session on the way in, which is a
+guarantee no message queue offers. iwork briefly had one — `say`/`reply`/`inbox`,
+backed by an append-only `inbox.tsv` and delivered by the hooks — and it was cut
+before it shipped. Every case it covered was already covered better: a live agent
+by `SendMessage`, one that is not running by `claude -m`, and anything durable by
+the project log it duplicated.
 
 ### Joining work already in flight
 
