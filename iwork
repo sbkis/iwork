@@ -360,6 +360,25 @@ warn() {
 # with a dash from being read as an option, and it ends a variadic option like
 # claude's --add-dir, which otherwise swallows a trailing prompt as one more
 # directory. AGENT_ARGS is empty when no message was given.
+# -m after the subcommand is forwarded to the agent as one of its own flags.
+# claude rejects it, so the pane is left at a shell and the window reads as
+# 'open' in the listing — the same as a task you opened by hand. Nothing says
+# the agent never started, and the message goes nowhere.
+reject_trailing_message_flag() {
+  local tool="$1"
+  local arg=""
+
+  shift
+  for arg in "$@"; do
+    case "$arg" in
+      -m|--message)
+        die "-m is an iwork flag, not a $tool one, so it has to come first:
+  iwork -m \"<message>\" $tool <task>"
+        ;;
+    esac
+  done
+}
+
 agent_message_args() {
   AGENT_ARGS=()
   [[ -z "$INITIAL_MESSAGE" ]] || AGENT_ARGS=(-- "$INITIAL_MESSAGE")
@@ -4000,8 +4019,11 @@ hook_master_brief() {
   echo "you build it: 'iwork decided \"B stacks on A; its PR targets A's branch\"'."
   echo ""
   echo "Reaching a task's agent — this is your own tooling, not iwork's:"
-  echo "  1. ListAgents gives every live session: the name it answers to, whether"
-  echo "     it is idle or working, and the tmux pane it occupies."
+  echo "  1. ListAgents gives every live session: the name it answers to, its"
+  echo "     state, and the tmux pane it occupies. 'idle' and 'waiting' both take"
+  echo "     a message; 'busy' takes it at the end of the current turn; 'shell'"
+  echo "     means that pane is not running an agent at all, so start one there"
+  echo "     instead of messaging it."
   echo "  2. 'iwork project agents --json' gives the pane for each task here."
   echo "  3. Pair the two on the pane — it is the only key that separates two"
   echo "     agents working in the same task — then SendMessage to the name."
@@ -4013,7 +4035,9 @@ hook_master_brief() {
   echo ""
   echo "For a task with no session running, don't message — start one, with the"
   echo "instruction as its first prompt:"
-  echo "  iwork --detach claude <task> -m \"<what to do>\""
+  echo "  iwork --detach -m \"<what to do>\" claude <task>"
+  echo "  The -m goes before the subcommand. After it, it is passed to claude as"
+  echo "  a claude flag, which fails in a pane you are not watching."
   echo ""
   echo "Anything a task should still know after everyone has gone home belongs in"
   echo "the project log, not in a message: 'iwork decided', 'iwork todo'. That is"
@@ -4564,8 +4588,9 @@ cmd_project() {
       # Destroys strictly more than rm does, and -f skips the confirmation that
       # a pane running an agent would answer itself. See the note on rm.
       if in_master_context; then
-        die "'project delete' does not run from a project directory: it destroys the memory, and this is where the master sits.
-  Run it from outside the project, or ask the operator."
+        die "'project delete' does not run from a project directory: it destroys the
+  memory, and a master agent sits here. Run it from anywhere else — 'cd' out
+  first — or, if you are an agent, ask the person running this."
       fi
       delete_project "$proj" "$force"
       ;;
@@ -4873,8 +4898,9 @@ if [[ "${1:-}" == "rm" ]]; then
   # A guardrail rather than a sandbox — cd out and it is gone. It is here to
   # catch the accident.
   if in_master_context; then
-    die "'rm' does not run from a project directory: it destroys worktrees, and this is where the master sits.
-  Run it from outside the project, or ask the operator."
+    die "'rm' does not run from a project directory: it destroys worktrees, and a
+  master agent sits here. Run it from anywhere else — 'cd' out first — or, if
+  you are an agent, ask the person running this."
   fi
 
   # rm deletes worktrees, so inferring the task from the directory has to be
@@ -4978,6 +5004,7 @@ if [[ "${1:-}" == "claude" && "${2:-}" != "-r" ]]; then
     die "usage: iwork claude <task> [claude-args...]"
   fi
 
+  reject_trailing_message_flag claude "${@:3}"
   agent_message_args
   run_tool_in_worktree claude "$2" "${@:3}" ${AGENT_ARGS[@]+"${AGENT_ARGS[@]}"}
 fi
@@ -4987,6 +5014,7 @@ if [[ "${1:-}" == "codex" && "${2:-}" != "-r" ]]; then
     die "usage: iwork codex <task> [codex-args...]"
   fi
 
+  reject_trailing_message_flag codex "${@:3}"
   agent_message_args
   run_tool_in_worktree codex "$2" "${@:3}" ${AGENT_ARGS[@]+"${AGENT_ARGS[@]}"}
 fi

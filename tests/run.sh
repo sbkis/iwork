@@ -2249,7 +2249,10 @@ test_master_hook_gives_the_project_role() {
   assert_contains "naming the key it pairs on" "on the pane" "$out"
   assert_contains "and says to verify it landed" "did not land" "$out"
   # A task with nothing running is started with its instruction, not messaged.
-  assert_contains "and what to do when nothing is running there" "claude <task> -m" "$out"
+  assert_contains "and what to do when nothing is running there" "claude <task>" "$out"
+  # -m after the subcommand is forwarded to claude, which rejects it; the brief
+  # got this wrong once and the failure is silent.
+  assert_contains "with the flag where it actually works" '-m "<what to do>" claude' "$out"
   assert_contains "with durable notes going to the log instead" "iwork decided" "$out"
 
   # The two roles are mutually exclusive: a master told to stay inside one task
@@ -2383,7 +2386,7 @@ test_rm_refuses_from_the_project_directory() {
   assert_fails "rm refuses from the project directory" \
     iw_in "$SB_PROJECTS/myproj" rm -f feat-one
   assert_dir "and the task is still there" "$SB_TASKS/feat-one"
-  assert_contains "saying where it will run instead" "ask the operator" \
+  assert_contains "saying where it will run instead" "cd' out first" \
     "$(iw_in "$SB_PROJECTS/myproj" rm -f feat-one 2>&1)"
 
   # From outside the project it is the operator's again.
@@ -2488,6 +2491,21 @@ test_agents_format_flags_are_exclusive() {
     iw project agents --json --tsv myproj
   assert_fails "an unknown format flag is still refused" \
     iw project agents --yaml myproj
+}
+
+
+test_message_flag_after_the_subcommand_is_refused() {
+  mk_repo backend
+  iw feat/one -r backend >/dev/null 2>&1
+
+  # It used to be forwarded to claude, which errors in a pane nobody is
+  # watching: the window is left at a shell and the listing says 'open', which
+  # is what a task you opened by hand looks like.
+  assert_fails "-m after the task name is refused" \
+    iw claude feat-one -m "do the thing"
+  assert_contains "and says where it goes instead" 'iwork -m "<message>" claude' \
+    "$(iw claude feat-one -m "do the thing" 2>&1)"
+  assert_fails "same for codex" iw codex feat-one --message "do the thing"
 }
 
 # --- runner -------------------------------------------------------------------
