@@ -140,7 +140,14 @@ window in a separate 'projects' session (IWORK_PROJECTS_TMUX_SESSION). Creation 
 window (claude starts in the left pane, a shell in the right);
 claude/codex/cd switch to it if it exists. Claude Code hooks (see
 install-hooks) mark the window name with the agent state:
-*task = busy, !task = waiting for you.
+*task = busy, !task = waiting for you. Session names carry the same
+marker, taken from the windows in them: '!tasks' means one of the tasks
+in there wants you, '*tasks' that one is working and none is waiting, and
+a plain 'tasks' that neither is true. A --big task's own session and the
+projects session are marked the same way. The marker is part of the name,
+so a marked session does not answer to 'tmux attach -t tasks': pick it out
+of the session list (prefix + s), or match it by pattern -- the README has
+the keybinding.
 
 -m <message> hands the agent the message as its first prompt, so a new task
 starts working the moment it comes up instead of waiting for you to type it.
@@ -165,8 +172,11 @@ spans several repos:
   window '<repo>'  one per worktree: IWORK_EDITOR (default nvim) on the
                    left, a shell on the right, both inside that worktree
 
-The agent window keeps the task name so the status hooks still apply. Repo
-windows are only added if missing, so 'add-repo' extends a live session.
+The agent window keeps the task name so the status hooks still apply, and
+they mark the session name with it ('*tasks-feat-bla' busy, '!tasks-feat-bla'
+waiting) so the state shows up in the session list as well. Repo windows are
+never marked: they hold an editor, not an agent. Repo windows are only added
+if missing, so 'add-repo' extends a live session.
 list/cd/claude/codex/rm all find a task in its own session or in the shared
 one, and rm kills the whole session. Combine with --detach to build the
 session without being moved into it.
@@ -201,9 +211,10 @@ Subcommands:
                  project whose job is the project rather than any task in it
                  (see Master below)
   install-hooks  Add Claude Code hooks to ~/.claude/settings.json: keep tmux
-                 window names in sync with agent status, inject the project
-                 brief at session start, log PRs, and prompt for a flush before
-                 a compaction. Safe to re-run; it only adds what is missing
+                 window and session names in sync with agent status, inject the
+                 project brief at session start, log PRs, and prompt for a
+                 flush before a compaction. Safe to re-run; it only adds what
+                 is missing
   project        Manage projects: the memory shared by the tasks of one
                  longer-horizon effort (see Projects below)
   todo           Capture something that needs doing but not in this PR
@@ -278,8 +289,9 @@ Master:
 
   A separate session because it is what you want in front of you while the tasks
   are not: attach to it from a second terminal or a second client with
-  'tmux attach -t projects'. Started from outside tmux it builds that session in
-  the background and tells you how to reach it.
+  'tmux attach -t projects' (or '!projects' / '*projects' while the status
+  hooks have it marked). Started from outside tmux it builds that session in
+  the background and tells you how to reach it, marker and all.
 
   Standing in the project directory changes three things, so the master does not
   have to spell them out: a task created there joins that project, it is created
@@ -847,8 +859,7 @@ kill_task_tmux() {
   command -v tmux >/dev/null 2>&1 || return 0
 
   # A --big task owns its session, so the whole session goes.
-  session="$(task_session_name "$folder")"
-  if tmux has-session -t "=$session" 2>/dev/null; then
+  if session="$(resolve_session_name "$(task_session_name "$folder")")"; then
     # Only meaningful when a client is actually attached: with none, tmux still
     # reports *a* current session, which made this refuse to kill anything.
     current_session=""
@@ -872,6 +883,9 @@ kill_task_tmux() {
   fi
 
   tmux kill-window -t "$window_id" 2>/dev/null || warn "could not kill tmux window '$folder'"
+
+  # That window may have been the one thing the session's marker was reporting.
+  refresh_session_marker "$TASKS_SESSION"
 }
 
 remove_worktrees() {
@@ -971,8 +985,7 @@ remove_worktrees() {
     echo "  - the task folder itself"
 
     # Worth spelling out: killing the session takes any editors with it.
-    session="$(task_session_name "$folder")"
-    if tmux_enabled && tmux has-session -t "=$session" 2>/dev/null; then
+    if tmux_enabled && session="$(resolve_session_name "$(task_session_name "$folder")")"; then
       echo "  - tmux session '$session' and everything running in it"
     fi
   fi
@@ -2133,6 +2146,29 @@ task_session_name() {
   printf '%s-%s\n' "$TASKS_SESSION" "$safe"
 }
 
+# The status hooks mark a dedicated task session the same way they mark a
+# window, so the name tmux holds is not always the name we computed. Anything
+# that targets a session by name resolves it here and gets the live name back;
+# non-zero means there is no such session, marked or not.
+resolve_session_name() {
+  local base="$1"
+  local name=""
+  local marked=""
+
+  while IFS= read -r name; do
+    if [[ "$name" == "$base" ]]; then
+      printf '%s\n' "$name"
+      return 0
+    fi
+    if [[ "${name#[*!]}" == "$base" && -z "$marked" ]]; then
+      marked="$name"
+    fi
+  done < <(tmux list-sessions -F '#{session_name}' 2>/dev/null)
+
+  [[ -n "$marked" ]] || return 1
+  printf '%s\n' "$marked"
+}
+
 # Prints "<window-id> <window-name>" for the window called $name in $session,
 # ignoring any leading '*' / '!' status marker.
 find_window_in_session() {
@@ -2140,6 +2176,8 @@ find_window_in_session() {
   local name="$2"
   local window_id=""
   local window_name=""
+
+  session="$(resolve_session_name "$session")" || return 1
 
   while IFS=' ' read -r window_id window_name; do
     if [[ "${window_name#[*!]}" == "$name" ]]; then
@@ -3729,11 +3767,14 @@ spawn_agent_window() {
   local window_id=""
   local pane_id=""
   local tool_cmd=""
+  local live=""
 
-  if tmux has-session -t "=$session" 2>/dev/null; then
+  # The status hooks mark session names too, so the shared session may not be
+  # sitting under the name we were handed.
+  if live="$(resolve_session_name "$session")"; then
     # -d keeps the new window from becoming the session's active window, which
     # would move the client if it is already viewing that session.
-    if ! IFS=' ' read -r window_id pane_id < <(tmux new-window ${IWORK_DETACH:+-d} -t "=$session" -n "$name" -c "$dir" -P -F '#{window_id} #{pane_id}' 2>/dev/null); then
+    if ! IFS=' ' read -r window_id pane_id < <(tmux new-window ${IWORK_DETACH:+-d} -t "=$live" -n "$name" -c "$dir" -P -F '#{window_id} #{pane_id}' 2>/dev/null); then
       warn "could not create tmux window '$name'"
       return 1
     fi
@@ -3759,6 +3800,7 @@ open_task_window() {
   shift 2
   local folder_path="$TASKS_DIR/$folder"
   local window_id=""
+  local live=""
 
   tmux_enabled || return 0
   [[ -d "$folder_path" ]] || return 0
@@ -3778,7 +3820,8 @@ open_task_window() {
   window_id="$(spawn_agent_window "$TASKS_SESSION" "$folder" "$folder_path" "$tool" "$@")" || return 0
 
   if [[ -n "$IWORK_DETACH" ]]; then
-    echo "Started $tool in detached tmux window '$folder' (session '$TASKS_SESSION')"
+    live="$(resolve_session_name "$TASKS_SESSION" || printf '%s' "$TASKS_SESSION")"
+    echo "Started $tool in detached tmux window '$folder' (session '$live')"
     echo "  attach with: iwork cd $folder"
     return 0
   fi
@@ -3792,6 +3835,8 @@ open_master_window() {
   shift 2
   local project_path="$PROJECTS_DIR/$project"
   local window_id=""
+  local live=""
+  local live_arg=""
 
   tmux_enabled || return 0
   [[ -d "$project_path" ]] || return 0
@@ -3811,8 +3856,12 @@ open_master_window() {
   window_id="$(spawn_agent_window "$PROJECTS_SESSION" "$project" "$project_path" "$tool" "$@")" || return 0
 
   if [[ -n "$IWORK_DETACH" ]]; then
-    echo "Started $tool as master for project '$project' (session '$PROJECTS_SESSION')"
-    echo "  attach with: tmux attach -t $PROJECTS_SESSION"
+    live="$(resolve_session_name "$PROJECTS_SESSION" || printf '%s' "$PROJECTS_SESSION")"
+    # A marked name starts with '*' or '!', which the shell would glob or take
+    # as history; quote the hint so it pastes as printed.
+    printf -v live_arg '%q' "$live"
+    echo "Started $tool as master for project '$project' (session '$live')"
+    echo "  attach with: tmux attach -t $live_arg"
     return 0
   fi
 
@@ -3858,7 +3907,9 @@ open_task_session() {
   local tool="$2"
   shift 2
   local folder_path="$TASKS_DIR/$folder"
+  local base_session=""
   local session=""
+  local session_arg=""
   local window_id=""
   local pane_id=""
   local tool_cmd=""
@@ -3869,9 +3920,13 @@ open_task_session() {
   tmux_enabled || return 0
   [[ -d "$folder_path" ]] || return 0
 
-  session="$(task_session_name "$folder")"
+  base_session="$(task_session_name "$folder")"
+  # The live name, which the status hooks may have marked '*' / '!'; empty when
+  # the session is not there yet.
+  session="$(resolve_session_name "$base_session" || true)"
 
-  if ! tmux has-session -t "=$session" 2>/dev/null; then
+  if [[ -z "$session" ]]; then
+    session="$base_session"
     # The task may already be open as a plain window in the shared session;
     # starting a second agent for it in a new session would be a surprise.
     if shared_line="$(find_window_in_session "$TASKS_SESSION" "$folder")"; then
@@ -3908,13 +3963,17 @@ open_task_session() {
     echo "tmux session '$session': '$folder' running $tool, plus $added repo window(s)"
   fi
 
+  # A marked session name starts with '*' or '!', which a shell would glob or
+  # treat as history; quote the hint so it can be pasted as printed.
+  printf -v session_arg '%q' "$session"
+
   if [[ -n "$IWORK_DETACH" ]]; then
-    echo "  attach with: tmux switch-client -t $session   (or: tmux attach -t $session)"
+    echo "  attach with: tmux switch-client -t $session_arg   (or: tmux attach -t $session_arg)"
     return 0
   fi
 
   if ! in_tmux; then
-    echo "  attach with: tmux attach -t $session"
+    echo "  attach with: tmux attach -t $session_arg"
     return 0
   fi
 
@@ -3941,8 +4000,7 @@ extend_task_session() {
   local added=0
 
   tmux_enabled || return 0
-  session="$(task_session_name "$folder")"
-  tmux has-session -t "=$session" 2>/dev/null || return 0
+  session="$(resolve_session_name "$(task_session_name "$folder")")" || return 0
 
   added="$(add_repo_windows "$folder" "$session")"
   (( added > 0 )) && echo "Added $added window(s) to tmux session '$session'"
@@ -4151,6 +4209,78 @@ hook_post_tool_use() {
   echo "iwork: recorded $url in project '$HOOK_PROJECT'"
 }
 
+# The state a session should advertise, read off the windows in it: '!' if any
+# agent in there wants you, '*' if one is working, empty if neither. A window
+# speaks for one agent and keeps its marker until that agent moves; a session
+# speaks for all of them, so its marker is derived on every hook and clears
+# itself once the last agent stops waiting.
+session_agent_marker() {
+  local session="$1"
+  local name=""
+  local marker=""
+
+  while IFS= read -r name; do
+    case "$name" in
+      '!'*)
+        # Waiting outranks working: the whole point is spotting the one that
+        # cannot move without you.
+        printf '!\n'
+        return 0
+        ;;
+      '*'*) marker='*' ;;
+    esac
+  done < <(tmux list-windows -t "=$session" -F '#{window_name}' 2>/dev/null)
+
+  printf '%s\n' "$marker"
+}
+
+# Puts that state on the session name. $base is the name without a marker,
+# $session the live one, which may already carry a stale marker.
+mark_session() {
+  local base="$1"
+  local session="$2"
+  local marker=""
+
+  marker="$(session_agent_marker "$session")"
+  [[ "$session" != "${marker}${base}" ]] || return 0
+
+  tmux rename-session -t "=$session" "${marker}${base}" 2>/dev/null || true
+}
+
+# For the paths that change a session's contents without an agent event behind
+# them ('rm' closing the last waiting window), so the name does not keep
+# claiming an agent that is gone.
+refresh_session_marker() {
+  local base="$1"
+  local session=""
+
+  command -v tmux >/dev/null 2>&1 || return 0
+  session="$(resolve_session_name "$base")" || return 0
+  mark_session "$base" "$session"
+}
+
+# The session list (prefix + s, switch-client, list-sessions) shows session
+# names and nothing else, so a marker that lives only on windows never reaches
+# it. Whichever of iwork's sessions this pane sits in gets the state of the
+# agents inside it: a --big task's own session speaks for its one agent, the
+# shared 'tasks' and 'projects' sessions for whichever of theirs is waiting.
+# A session iwork did not make is never renamed.
+mark_task_session() {
+  local base="$1"
+  local session=""
+  local unmarked=""
+
+  session="$(tmux display-message -p -t "$TMUX_PANE" '#{session_name}' 2>/dev/null)" || return 0
+  unmarked="${session#[*!]}"
+
+  if [[ "$unmarked" != "$TASKS_SESSION" && "$unmarked" != "$PROJECTS_SESSION" &&
+        "$unmarked" != "$(task_session_name "$base")" ]]; then
+    return 0
+  fi
+
+  mark_session "$unmarked" "$session"
+}
+
 mark_task_window() {
   local event="$1"
   local window_name=""
@@ -4182,6 +4312,8 @@ mark_task_window() {
   if [[ "$window_name" != "${marker}${base}" ]]; then
     tmux rename-window -t "$TMUX_PANE" "${marker}${base}" 2>/dev/null || true
   fi
+
+  mark_task_session "$base"
 }
 
 handle_claude_hook() {
