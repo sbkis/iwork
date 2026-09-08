@@ -1448,6 +1448,60 @@ test_hook_marks_a_big_tasks_own_session() {
   unset -f hook_in_pane
 }
 
+test_hook_marks_the_shared_session_from_its_windows() {
+  command -v tmux >/dev/null 2>&1 || { printf '    skip (no tmux)\n'; return 0; }
+  mk_repo backend
+  iw feat/one -r backend -p myproj >/dev/null 2>&1
+  iw feat/two -r backend -p myproj >/dev/null 2>&1
+
+  tmux_t new-session -d -s tasks -n feat-one -c "$SB_TASKS/feat-one" 2>/dev/null
+  tmux_t new-window -d -t '=tasks' -n feat-two -c "$SB_TASKS/feat-two" 2>/dev/null
+  local one two socket
+  one="$(tmux_t list-panes -t '=tasks:feat-one' -F '#{pane_id}' 2>/dev/null | head -1)"
+  two="$(tmux_t list-panes -t '=tasks:feat-two' -F '#{pane_id}' 2>/dev/null | head -1)"
+  socket="$(tmux_t display-message -p '#{socket_path}' 2>/dev/null)"
+  if [[ -z "$one" || -z "$two" || -z "$socket" ]]; then
+    printf '    skip (could not start isolated tmux server)\n'
+    return 0
+  fi
+
+  hook_in_pane() {
+    printf '{"hook_event_name":"%s"}' "$2" | env \
+      TMUX="$socket,1,0" TMUX_PANE="$1" TMUX_TMPDIR="$SB/tmux" \
+      HOME="$SB_HOME" IWORK_CONFIG_FILE="$SB/config" \
+      IWORK_REPO_DIR="$SB_REPOS" IWORK_TASKS_DIR="$SB_TASKS" \
+      IWORK_PROJECTS_DIR="$SB_PROJECTS" \
+      "$IWORK_SRC" --hook >/dev/null 2>&1
+  }
+  shared_name() { tmux_t list-sessions -F '#{session_name}' 2>/dev/null | grep -E '^[*!]?tasks$'; }
+
+  hook_in_pane "$one" UserPromptSubmit
+  assert_eq "one agent working marks the session busy" "*tasks" "$(shared_name)"
+
+  # Waiting outranks working: the session has to report the agent that cannot
+  # move without you, not the one that is fine.
+  hook_in_pane "$two" Stop
+  assert_eq "one waiting agent wins over a working one" "!tasks" "$(shared_name)"
+
+  hook_in_pane "$two" UserPromptSubmit
+  assert_eq "and it drops back when nobody waits" "*tasks" "$(shared_name)"
+
+  # Derived, not sticky: closing the last waiting window has to clear it.
+  hook_in_pane "$two" Stop
+  assert_eq "waiting again" "!tasks" "$(shared_name)"
+  WANT_TMUX=1 iw rm -f feat-two >/dev/null 2>&1
+  assert_eq "rm of the waiting task refreshes the session" "*tasks" "$(shared_name)"
+
+  # And the marked name must not send iwork off to build a second session.
+  iw feat/three -r backend >/dev/null 2>&1
+  WANT_TMUX=1 iw --detach claude feat-three >/dev/null 2>&1
+  assert_eq "no second shared session was created" "1" "$(shared_name | grep -c .)"
+  assert_contains "the new window landed in the marked session" "feat-three" \
+    "$(tmux_t list-windows -t "=$(shared_name)" -F '#{window_name}' 2>/dev/null | tr '\n' ' ')"
+
+  unset -f hook_in_pane shared_name
+}
+
 test_install_hooks_registers_every_event() {
   command -v python3 >/dev/null 2>&1 || { printf '    skip (no python3)\n'; return 0; }
   iw install-hooks "$SB/settings.json" >/dev/null 2>&1
