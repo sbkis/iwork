@@ -117,8 +117,9 @@ it up.
 ### 5. Install Claude Code status hooks (optional)
 
 These keep the tmux window name in sync with the agent state
-(`*task` = busy, `!task` = waiting for you). Idempotent; shows the change and asks
-before writing.
+(`*task` = busy, `!task` = waiting for you), and mark a `--big` task's own
+session name the same way. Idempotent; shows the change and asks before
+writing.
 
 ```bash
 iwork install-hooks              # edits ~/.claude/settings.json
@@ -143,7 +144,10 @@ set -g status-right '!#(tmux list-windows -a -F "#W" 2>/dev/null | grep -c "^!")
 ```
 
 Only `iwork` marks window names with `!`, so counting across all sessions is safe.
-With `--big` in play, `prefix + s` lists the `tasks-` sessions together.
+Counting windows rather than sessions also keeps a `--big` task from being counted
+twice: its session name carries the same marker as its agent window.
+With `--big` in play, `prefix + s` lists the `tasks-` sessions together, each one
+showing whether its agent is busy or waiting.
 
 ## Quick start
 
@@ -316,7 +320,7 @@ work, not an event. So three of the four paths are hooks instead (installed by
 | `SessionEnd` | Records that the session left, so it stops being listed as live | none — an event, not a judgement |
 | `PostToolUse` (Bash) | Logs the PR URL when the command really is `gh pr create` | none — a URL is a fact |
 | `PreCompact` | Prompts a flush right before the reasoning is discarded | the agent's, but at the right moment |
-| `Stop` / `UserPromptSubmit` / `Notification` | tmux window markers, as before | n/a |
+| `Stop` / `UserPromptSubmit` / `Notification` | tmux window markers, plus the same marker on a `--big` task's session | n/a |
 
 Deliberately absent: anything that *forces* a log entry. A hook that demands one
 every session produces filler, and filler degrades the exact file every future
@@ -772,6 +776,11 @@ How it fits with everything else:
 - **The agent window keeps the task name**, so the Claude Code status hooks still
   rename it `*task` / `!task`, and `iwork list` reports it — tagged `(session)` so
   you can see which tasks own one.
+- **The session name is marked too** — `*tasks-feat-big-thing` while the agent
+  works, `!tasks-feat-big-thing` when it wants you. The session list (`prefix + s`)
+  shows names and nothing else, so without this a task that owns a session was
+  the one place the state did not reach. Everything that looks a session up by
+  name (`cd`, `claude`, `codex`, `add-repo`, `rm`, `list`) ignores the marker.
 - **`cd`, `claude`, `codex`** find a task in its own session or in the shared one,
   whether or not you pass `--big` again.
 - **`add-repo`** adds a window for the new repo to a live session.
