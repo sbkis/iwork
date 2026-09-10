@@ -826,10 +826,37 @@ The rule is a function of the task, which is what keeps it predictable:
 - `--big` still wins: a task with its own session keeps it, project or no
   project.
 
-One consequence worth knowing: `projects` on its own is no longer a session. If
-you have one running from before, kill it — `iwork master <project>` now looks in
-`projects-<project>`, so an old master would sit there unreachable while a second
-one started next to it.
+### Moving an existing setup over
+
+Nothing on disk changes: project directories, `.project` links, `history.tsv`,
+`agents.tsv` and the task folders are untouched by this. The only thing that
+drifts is live tmux windows, and one command per project settles it:
+
+```bash
+iwork master claims     # the project's own session, assembled
+```
+
+That does two things, and says so line by line:
+
+- **Adopts a master left in the old shared `projects` session.** That window is
+  the real master — an agent already holding the project's brief — so it is moved
+  into `projects-claims` as the first window rather than left behind for a second
+  master to duplicate. The old `projects` session disappears once its last window
+  leaves, which is tmux's rule, not iwork's.
+- **Gathers the project's tasks** out of the shared session into
+  `projects-claims`. Tasks belonging to no project are left alone.
+
+Neither is migration-only: gathering repairs any later drift the same way, and
+both are no-ops once every window is where it belongs — so re-running `iwork
+master` is always safe. To move a single task's window instead, re-run `iwork
+project add <project> <task>` on a task that is already attached.
+
+Two things it deliberately does not do. It never moves **the window you are
+looking at** — that would make your client jump to whatever was left behind — and
+it never touches a `--big` task, which owns its session by design. Nothing needs
+doing for the windows it skips: every lookup searches the project's session, the
+shared one, and then everywhere else iwork owns, so a window that stays put is
+still found rather than duplicated.
 
 ## Big tasks: a session per task
 
