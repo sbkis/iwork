@@ -165,6 +165,21 @@ iw_in() {
 }
 
 tmux_t() { env -u TMUX TMUX_TMPDIR="$SB/tmux" tmux -f /dev/null "$@"; }
+
+# send-keys returns once the keys are in the pane's input buffer, not once the
+# command has started, so a test that reads pane state straight afterwards races
+# the shell and sees the shell.
+wait_for_pane_command() {
+  local pane="$1" want="$2" waited=0
+
+  while (( waited < 50 )); do
+    [[ "$(tmux_t display-message -p -t "$pane" '#{pane_current_command}' 2>/dev/null)" != "$want" ]] || return 0
+    command sleep 0.1
+    waited=$((waited + 1))
+  done
+
+  return 1
+}
 tmux_kill_server() { env -u TMUX TMUX_TMPDIR="$SB/tmux" tmux kill-server 2>/dev/null; return 0; }
 
 # --- assertions ---------------------------------------------------------------
@@ -2782,6 +2797,221 @@ test_message_flag_after_the_subcommand_is_refused() {
   assert_contains "and says where it goes instead" 'iwork -m "<message>" claude' \
     "$(iw claude feat-one -m "do the thing" 2>&1)"
   assert_fails "same for codex" iw codex feat-one --message "do the thing"
+}
+
+# --- resurrect ----------------------------------------------------------------
+
+# The claude stub exits the moment it is sent into a pane, so a task created in
+# the sandbox already looks exactly like one whose agent a dead tmux server took
+# with it: the window is there, the pane is back at a shell.
+
+test_resurrect_restarts_a_dead_agent_pane() {
+  command -v tmux >/dev/null 2>&1 || { printf '    skip (no tmux)\n'; return 0; }
+  mk_repo backend
+  WANT_TMUX=1 iw --detach feat/one -r backend >/dev/null 2>&1
+
+  local out
+  out="$(WANT_TMUX=1 iw resurrect 2>&1)"
+  assert_contains "the dead pane is restarted" "feat-one: restarted" "$out"
+  assert_contains "and resumes the conversation it was having" "claude --continue" "$out"
+
+  # The window it already had is the one it keeps: a second one would be a
+  # second agent for the same worktrees.
+  local count
+  count="$(tmux_t list-windows -t '=tasks' -F '#{window_name}' 2>/dev/null | grep -c '^feat-one$')"
+  assert_eq "no second window was made" "1" "$(printf '%s' "$count" | tr -d ' ')"
+}
+
+test_resurrect_opens_a_window_for_a_task_that_has_none() {
+  command -v tmux >/dev/null 2>&1 || { printf '    skip (no tmux)\n'; return 0; }
+  mk_repo backend
+  # Created with tmux off, so the task exists on disk with no window anywhere —
+  # which is what every task looks like after a server is lost outright.
+  iw feat/one -r backend >/dev/null 2>&1
+
+  assert_contains "a window is opened for it" "feat-one: opened a window" \
+    "$(WANT_TMUX=1 iw resurrect 2>&1)"
+  assert_contains "in the session the task belongs to" "feat-one" \
+    "$(tmux_t list-windows -t '=tasks' -F '#{window_name}' 2>/dev/null | tr '\n' ' ')"
+}
+
+test_resurrect_closes_a_window_whose_task_is_gone() {
+  command -v tmux >/dev/null 2>&1 || { printf '    skip (no tmux)\n'; return 0; }
+  mk_repo backend
+  WANT_TMUX=1 iw --detach feat/one -r backend >/dev/null 2>&1
+
+  # Deleted behind iwork's back, which is how a restorer ends up replaying a
+  # window for a task that no longer exists.
+  rm -rf "$SB_TASKS/feat-one"
+
+  assert_contains "the leftover window is closed" "closed window 'feat-one'" \
+    "$(WANT_TMUX=1 iw resurrect 2>&1)"
+  case "$(tmux_t list-windows -t '=tasks' -F '#{window_name}' 2>/dev/null | tr '\n' ' ')" in
+    *feat-one*) bad "resurrect left the leftover window behind" ;;
+    *) ok ;;
+  esac
+}
+
+test_resurrect_never_closes_a_window_with_something_running() {
+  command -v tmux >/dev/null 2>&1 || { printf '    skip (no tmux)\n'; return 0; }
+  mk_repo backend
+  WANT_TMUX=1 iw --detach feat/one -r backend >/dev/null 2>&1
+
+  local pane
+  pane="$(tmux_t list-panes -t '=tasks:feat-one' -F '#{pane_id}' 2>/dev/null | head -1)"
+  # 'cat' with no argument blocks on stdin forever, so the pane reports a live
+  # foreground job without the suite having to sleep for one.
+  tmux_t send-keys -t "$pane" 'cat' Enter 2>/dev/null
+  wait_for_pane_command "$pane" cat || { printf '    skip (pane never ran cat)\n'; return 0; }
+  rm -rf "$SB_TASKS/feat-one"
+
+  local out
+  out="$(WANT_TMUX=1 iw resurrect 2>&1)"
+  assert_contains "it says why the window was spared" "running 'cat'" "$out"
+  assert_contains "the window is still there" "feat-one" \
+    "$(tmux_t list-windows -t '=tasks' -F '#{window_name}' 2>/dev/null | tr '\n' ' ')"
+}
+
+test_resurrect_never_types_into_a_pane_that_is_busy() {
+  command -v tmux >/dev/null 2>&1 || { printf '    skip (no tmux)\n'; return 0; }
+  mk_repo backend
+  WANT_TMUX=1 iw --detach feat/one -r backend >/dev/null 2>&1
+
+  local pane
+  pane="$(tmux_t list-panes -t '=tasks:feat-one' -F '#{pane_id}' 2>/dev/null | head -1)"
+  tmux_t send-keys -t "$pane" 'cat' Enter 2>/dev/null
+  wait_for_pane_command "$pane" cat || { printf '    skip (pane never ran cat)\n'; return 0; }
+
+  # Typing 'claude --continue' at an editor puts it in a buffer, so a pane that
+  # is not an idle shell is reported and left alone.
+  local out
+  out="$(WANT_TMUX=1 iw resurrect 2>&1)"
+  assert_contains "the busy pane is left alone" "left alone" "$out"
+  case "$out" in
+    *"feat-one: restarted"*) bad "resurrect typed into a busy pane" ;;
+    *) ok ;;
+  esac
+}
+
+test_resurrect_dry_run_changes_nothing() {
+  command -v tmux >/dev/null 2>&1 || { printf '    skip (no tmux)\n'; return 0; }
+  mk_repo backend
+  WANT_TMUX=1 iw --detach feat/one -r backend >/dev/null 2>&1
+  iw feat/two -r backend >/dev/null 2>&1
+  rm -rf "$SB_TASKS/feat-one"
+
+  local out
+  out="$(WANT_TMUX=1 iw resurrect -n 2>&1)"
+  assert_contains "it says it is a dry run" "Dry run" "$out"
+  assert_contains "and what it would close" "would close window 'feat-one'" "$out"
+  assert_contains "and what it would open" "feat-two: would open" "$out"
+
+  local windows
+  windows="$(tmux_t list-windows -t '=tasks' -F '#{window_name}' 2>/dev/null | tr '\n' ' ')"
+  assert_contains "the leftover window is untouched" "feat-one" "$windows"
+  case "$windows" in
+    *feat-two*) bad "a dry run opened a window" ;;
+    *) ok ;;
+  esac
+}
+
+test_resurrect_leaves_a_big_tasks_own_session_alone() {
+  command -v tmux >/dev/null 2>&1 || { printf '    skip (no tmux)\n'; return 0; }
+  mk_repo backend
+  mk_repo frontend
+  WANT_TMUX=1 iw --detach --big feat/one -r backend frontend >/dev/null 2>&1
+  tmux_t has-session -t '=tasks-feat-one' 2>/dev/null || {
+    printf '    skip (--big session not created in this environment)\n'; return 0; }
+
+  WANT_TMUX=1 iw resurrect >/dev/null 2>&1
+
+  # The repo windows in a --big session are named after repos, not tasks. A
+  # sweep that read them as task windows would close every one of them.
+  local windows
+  windows="$(tmux_t list-windows -t '=tasks-feat-one' -F '#{window_name}' 2>/dev/null | tr '\n' ' ')"
+  assert_contains "the agent window survives" "feat-one" "$windows"
+  assert_contains "and so does the backend repo window" "backend" "$windows"
+  assert_contains "and the frontend one" "frontend" "$windows"
+}
+
+test_resurrect_big_restores_a_task_to_its_own_session() {
+  command -v tmux >/dev/null 2>&1 || { printf '    skip (no tmux)\n'; return 0; }
+  mk_repo backend
+  # Bigness is recorded in the session layout and nowhere on disk, so a task
+  # whose session died can only come back big by being named.
+  iw feat/one -r backend >/dev/null 2>&1
+
+  WANT_TMUX=1 iw resurrect --big feat-one >/dev/null 2>&1
+  if ! tmux_t has-session -t '=tasks-feat-one' 2>/dev/null; then
+    printf '    skip (--big session not created in this environment)\n'
+    return 0
+  fi
+  ok
+
+  case "$(tmux_t list-windows -t '=tasks' -F '#{window_name}' 2>/dev/null | tr '\n' ' ')" in
+    *feat-one*) bad "the big task also got a window in the shared session" ;;
+    *) ok ;;
+  esac
+
+  assert_contains "and list says it owns a session" "(session)" \
+    "$(WANT_TMUX=1 iw --big list 2>&1 | grep feat-one)"
+}
+
+test_resurrect_big_refuses_a_task_that_is_not_there() {
+  command -v tmux >/dev/null 2>&1 || { printf '    skip (no tmux)\n'; return 0; }
+  mk_repo backend
+  WANT_TMUX=1 assert_fails "--big on a task that does not exist is refused" \
+    iw resurrect --big feat-nope
+  assert_contains "and says so" "no such task" \
+    "$(WANT_TMUX=1 iw resurrect --big feat-nope 2>&1)"
+}
+
+test_resurrect_keeps_a_master_window() {
+  command -v tmux >/dev/null 2>&1 || { printf '    skip (no tmux)\n'; return 0; }
+  mk_repo backend
+  iw feat/one -r backend -p myproj >/dev/null 2>&1
+  WANT_TMUX=1 iw master myproj >/dev/null 2>&1
+
+  # A master window is named after its project, and no task of that name exists.
+  # A sweep that did not know the difference would close it.
+  WANT_TMUX=1 iw resurrect >/dev/null 2>&1
+  assert_contains "the master window survives the sweep" "myproj" \
+    "$(tmux_t list-windows -t '=projects-myproj' -F '#{window_name}' 2>/dev/null | tr '\n' ' ')"
+}
+
+test_resurrect_gathers_a_projects_task_back_into_its_session() {
+  command -v tmux >/dev/null 2>&1 || { printf '    skip (no tmux)\n'; return 0; }
+  mk_repo backend
+  WANT_TMUX=1 iw --detach feat/one -r backend -p myproj >/dev/null 2>&1
+  tmux_t has-session -t '=projects-myproj' 2>/dev/null || {
+    printf '    skip (project session not created in this environment)\n'; return 0; }
+
+  # A restorer rebuilds windows from a snapshot with no idea which session each
+  # one belongs in, so drift like this is exactly what it leaves behind.
+  tmux_t new-session -d -s tasks 2>/dev/null
+  tmux_t move-window -s '=projects-myproj:feat-one' -t '=tasks:' 2>/dev/null
+
+  WANT_TMUX=1 iw resurrect >/dev/null 2>&1
+
+  assert_contains "the task is back in its project's session" "feat-one" \
+    "$(tmux_t list-windows -t '=projects-myproj' -F '#{window_name}' 2>/dev/null | tr '\n' ' ')"
+  case "$(tmux_t list-windows -t '=tasks' -F '#{window_name}' 2>/dev/null | tr '\n' ' ')" in
+    *feat-one*) bad "resurrect left the task in the shared session" ;;
+    *) ok ;;
+  esac
+}
+
+test_resurrect_is_refused_without_tmux() {
+  mk_repo backend
+  # Its whole job is repairing tmux state, so silently doing nothing would be
+  # the wrong answer.
+  assert_fails "resurrect refuses with --no-tmux" iw resurrect
+  assert_contains "and says why" "repairs tmux" "$(iw resurrect 2>&1)"
+}
+
+test_resurrect_rejects_an_unknown_argument() {
+  assert_fails "a stray argument is refused" iw resurrect feat-one
+  assert_contains "with the usage line" "iwork resurrect" "$(iw resurrect feat-one 2>&1)"
 }
 
 # --- runner -------------------------------------------------------------------
