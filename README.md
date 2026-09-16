@@ -128,9 +128,11 @@ iwork install-hooks path/to/settings.json   # or a specific settings file
 
 ### 6. Recommended tmux config (optional)
 
-Task windows live in a dedicated `tasks` session. These `~/.tmux.conf` additions make
-it easy to move between your regular sessions and the tasks session, and surface how
-many agents are waiting:
+iwork keeps its windows in sessions of its own — `tasks` for loose tasks, one
+`projects-<project>` per project, one `tasks-<task>` per `--big` task (see
+[Which session holds what](#which-session-holds-what)). These `~/.tmux.conf`
+additions make it easy to move between your regular sessions and iwork's, and
+surface how many agents are waiting:
 
 ```tmux
 setw -g automatic-rename off        # let iwork own the task window names
@@ -151,8 +153,9 @@ Only `iwork` marks names with `!`, so counting across all sessions is safe. Coun
 counting both would count the same waiting agent twice.
 
 `prefix + s` is where the session markers pay off — every session in the list says
-whether something in it is working, waiting, or idle, `tasks` and the per-task
-`tasks-*` sessions alike.
+whether something in it is working, waiting, or idle: the shared `tasks`, each
+project's session, and the per-task `tasks-*` sessions alike. One row per project
+is the whole point of the layout below.
 
 ## Quick start
 
@@ -355,13 +358,14 @@ derived from its windows on every hook, and `!` outranks `*`:
 
 | Session name | Meaning |
 |---|---|
-| `!tasks` | at least one agent in there is waiting for you |
-| `*tasks` | one is working, none is waiting |
-| `tasks` | neither — nothing in there wants anything |
+| `!projects-claims` | at least one agent in there is waiting for you |
+| `*projects-claims` | one is working, none is waiting |
+| `projects-claims` | neither — nothing in there wants anything |
 
-That holds for `tasks`, for `projects`, and for a `--big` task's own
-`tasks-<task>`; repo windows under `--big` hold an editor rather than an agent, so
-they never count. Being derived is what lets it *clear* — a window's marker can
+That holds for every session iwork owns: the shared `tasks`, each
+`projects-<project>` (its master and its tasks counted together), and a `--big`
+task's own `tasks-<task>`. Repo windows under `--big` hold an editor rather than
+an agent, so they never count. Being derived is what lets it *clear* — a window's marker can
 only be replaced by the next event from that same agent, while a session recomputes
 from what is actually there. `iwork rm` re-derives it too, so closing the last
 waiting task drops the `!` immediately rather than leaving the name lying.
@@ -488,8 +492,8 @@ quietly redirect the thing in front of you.
 ### The master: one agent whose job is the project
 
 ```bash
-iwork master auth-rewrite          # or bare `iwork master` from inside the project
-tmux attach -t projects            # from a second terminal, or a second client
+iwork master auth-rewrite            # or bare `iwork master` from inside the project
+tmux attach -t projects-auth-rewrite # from a second terminal, or a second client
 ```
 
 Every other session iwork starts is scoped to one task, one branch, one set of
@@ -498,11 +502,14 @@ for the shape of the work: what the tasks should be, what order they stack in,
 when one is far enough along that the next can branch off it, whether two of them
 are converging on the same file. The master is the session for that.
 
-It gets a window of its own, named after the project, in a separate `projects`
-session — not a window in `tasks`. A separate session because it is the thing you
-want in front of you while the tasks are not: attach to it from another terminal
-or another client and leave it there. Started from outside tmux it builds that
-session in the background and tells you how to reach it.
+It gets the **first window of the session its project owns** — `projects-claims`
+for project `claims` — named after the project, with the tasks it spawns in the
+windows behind it. A session per project because a project is the unit you attend
+to: attach to it from another terminal or another client and leave it there, move
+between the master and its tasks with `prefix + n`, and read one row in the
+session list to know whether anything in that project wants you. Started from
+outside tmux it builds the session in the background and tells you how to reach
+it. `project delete` takes the session with it.
 
 Its cwd is the project directory, which is what makes it cheap: every project
 verb already resolves the project from where you are standing, so `iwork project
@@ -522,7 +529,7 @@ to spell them out:
 | From the project directory | Why |
 |---|---|
 | a new task joins that project without `-p` | naming it on every line is one typo from an orphan task |
-| tasks are created detached | otherwise spawning one calls `switch-client` and drags your client into the tasks session |
+| tasks are created detached | otherwise spawning one calls `switch-client` and moves your client off the master's own window |
 | `rm` and `project delete` refuse | they destroy worktrees and memory, and that stays yours |
 
 The last one is a guardrail rather than a sandbox — `cd` out and it is gone. It
@@ -774,11 +781,82 @@ iwork -d feat/login-bug -r backend-api                  # -d is the short form
 
 Useful when you want an agent chewing on something while you keep working, and
 for scripting: because nothing needs a client to switch, `--detach` also works
-from **outside** tmux, creating the tasks session in the background.
+from **outside** tmux, creating whichever session the task belongs in
+([which one](#which-session-holds-what)) in the background.
 
 Pick the task up whenever you like with `iwork cd <task>`, or watch it from
 `iwork list` — the `*` / `!` markers report whether the agent is busy or waiting
 for you. Set `IWORK_DETACH=1` in your config to make this the default.
+
+## Which session holds what
+
+A task's window goes where its **project** says, not where it was created from:
+
+```
+session tasks                     tasks that belong to no project
+|- window "feat-login-bug"        claude | shell
+'- window "chore-bump-deps"
+
+session projects-claims           one per project
+|- window "claims"                the master, always the first window
+|- window "feat-response"         a task of that project
+'- window "feat-askilnadur"       another
+
+session tasks-feat-big-thing      a --big task owns a whole session
+|- window "feat-big-thing"        the agent
+'- window "backend-api"           one per repo: nvim | shell
+```
+
+Before this, every task went into `tasks` — so a master spawning five of them
+buried the two you were working on yourself. Now the shared session means one
+thing: **tasks that belong to no project.**
+
+The rule is a function of the task, which is what keeps it predictable:
+
+- `iwork feat/x -r backend -p claims` lands in `projects-claims` whether you
+  typed it or its master did. Who created it is not part of the address.
+- `iwork project add claims feat-x` on a task that is already running **moves its
+  window** into the project's session, and `project rm` moves it back out. The
+  session is created if it is not there yet, and destroyed by tmux when its last
+  window leaves.
+- `cd`, `claude`, `codex`, `list` and `rm` look for a task's window in its own
+  session, then its project's, then the shared one — and then across every
+  session iwork owns, so a window that has drifted is still found rather than
+  duplicated.
+- `--big` still wins: a task with its own session keeps it, project or no
+  project.
+
+### Moving an existing setup over
+
+Nothing on disk changes: project directories, `.project` links, `history.tsv`,
+`agents.tsv` and the task folders are untouched by this. The only thing that
+drifts is live tmux windows, and one command per project settles it:
+
+```bash
+iwork master claims     # the project's own session, assembled
+```
+
+That does two things, and says so line by line:
+
+- **Adopts a master left in the old shared `projects` session.** That window is
+  the real master — an agent already holding the project's brief — so it is moved
+  into `projects-claims` as the first window rather than left behind for a second
+  master to duplicate. The old `projects` session disappears once its last window
+  leaves, which is tmux's rule, not iwork's.
+- **Gathers the project's tasks** out of the shared session into
+  `projects-claims`. Tasks belonging to no project are left alone.
+
+Neither is migration-only: gathering repairs any later drift the same way, and
+both are no-ops once every window is where it belongs — so re-running `iwork
+master` is always safe. To move a single task's window instead, re-run `iwork
+project add <project> <task>` on a task that is already attached.
+
+Two things it deliberately does not do. It never moves **the window you are
+looking at** — that would make your client jump to whatever was left behind — and
+it never touches a `--big` task, which owns its session by design. Nothing needs
+doing for the windows it skips: every lookup searches the project's session, the
+shared one, and then everywhere else iwork owns, so a window that stays put is
+still found rather than duplicated.
 
 ## Big tasks: a session per task
 
@@ -815,16 +893,18 @@ How it fits with everything else:
   session was the one place the state did not reach. Everything that looks a
   session up by name (`cd`, `claude`, `codex`, `add-repo`, `rm`, `list`) ignores
   the marker.
-- **`cd`, `claude`, `codex`** find a task in its own session or in the shared one,
-  whether or not you pass `--big` again.
+- **`cd`, `claude`, `codex`** find a task wherever its window is — its own
+  session, its project's, or the shared one — whether or not you pass `--big`
+  again.
 - **`add-repo`** adds a window for the new repo to a live session.
 - **`rm`** kills the whole session, and says so before it does — anything unsaved
   in those editors goes with it.
 - **`--big --detach`** builds the session without moving you into it, and works
   from outside tmux entirely.
 
-If a task is already open as a plain window in the shared session, `--big` will
-not start a second agent for it in a new session; close that window first.
+If a task is already open as a plain window somewhere — the shared session or its
+project's — `--big` will not start a second agent for it in a new session; close
+that window first.
 
 Set `IWORK_BIG=1` in your config to make every task work this way.
 
@@ -888,8 +968,8 @@ overrides.
 | `IWORK_REPO_DIR` | — (required) | Directory whose direct children are your git repos |
 | `IWORK_TASKS_DIR` | `$IWORK_REPO_DIR/tasks` | Where task folders are created |
 | `IWORK_PROJECTS_DIR` | `$IWORK_REPO_DIR/projects` | Where project memory lives (see [Projects](#projects-memory-across-many-tasks)) |
-| `IWORK_TMUX_SESSION` | `tasks` | tmux session that holds task windows |
-| `IWORK_PROJECTS_TMUX_SESSION` | `projects` | tmux session that holds project master windows (see [The master](#the-master-one-agent-whose-job-is-the-project)). Must differ from `IWORK_TMUX_SESSION`, or a task lookup could answer with a master |
+| `IWORK_TMUX_SESSION` | `tasks` | tmux session for tasks that belong to no project, and the prefix for a `--big` task's own session (`tasks-<task>`) |
+| `IWORK_PROJECTS_TMUX_SESSION` | `projects` | prefix for the session each project owns (`projects-<project>`), holding its master and its tasks (see [The master](#the-master-one-agent-whose-job-is-the-project)) |
 | `IWORK_CONTEXT_TEMPLATE` | `~/.config/iwork/task-context.md.tmpl` | Template for the generated `CLAUDE.md`/`AGENTS.md` (seeded with a default on first use, then yours to edit) |
 | `IWORK_PROJECT_TEMPLATE` | `~/.config/iwork/project-context.md.tmpl` | Template for the project block injected into those files (same deal: seeded once, then yours) |
 | `IWORK_PROJECT` | unset | Fallback project for `todo`/`log`/`decided`/`done`/`drop`. A task's own `.project` link always wins over it; `-p` wins over both |

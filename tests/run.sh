@@ -1844,12 +1844,43 @@ test_tmux_window_is_created_for_a_task() {
 
   # WANT_TMUX was dead, so window creation, session naming and kill_task_tmux
   # were never run by any test.
-  WANT_TMUX=1 iw --detach feat/one -r backend -p myproj >/dev/null 2>&1
+  WANT_TMUX=1 iw --detach feat/loose -r backend >/dev/null 2>&1
 
   local windows
-  windows="$(tmux_t list-windows -t tasks -F '#{window_name}' 2>/dev/null | tr '\n' ' ')"
-  assert_contains "a window was created for the task" "feat-one" "$windows"
-  assert_link "and the project was still attached" "$SB_TASKS/feat-one/.project"
+  windows="$(tmux_t list-windows -t '=tasks' -F '#{window_name}' 2>/dev/null | tr '\n' ' ')"
+  assert_contains "a window was created for the task" "feat-loose" "$windows"
+  assert_no_file "and it joined no project" "$SB_TASKS/feat-loose/.project"
+}
+
+test_a_projects_task_goes_to_the_projects_session() {
+  command -v tmux >/dev/null 2>&1 || { printf '    skip (no tmux)\n'; return 0; }
+  mk_repo backend
+
+  # The shared session is for tasks that belong to nobody. A task with a project
+  # goes to that project's session, whoever created it — the operator here.
+  WANT_TMUX=1 iw --detach feat/one -r backend -p myproj >/dev/null 2>&1
+  WANT_TMUX=1 iw --detach feat/loose -r backend >/dev/null 2>&1
+
+  assert_contains "the project's task landed in the project session" "feat-one" \
+    "$(tmux_t list-windows -t '=projects-myproj' -F '#{window_name}' 2>/dev/null | tr '\n' ' ')"
+  assert_link "and it is attached" "$SB_TASKS/feat-one/.project"
+
+  local shared
+  shared="$(tmux_t list-windows -t '=tasks' -F '#{window_name}' 2>/dev/null | tr '\n' ' ')"
+  assert_contains "the loose task is in the shared session" "feat-loose" "$shared"
+  case "$shared" in
+    *feat-one*) bad "a project's task cluttered the shared session" ;;
+    *) ok ;;
+  esac
+
+  # Every lookup has to follow it there, or 'cd', 'list' and 'rm' stop seeing it.
+  assert_contains "list reports its agent state" "feat-one" \
+    "$(WANT_TMUX=1 iw --big list 2>&1)"
+  WANT_TMUX=1 iw rm -f feat-one >/dev/null 2>&1
+  case "$(tmux_t list-windows -t '=projects-myproj' -F '#{window_name}' 2>/dev/null | tr '\n' ' ')" in
+    *feat-one*) bad "rm left the task's window in the project session" ;;
+    *) ok ;;
+  esac
 }
 
 test_tmux_session_is_killed_with_the_task() {
@@ -2451,8 +2482,8 @@ test_master_window_is_created_and_reused() {
   WANT_TMUX=1 iw master myproj >/dev/null 2>&1
 
   local windows
-  windows="$(tmux_t list-windows -t projects -F '#{window_name}' 2>/dev/null | tr '\n' ' ')"
-  assert_contains "a master window was created in the projects session" "myproj" "$windows"
+  windows="$(tmux_t list-windows -t '=projects-myproj' -F '#{window_name}' 2>/dev/null | tr '\n' ' ')"
+  assert_contains "a master window was created in the project's own session" "myproj" "$windows"
 
   # Two masters would plan against the same PROJECT.md and spawn overlapping
   # tasks, with neither aware of the other.
@@ -2460,16 +2491,156 @@ test_master_window_is_created_and_reused() {
     "$(WANT_TMUX=1 iw master myproj 2>&1)"
 
   local count
-  count="$(tmux_t list-windows -t projects -F '#{window_name}' 2>/dev/null | grep -c myproj)"
+  count="$(tmux_t list-windows -t '=projects-myproj' -F '#{window_name}' 2>/dev/null | grep -c myproj)"
   assert_eq "and no second window was made" "1" "$(printf '%s' "$count" | tr -d ' ')"
 
-  # The tasks session is not where a master lives.
+  # The shared session is not where a master lives.
   local task_windows
-  task_windows="$(tmux_t list-windows -t tasks -F '#{window_name}' 2>/dev/null | tr '\n' ' ')"
+  task_windows="$(tmux_t list-windows -t '=tasks' -F '#{window_name}' 2>/dev/null | tr '\n' ' ')"
   case "$task_windows" in
-    *myproj*) bad "the master landed in the tasks session" ;;
+    *myproj*) bad "the master landed in the shared tasks session" ;;
     *) ok ;;
   esac
+}
+
+test_master_takes_the_first_window_of_its_session() {
+  command -v tmux >/dev/null 2>&1 || { printf '    skip (no tmux)\n'; return 0; }
+  mk_repo backend
+
+  # The task exists before the master here, which is the case that needs the
+  # insert: appending would leave the master last in its own session.
+  WANT_TMUX=1 iw --detach feat/one -r backend -p myproj >/dev/null 2>&1
+  WANT_TMUX=1 iw master myproj >/dev/null 2>&1
+
+  local first
+  first="$(tmux_t list-windows -t '=projects-myproj' -F '#{window_name}' 2>/dev/null | head -1)"
+  assert_eq "the master is the first window" "myproj" "$first"
+  assert_contains "with the task after it" "feat-one" \
+    "$(tmux_t list-windows -t '=projects-myproj' -F '#{window_name}' 2>/dev/null | tail -n +2 | tr '\n' ' ')"
+}
+
+test_project_delete_takes_the_session_with_it() {
+  command -v tmux >/dev/null 2>&1 || { printf '    skip (no tmux)\n'; return 0; }
+  mk_repo backend
+  # delete refuses while a task is attached, so the project has to be emptied
+  # first — leaving the master as the only thing in the session.
+  iw feat/one -r backend -p myproj >/dev/null 2>&1
+  iw project rm myproj feat-one >/dev/null 2>&1
+  WANT_TMUX=1 iw master myproj >/dev/null 2>&1
+  tmux_t has-session -t '=projects-myproj' 2>/dev/null || {
+    printf '    skip (master session not created in this environment)\n'
+    return 0
+  }
+
+  # A session named after a project that no longer exists, with a master in it
+  # reading memory that is gone, is worse than no session at all.
+  local out
+  out="$(WANT_TMUX=1 iw project delete -f myproj 2>&1)"
+  assert_contains "the confirmation says the session goes too" "projects-myproj" "$out"
+  if tmux_t has-session -t '=projects-myproj' 2>/dev/null; then
+    bad "delete left the project's session behind"
+  else
+    ok
+  fi
+}
+
+test_master_gathers_a_projects_stray_windows() {
+  command -v tmux >/dev/null 2>&1 || { printf '    skip (no tmux)\n'; return 0; }
+  mk_repo backend
+  iw feat/one -r backend -p myproj >/dev/null 2>&1
+  iw feat/two -r backend -p myproj >/dev/null 2>&1
+  iw feat/loose -r backend >/dev/null 2>&1
+
+  # The state every project created before the layout change is in: its tasks
+  # are windows in the shared session, and nothing moves a window by itself.
+  tmux_t new-session -d -s tasks -n feat-one -c "$SB_TASKS/feat-one" 2>/dev/null
+  tmux_t new-window -d -t '=tasks' -n feat-two -c "$SB_TASKS/feat-two" 2>/dev/null
+  tmux_t new-window -d -t '=tasks' -n feat-loose -c "$SB_TASKS/feat-loose" 2>/dev/null
+  tmux_t has-session -t '=tasks' 2>/dev/null || {
+    printf '    skip (could not start isolated tmux server)\n'
+    return 0
+  }
+
+  # Opening the master is the moment the project's session exists, so it is
+  # where the strays are collected.
+  local out
+  out="$(WANT_TMUX=1 iw master myproj 2>&1)"
+  assert_contains "says it moved the first one" "moved tmux window 'feat-one'" "$out"
+  assert_contains "and the second" "moved tmux window 'feat-two'" "$out"
+
+  local gathered
+  gathered="$(tmux_t list-windows -t '=projects-myproj' -F '#{window_name}' 2>/dev/null | tr '\n' ' ')"
+  assert_contains "the project's tasks are in its session" "feat-one" "$gathered"
+  assert_contains "both of them" "feat-two" "$gathered"
+
+  # A task belonging to no project is none of the project's business.
+  local shared
+  shared="$(tmux_t list-windows -t '=tasks' -F '#{window_name}' 2>/dev/null | tr '\n' ' ')"
+  assert_contains "the loose task was left alone" "feat-loose" "$shared"
+  case "$shared" in
+    *feat-one*|*feat-two*) bad "a project task was left in the shared session" ;;
+    *) ok ;;
+  esac
+
+  # Idempotent: nothing left to move, so nothing is said about moving.
+  out="$(WANT_TMUX=1 iw master myproj 2>&1)"
+  case "$out" in
+    *"moved tmux window"*) bad "a second master start moved windows again" ;;
+    *) ok ;;
+  esac
+}
+
+test_master_left_in_the_old_shared_session_is_adopted() {
+  command -v tmux >/dev/null 2>&1 || { printf '    skip (no tmux)\n'; return 0; }
+  mk_repo backend
+  iw feat/one -r backend -p myproj >/dev/null 2>&1
+  iw feat/two -r backend -p other >/dev/null 2>&1
+
+  # The world as it was: every master a window in one shared 'projects' session.
+  tmux_t new-session -d -s projects -n myproj -c "$SB_PROJECTS/myproj" 2>/dev/null
+  tmux_t new-window -d -t '=projects' -n other -c "$SB_PROJECTS/other" 2>/dev/null
+  tmux_t has-session -t '=projects' 2>/dev/null || {
+    printf '    skip (could not start isolated tmux server)\n'
+    return 0
+  }
+
+  local out
+  out="$(WANT_TMUX=1 iw --detach master myproj 2>&1)"
+  assert_contains "says where the master was" "old shared 'projects' session" "$out"
+  assert_contains "and that it moved it" "moved tmux window 'myproj'" "$out"
+
+  # Adopted, not duplicated: the running agent keeps its pane, and no second
+  # master is started against the same PROJECT.md.
+  assert_contains "the master is not started twice" "already open" "$out"
+  assert_eq "it is the first window of the project's session" "myproj" \
+    "$(tmux_t list-windows -t '=projects-myproj' -F '#{window_name}' 2>/dev/null | head -1)"
+
+  # Another project's master is nobody else's business.
+  assert_contains "the other master was left where it was" "other" \
+    "$(tmux_t list-windows -t '=projects' -F '#{window_name}' 2>/dev/null | tr '\n' ' ')"
+}
+
+test_attach_and_detach_move_the_tasks_window() {
+  command -v tmux >/dev/null 2>&1 || { printf '    skip (no tmux)\n'; return 0; }
+  mk_repo backend
+  iw feat/one -r backend -p myproj >/dev/null 2>&1
+  WANT_TMUX=1 iw master myproj >/dev/null 2>&1
+  WANT_TMUX=1 iw --detach feat/two -r backend >/dev/null 2>&1
+
+  # feat-two starts loose, in the shared session.
+  assert_contains "starts in the shared session" "feat-two" \
+    "$(tmux_t list-windows -t '=tasks' -F '#{window_name}' 2>/dev/null | tr '\n' ' ')"
+
+  local out
+  out="$(WANT_TMUX=1 iw project add myproj feat-two 2>&1)"
+  assert_contains "attaching says where the window went" "moved tmux window 'feat-two'" "$out"
+  assert_contains "and it is in the project session" "feat-two" \
+    "$(tmux_t list-windows -t '=projects-myproj' -F '#{window_name}' 2>/dev/null | tr '\n' ' ')"
+
+  out="$(WANT_TMUX=1 iw project rm myproj feat-two 2>&1)"
+  assert_contains "detaching moves it back" "moved tmux window 'feat-two'" "$out"
+  assert_contains "to the shared session" "feat-two" \
+    "$(tmux_t list-windows -t '=tasks' -F '#{window_name}' 2>/dev/null | tr '\n' ' ')"
 }
 
 test_task_created_from_the_project_directory_joins_it() {
