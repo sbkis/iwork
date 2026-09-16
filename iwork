@@ -77,6 +77,7 @@ Usage: iwork [flags] <branch-name> [--from <task|branch>] -r <repo1> [repo2 ...]
        iwork [flags] claude <task> [claude-args...]
        iwork [flags] codex <task> [codex-args...]
        iwork [flags] master [<project>]
+       iwork resurrect [-n] [--fresh] [--big <task>]...
        iwork init
        iwork install-hooks [settings-path]
        iwork --completion <bash|zsh>
@@ -214,6 +215,13 @@ Subcommands:
   master         Open/switch to the project's master session: one agent per
                  project whose job is the project rather than any task in it
                  (see Master below)
+  resurrect      Put tmux back the way the tasks directory says it should be,
+                 after a tmux server has died and taken every agent with it.
+                 Closes windows whose task is gone, restarts the agent in each
+                 pane that came back as a bare shell, opens a window for every
+                 task that has none, and puts each project's windows back in
+                 its session. Agents resume with 'claude --continue'; -n shows
+                 the plan without touching anything (see Resurrect below)
   install-hooks  Add Claude Code hooks to ~/.claude/settings.json: keep tmux
                  window and session names in sync with agent status, inject the
                  project brief at session start, log PRs, and prompt for a
@@ -317,6 +325,44 @@ Master:
   is not optional for it: without the hooks it starts as an ordinary agent in a
   directory of markdown, and says so.
 
+Resurrect:
+  A tmux server that dies takes every agent with it and nothing else. The
+  worktrees are on disk and Claude keeps its transcripts per directory, so the
+  conversations are not lost — only the processes that were having them.
+
+  'iwork resurrect' reads the tasks directory as the truth and makes tmux match
+  it again:
+
+    - closes windows whose task no longer exists (a session restorer replays
+      whatever snapshot it has, so it brings back windows for tasks you tore
+      down since)
+    - restarts the agent in every task window that came back as a bare shell
+    - opens a window for every task that has none
+    - adopts each project's master and gathers its tasks into its session
+
+  Agents come back with 'claude --continue', which resumes the last conversation
+  in that directory; --fresh starts them cold instead. A task whose directory
+  has no conversation yet just reports that and leaves you at a prompt.
+
+  Nothing with a process in it is touched. A pane already running an agent is
+  left alone, a pane running an editor is reported rather than typed into, and a
+  window is never closed while anything is running in it — so resurrect is safe
+  to re-run, and safe to run when only half the tree is broken.
+
+  -n prints the whole plan and changes nothing. Worth doing first: it is the
+  only way to see which windows it considers leftovers before they close.
+
+  What it cannot know is which tasks were '--big'. That lives in the session
+  layout and nowhere on disk, so a dedicated session that survived is believed,
+  and a big task whose session did not survive has to be named:
+
+    iwork resurrect --big feat-huge-thing
+
+  Masters are restarted where they exist but never created: one is a standing
+  agent holding the project's brief, and starting a batch of them for projects
+  that had none is not a restore. Resurrect says which projects have no master,
+  and 'iwork master <project>' starts one.
+
 Examples:
   iwork feat/bla -r backend-api frontend
   iwork fix/login-bug -r auth-service web-app
@@ -340,6 +386,9 @@ Examples:
   iwork --no-tmux claude feat-bla
   iwork master auth-rewrite
   iwork master -m 'split the token work into stacked PRs'
+  iwork resurrect -n
+  iwork resurrect
+  iwork resurrect --big feat-huge-thing
   iwork install-hooks
 
 Options (all accepted before the branch name or after the repo list):
@@ -1590,7 +1639,7 @@ _iwork() {
   fi
 
   if [[ -z "$cmd" ]]; then
-    COMPREPLY=( $(compgen -W "add-repo rm park list cd claude codex master project todo log decided done drop init install-hooks --no-tmux --no-context --detach -d --big --from --message -m -h --help --completion" -- "$cur") )
+    COMPREPLY=( $(compgen -W "add-repo rm park list cd claude codex master resurrect project todo log decided done drop init install-hooks --no-tmux --no-context --detach -d --big --from --message -m -h --help --completion" -- "$cur") )
     return 0
   fi
 
@@ -1791,6 +1840,7 @@ _iwork() {
       'claude[open the task tmux window and run claude]' \
       'codex[open the task tmux window and run codex]' \
       'master[open the project master session that runs the tasks]' \
+      'resurrect[restart the agents and windows a dead tmux server took]' \
       'project[manage the memory shared across a project'\''s tasks]' \
       'todo[capture something that needs doing, but not in this PR]' \
       'log[append one line to the project log]' \
@@ -2552,8 +2602,9 @@ the end the reasoning is gone, and the reasoning is the part worth keeping.
 `iwork` is a CLI on your PATH. `iwork project -h` lists every command above and
 stays current if the tool grows new ones, so prefer it over this list going
 stale. Task and tmux management — creating tasks, `add-repo`, `rm`, `park`,
-`install-hooks` — belongs to the operator, not to you: those change or destroy
-worktrees, so do not run them unless you were asked to directly.
+`resurrect`, `install-hooks` — belongs to the operator, not to you: those change
+or destroy worktrees, or restart every agent at once, so do not run them unless
+you were asked to directly.
 
 PROJECT.md is curated by hand and is not yours to rewrite. If it has gone stale,
 say so instead of fixing it.'
@@ -4324,6 +4375,405 @@ open_task() {
   fi
 }
 
+# --- resurrect ----------------------------------------------------------------
+
+# A tmux server that dies takes every agent with it and nothing else: the
+# worktrees are still on disk and Claude still holds the transcripts, so each
+# task can be handed back the conversation it was having. 'resurrect' is that
+# repair. It treats the tasks directory as the truth and makes tmux match it
+# again — closing windows whose task is gone, restarting the agents in panes a
+# restorer brought back as bare shells, and opening a window for every task that
+# has none.
+#
+# The one thing it cannot read anywhere is which tasks were '--big'. That choice
+# is only ever recorded in the session layout, so a dedicated session that
+# survived is believed and anything else has to be named with --big.
+
+RESURRECT_DRY=""
+RESURRECT_CONTINUE=1
+RESURRECT_BIG=()
+
+# What gets typed into a revived pane. --continue picks that directory's last
+# conversation back up, which is the whole point of the exercise; --fresh drops
+# it for a task whose history is not worth resuming.
+resurrect_agent_cmd() {
+  if [[ -n "$RESURRECT_CONTINUE" ]]; then
+    printf 'claude --continue\n'
+  else
+    printf 'claude\n'
+  fi
+}
+
+resurrect_wants_big() {
+  local folder="$1"
+  local want=""
+
+  for want in ${RESURRECT_BIG[@]+"${RESURRECT_BIG[@]}"}; do
+    [[ "$want" != "$folder" ]] || return 0
+  done
+
+  return 1
+}
+
+pane_command() {
+  tmux display-message -p -t "$1" '#{pane_current_command}' 2>/dev/null || true
+}
+
+# A shell sitting at its prompt is the only thing it is safe to type a command
+# into: an editor would take 'claude --continue' as keystrokes in a buffer. A
+# shell running a foreground job reports that job here rather than itself, so
+# this refuses a busy pane for the same reason.
+pane_is_idle_shell() {
+  case "$(pane_command "$1")" in
+    sh|bash|zsh|fish|dash|ksh|tcsh|csh) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# The pane an agent runs in: the first one, which is where spawn_agent_window
+# starts the tool before splitting a shell off to its right.
+window_agent_pane() {
+  tmux list-panes -t "$1" -F '#{pane_id}' 2>/dev/null | head -1
+}
+
+resurrect_start_agent() {
+  local pane="$1"
+  local what="$2"
+  local cmd=""
+
+  cmd="$(pane_command "$pane")"
+
+  # 'node' is a claude that reports itself by its interpreter rather than by
+  # its own name.
+  case "$cmd" in
+    claude|codex|node)
+      echo "  $what: already running '$cmd'"
+      return 0
+      ;;
+  esac
+
+  if ! pane_is_idle_shell "$pane"; then
+    warn "$what: left alone, its agent pane is running '$cmd'"
+    return 0
+  fi
+
+  if [[ -n "$RESURRECT_DRY" ]]; then
+    echo "  $what: would run '$(resurrect_agent_cmd)'"
+    return 0
+  fi
+
+  if ! tmux send-keys -t "$pane" "$(resurrect_agent_cmd)" Enter 2>/dev/null; then
+    warn "$what: could not start the agent"
+    return 1
+  fi
+
+  echo "  $what: restarted with '$(resurrect_agent_cmd)'"
+}
+
+# Which task owns a '--big' session, and which project owns a project session.
+# Both map forwards from what is on disk rather than parsing the session name,
+# because the name-safe spelling replaces ':' and '.' and cannot be reversed.
+resurrect_session_task() {
+  local base="$1"
+  local folder=""
+
+  while IFS= read -r folder; do
+    [[ "$(task_session_name "$folder")" == "$base" ]] || continue
+    printf '%s\n' "$folder"
+    return 0
+  done < <(list_worktree_folders)
+
+  return 1
+}
+
+resurrect_session_project() {
+  local base="$1"
+  local project=""
+
+  while IFS= read -r project; do
+    [[ "$(project_session_name "$project")" == "$base" ]] || continue
+    printf '%s\n' "$project"
+    return 0
+  done < <(list_projects)
+
+  return 1
+}
+
+# Nothing with a process in it is ever closed. A task folder deleted out from
+# under a live agent is a mess, but it is not resurrect's to throw away.
+resurrect_target_is_idle() {
+  local scope="$1"
+  local target="$2"
+  local what="$3"
+  local pane=""
+
+  while IFS= read -r pane; do
+    [[ -n "$pane" ]] || continue
+    pane_is_idle_shell "$pane" && continue
+    warn "left '$what' alone: a pane in it is running '$(pane_command "$pane")'"
+    return 1
+  done < <(tmux list-panes ${scope:+-s} -t "$target" -F '#{pane_id}' 2>/dev/null)
+
+  return 0
+}
+
+resurrect_close_window() {
+  local window_id="$1"
+  local window_name="$2"
+  local session="$3"
+
+  resurrect_target_is_idle "" "$window_id" "$window_name" || return 0
+
+  if [[ -n "$RESURRECT_DRY" ]]; then
+    echo "  would close window '$window_name' in session '$session': no such task"
+    return 0
+  fi
+
+  if ! tmux kill-window -t "$window_id" 2>/dev/null; then
+    warn "could not close window '$window_name'"
+    return 1
+  fi
+
+  echo "  closed window '$window_name' in session '$session': no such task"
+  refresh_session_marker "${session#[*!]}"
+}
+
+resurrect_close_session() {
+  local session="$1"
+
+  resurrect_target_is_idle -s "$session" "$session" || return 0
+
+  if [[ -n "$RESURRECT_DRY" ]]; then
+    echo "  would close session '$session': no such task"
+    return 0
+  fi
+
+  if ! tmux kill-session -t "=$session" 2>/dev/null; then
+    warn "could not close session '$session'"
+    return 1
+  fi
+
+  echo "  closed session '$session': no such task"
+}
+
+# Windows left over from tasks that are gone. A restorer replays the snapshot it
+# happened to have, so it brings back windows for tasks torn down since.
+#
+# Bounded to the sessions iwork owns, and inside them to the windows iwork puts
+# there: task windows in the shared session and in a project's, and a whole
+# session for a '--big' task. A master window carries its project's name rather
+# than a task's, and the repo windows of a live '--big' task are not task
+# windows at all, so neither is mistaken for a leftover.
+resurrect_sweep() {
+  local session=""
+  local base=""
+  local project=""
+  local window_id=""
+  local window_name=""
+  local name=""
+
+  while IFS= read -r session; do
+    base="${session#[*!]}"
+    project=""
+
+    case "$base" in
+      "$TASKS_SESSION")
+        ;;
+      "$TASKS_SESSION"-*)
+        # Its task is either still on disk, which makes every window in here
+        # real, or gone, which makes the whole session a leftover.
+        resurrect_session_task "$base" >/dev/null ||
+          resurrect_close_session "$session"
+        continue
+        ;;
+      "$PROJECTS_SESSION"-*)
+        if ! project="$(resurrect_session_project "$base")"; then
+          warn "session '$session' matches no project iwork knows; left alone"
+          continue
+        fi
+        ;;
+      *)
+        continue
+        ;;
+    esac
+
+    while IFS=' ' read -r window_id window_name; do
+      name="${window_name#[*!]}"
+      [[ "$name" != "$project" ]] || continue
+      [[ ! -d "$TASKS_DIR/$name" ]] || continue
+      resurrect_close_window "$window_id" "$window_name" "$session"
+    done < <(tmux list-windows -t "=$session" -F '#{window_id} #{window_name}' 2>/dev/null)
+  done < <(iwork_sessions)
+}
+
+# Every task on disk, given back an agent. A window that survived keeps its
+# place and only its pane is restarted; a task with no window anywhere gets one
+# built where the task belongs.
+resurrect_tasks() {
+  local folder=""
+  local line=""
+  local session=""
+  local window_id=""
+  local window_name=""
+  local pane=""
+  local home=""
+  local live=""
+  local built=""
+  local saved_big="$IWORK_BIG"
+
+  while IFS= read -r folder; do
+    [[ -n "$folder" ]] || continue
+
+    if line="$(locate_task_window "$folder")"; then
+      IFS=' ' read -r session window_id window_name <<< "$line"
+      pane="$(window_agent_pane "$window_id")"
+
+      if [[ -z "$pane" ]]; then
+        warn "$folder: its window has no pane to start an agent in"
+        continue
+      fi
+
+      resurrect_start_agent "$pane" "$folder"
+      continue
+    fi
+
+    if resurrect_wants_big "$folder"; then
+      if [[ -n "$RESURRECT_DRY" ]]; then
+        echo "  $folder: would open a session of its own running '$(resurrect_agent_cmd)'"
+        continue
+      fi
+
+      IWORK_BIG=1
+      built="$(open_task_session "$folder" claude ${RESURRECT_CONTINUE:+--continue})"
+      IWORK_BIG="$saved_big"
+      # open_task_session reports a session in its own words, over two lines.
+      # Indented here so it sits under the heading with everything else.
+      [[ -z "$built" ]] || printf '%s\n' "$built" | sed 's/^/  /'
+      continue
+    fi
+
+    home="$(task_home_session "$folder")"
+
+    if [[ -n "$RESURRECT_DRY" ]]; then
+      live="$(resolve_session_name "$home" || printf '%s' "$home")"
+      echo "  $folder: would open a window in session '$live' running '$(resurrect_agent_cmd)'"
+      continue
+    fi
+
+    # spawn_agent_window rather than open_task: the window is known to be
+    # missing, and this is the half of open_task that builds one, without the
+    # per-task "attach with" hint that would treble the length of the report.
+    if ! spawn_agent_window "$home" "$folder" "$TASKS_DIR/$folder" \
+           claude ${RESURRECT_CONTINUE:+--continue} >/dev/null; then
+      continue
+    fi
+
+    live="$(resolve_session_name "$home" || printf '%s' "$home")"
+    echo "  $folder: opened a window in session '$live' running '$(resurrect_agent_cmd)'"
+  done < <(list_worktree_folders)
+
+  IWORK_BIG="$saved_big"
+}
+
+# A master and the windows of its project's tasks belong in one session. A
+# restorer rebuilds sessions from a snapshot with no idea which window belongs
+# where, so the drift repair 'iwork master' does for one project is run here for
+# all of them. Masters are restarted where they exist but never created: one is
+# a standing agent with the project's brief, and starting a batch of them for
+# projects that had none is not a restore.
+resurrect_find_master() {
+  local project="$1"
+  local line=""
+
+  find_master_window "$project" && return 0
+
+  # Adoption has not run yet under --dry-run, so a master from the old shared
+  # session is still sitting in it.
+  line="$(find_window_in_session "$PROJECTS_SESSION" "$project")" || return 1
+  printf '%s\n' "${line%% *}"
+}
+
+resurrect_projects() {
+  local project=""
+  local window_id=""
+  local pane=""
+
+  while IFS= read -r project; do
+    [[ -n "$project" ]] || continue
+
+    [[ -n "$RESURRECT_DRY" ]] || adopt_legacy_master "$project"
+
+    if window_id="$(resurrect_find_master "$project")"; then
+      pane="$(window_agent_pane "$window_id")"
+      [[ -z "$pane" ]] || resurrect_start_agent "$pane" "master of '$project'"
+    else
+      echo "  project '$project' has no master; start one with: iwork master $project"
+    fi
+
+    [[ -n "$RESURRECT_DRY" ]] || gather_project_tasks "$project"
+  done < <(list_projects)
+}
+
+# Sections are collected before they are printed so a heading only appears when
+# something is under it: on a healthy tree resurrect should say so in one line,
+# not print three empty headings.
+resurrect_section() {
+  local heading="$1"
+  shift
+  local body=""
+
+  body="$("$@")"
+  [[ -n "$body" ]] || return 0
+
+  echo "$heading"
+  printf '%s\n' "$body"
+}
+
+cmd_resurrect() {
+  local folder=""
+
+  RESURRECT_BIG=()
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -n|--dry-run) RESURRECT_DRY=1; shift ;;
+      --fresh) RESURRECT_CONTINUE=""; shift ;;
+      --big)
+        [[ $# -ge 2 ]] || die "expected a task name after --big"
+        validate_worktree_folder_name "$2"
+        RESURRECT_BIG+=("$2")
+        shift 2
+        ;;
+      -h|--help) usage 0 ;;
+      *) die "usage: iwork resurrect [-n] [--fresh] [--big <task>]..." ;;
+    esac
+  done
+
+  require_config
+  warn_message_undelivered "resurrect restarts every agent, so there is nobody in particular to send it to"
+
+  [[ -z "$IWORK_NO_TMUX" ]] ||
+    die "resurrect repairs tmux; there is nothing for it to do with --no-tmux"
+  command -v tmux >/dev/null 2>&1 || die "resurrect needs tmux"
+
+  for folder in ${RESURRECT_BIG[@]+"${RESURRECT_BIG[@]}"}; do
+    [[ -d "$TASKS_DIR/$folder" ]] || die "no such task: $folder"
+  done
+
+  # Resurrect walks the whole tasks directory, so every window it opens is
+  # opened in the background: switching to each in turn would end with the
+  # client parked on whichever task happened to sort last.
+  IWORK_DETACH=1
+
+  [[ -z "$RESURRECT_DRY" ]] || echo "Dry run — nothing is changed."
+
+  resurrect_section "Leftovers:" resurrect_sweep
+  resurrect_section "Tasks:" resurrect_tasks
+  resurrect_section "Projects:" resurrect_projects
+
+  echo "Done. 'iwork list' shows where everything ended up."
+}
+
 # add-repo into a task that already owns a session should get a window too.
 extend_task_session() {
   local folder="$1"
@@ -4867,8 +5317,8 @@ not run them unless you were asked to directly:
   iwork project rm [<project>] [<task>]  detach a task, keeping the memory
   iwork project delete [-f] <project>    delete a project and its memory
 
-For task and tmux management (creating tasks, add-repo, rm, park, install-hooks)
-see 'iwork -h'.
+For task and tmux management (creating tasks, add-repo, rm, park, resurrect,
+install-hooks) see 'iwork -h'.
 EOF
 }
 
@@ -5220,6 +5670,12 @@ if [[ "${1:-}" == "list" && $# -eq 1 ]]; then
   else
     list_worktree_folders
   fi
+  exit 0
+fi
+
+if [[ "${1:-}" == "resurrect" ]]; then
+  shift
+  cmd_resurrect "$@"
   exit 0
 fi
 

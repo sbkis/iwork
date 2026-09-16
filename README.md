@@ -189,6 +189,10 @@ iwork park task-billing-followup
 # See your tasks (with live agent status inside tmux)
 iwork list
 
+# After a tmux server died: restart every agent where it belongs
+iwork resurrect -n
+iwork resurrect
+
 # Make the task part of a longer-horizon project (created on first use)
 iwork feat/token-api -r auth-service -p auth-rewrite
 
@@ -907,6 +911,74 @@ project's — `--big` will not start a second agent for it in a new session; clo
 that window first.
 
 Set `IWORK_BIG=1` in your config to make every task work this way.
+
+
+## Recovering from a dead tmux server
+
+When the tmux server dies it takes every agent with it and nothing else. The
+worktrees are still on disk, and Claude keeps its transcripts per directory, so
+the conversations are not lost either — only the processes that were having
+them. If you run a session restorer (tmux-resurrect, continuum) you get the
+window layout back, but every pane comes up as a bare shell.
+
+```bash
+iwork resurrect -n     # what it would do
+iwork resurrect        # do it
+```
+
+It reads the tasks directory as the truth and makes tmux match it again:
+
+- **Closes windows whose task is gone.** A restorer replays whatever snapshot it
+  has, so it brings back windows for tasks you tore down since — pointing at
+  directories that no longer exist.
+- **Restarts the agent in every task window that came back empty**, in place, so
+  the window keeps its number and its neighbours.
+- **Opens a window for every task that has none**, where that task belongs — the
+  shared session, or its project's.
+- **Puts each project back together**: adopts a master left in the old shared
+  `projects` session and gathers the project's task windows into its session,
+  the same repair `iwork master` does, for every project at once.
+
+Agents come back with `claude --continue`, which resumes the last conversation in
+that directory. Pass `--fresh` to start them cold instead. A task whose directory
+has no conversation yet simply reports that and leaves you at a prompt.
+
+### What it will not touch
+
+Nothing with a process in it. A pane already running an agent is left alone, a
+pane running an editor is reported rather than typed into, and a window is never
+closed while anything is running in it. That makes `resurrect` safe to re-run,
+and safe to run when only part of the tree is broken.
+
+`-n` prints the whole plan and changes nothing. It is worth running first: it is
+the only way to see which windows it considers leftovers before they close.
+
+### Big tasks have to be named
+
+Which tasks were `--big` is recorded in the session layout and nowhere on disk.
+A dedicated session that survived is believed, but one that died cannot be
+guessed at, so name it:
+
+```bash
+iwork resurrect --big feat-big-thing
+```
+
+Everything else comes back as an ordinary window.
+
+### Masters are restarted, never created
+
+A master is a standing agent holding its project's brief, so starting a batch of
+them for projects that never had one is not a restore. `resurrect` restarts the
+masters that are there, and names the projects that have none so you can start
+one yourself with `iwork master <project>`.
+
+### Stale status markers
+
+The `*` / `!` markers on window and session names are written by the Claude Code
+hooks, so a name freezes at whatever the agent's state was when the server died
+— `iwork list` will report `!waiting` for an agent that is not running at all.
+Restarting the agent does not clear the marker by itself; the next hook event
+does, which is the first time that agent changes state.
 
 
 ## Cleaning up
