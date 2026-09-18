@@ -205,7 +205,10 @@ Subcommands:
                  window/session. Branches are always left intact. A
                  directory whose worktree registration is gone is reported
                  as orphaned and needs -f, since git can no longer say
-                 whether it holds uncommitted work.
+                 whether it holds uncommitted work. Run from inside the
+                 task's own window or session, it finishes the removal and
+                 closes that window last, moving you to another window or
+                 session first and saying where it put you.
   park           Move the current repo/branch into a task folder
   list           List task folders (with window status in tmux)
   cd             Switch to the task window, or cd into the task folder
@@ -906,6 +909,111 @@ confirm() {
   esac
 }
 
+# Killing the window or session the caller is sitting in takes this process with
+# it, which is why both kills used to refuse that case and tell you to close it
+# yourself — leaving a window pointing at a directory that no longer exists, and
+# a listing that still claimed the task was open.
+#
+# It is deferred instead. Everything else in the window or session is killed at
+# the normal moment, which is what the early kill was for: no editor and no
+# agent left alive to write the task folder back up while it is being deleted.
+# What we are standing in survives just long enough to finish the job, and goes
+# last, after the client has been moved somewhere that will outlive it.
+DEFERRED_KILL_KIND=""
+DEFERRED_KILL_TARGET=""
+
+# Every pane of our window except the one this is running in.
+strand_current_pane() {
+  local window_id="$1"
+  local keep=""
+  local pane=""
+
+  keep="$(tmux display-message -p '#{pane_id}' 2>/dev/null || true)"
+
+  while IFS= read -r pane; do
+    [[ -n "$pane" && "$pane" != "$keep" ]] || continue
+    tmux kill-pane -t "$pane" 2>/dev/null || true
+  done < <(tmux list-panes -t "$window_id" -F '#{pane_id}' 2>/dev/null)
+}
+
+# The same for a session the task owns: every window except ours, editors and
+# all.
+strand_current_window() {
+  local session="$1"
+  local keep=""
+  local window_id=""
+
+  keep="$(tmux display-message -p '#{window_id}' 2>/dev/null || true)"
+
+  while IFS= read -r window_id; do
+    [[ -n "$window_id" && "$window_id" != "$keep" ]] || continue
+    tmux kill-window -t "$window_id" 2>/dev/null || true
+  done < <(tmux list-windows -t "=$session" -F '#{window_id}' 2>/dev/null)
+}
+
+# Somewhere to put the client before what it is looking at is destroyed.
+# Prefers another window in the same session, so the jump is the smallest one
+# that works; failing that, any other session. Prints "<session> <window-id>".
+find_client_refuge() {
+  local doomed_window="$1"
+  local doomed_session="$2"
+  local here=""
+  local session=""
+  local window_id=""
+  local fallback=""
+
+  here="$(tmux display-message -p '#{session_name}' 2>/dev/null || true)"
+
+  while IFS=' ' read -r session window_id; do
+    [[ -n "$window_id" ]] || continue
+    [[ -z "$doomed_window" || "$window_id" != "$doomed_window" ]] || continue
+    [[ -z "$doomed_session" || "$session" != "$doomed_session" ]] || continue
+
+    if [[ -n "$here" && "$session" == "$here" ]]; then
+      printf '%s %s\n' "$session" "$window_id"
+      return 0
+    fi
+
+    [[ -n "$fallback" ]] || fallback="$session $window_id"
+  done < <(tmux list-windows -a -F '#{session_name} #{window_id}' 2>/dev/null)
+
+  [[ -n "$fallback" ]] || return 1
+  printf '%s\n' "$fallback"
+}
+
+# The deferred kill, run once everything else is done. Moves the client first,
+# because the alternative is tmux dropping it wherever it likes — or detaching
+# it outright when the session goes. This process dies with the target, so
+# nothing may follow it.
+run_deferred_kill() {
+  local refuge=""
+  local session=""
+  local window_id=""
+  local name=""
+
+  [[ -n "$DEFERRED_KILL_KIND" ]] || return 0
+
+  case "$DEFERRED_KILL_KIND" in
+    window) refuge="$(find_client_refuge "$DEFERRED_KILL_TARGET" "" || true)" ;;
+    session) refuge="$(find_client_refuge "" "$DEFERRED_KILL_TARGET" || true)" ;;
+  esac
+
+  if [[ -n "$refuge" ]]; then
+    IFS=' ' read -r session window_id <<< "$refuge"
+    name="$(tmux display-message -p -t "$window_id" '#{window_name}' 2>/dev/null || true)"
+    tmux switch-client -t "=$session" 2>/dev/null || true
+    tmux select-window -t "$window_id" 2>/dev/null || true
+    echo "  -> you are now in tmux window '$name' (session '$session')"
+  else
+    echo "  -> nothing else is open in tmux, so this client detaches"
+  fi
+
+  case "$DEFERRED_KILL_KIND" in
+    window) tmux kill-window -t "$DEFERRED_KILL_TARGET" 2>/dev/null || true ;;
+    session) tmux kill-session -t "=$DEFERRED_KILL_TARGET" 2>/dev/null || true ;;
+  esac
+}
+
 kill_task_tmux() {
   local folder="$1"
   local session=""
@@ -929,7 +1037,9 @@ kill_task_tmux() {
     current_session=""
     in_tmux && current_session="$(tmux display-message -p '#{session_name}' 2>/dev/null || true)"
     if [[ -n "$current_session" && "$current_session" == "$session" ]]; then
-      warn "you are attached to tmux session '$session'; close it yourself"
+      strand_current_window "$session"
+      DEFERRED_KILL_KIND="session"
+      DEFERRED_KILL_TARGET="$session"
       return 0
     fi
     tmux kill-session -t "=$session" 2>/dev/null || warn "could not kill tmux session '$session'"
@@ -943,7 +1053,9 @@ kill_task_tmux() {
   current_id=""
   in_tmux && current_id="$(tmux display-message -p '#{window_id}' 2>/dev/null || true)"
   if [[ -n "$current_id" && "$current_id" == "$window_id" ]]; then
-    warn "tmux window '$folder' is the current window; close it yourself"
+    strand_current_pane "$window_id"
+    DEFERRED_KILL_KIND="window"
+    DEFERRED_KILL_TARGET="$window_id"
     return 0
   fi
 
@@ -1116,6 +1228,11 @@ remove_worktrees() {
   kill_task_tmux "$folder"
 
   if [[ -n "$failed" ]]; then
+    # The folder survives, so the window that was standing in it should too.
+    # Its other panes are already closed — they were shut before the removal
+    # started, and that cannot be taken back.
+    DEFERRED_KILL_KIND=""
+    DEFERRED_KILL_TARGET=""
     die "some worktrees could not be removed; kept $folder_path"
   fi
 
@@ -1143,6 +1260,9 @@ remove_worktrees() {
 
   echo ""
   echo "Done! Branches were left untouched."
+
+  # Last, because it takes this process with it.
+  run_deferred_kill
 }
 
 parse_repos_flag() {
@@ -3325,9 +3445,9 @@ detach_task_from_project() {
   move_task_window "$task" "$TASKS_SESSION"
 }
 
-# The session branch of kill_task_tmux, for the session a project owns. Refuses
-# the one case that would pull the rug out from under the caller: killing the
-# session their own client is sitting in.
+# The session branch of kill_task_tmux, for the session a project owns. Killing
+# the session the caller is sitting in is deferred the same way rather than
+# refused.
 kill_project_tmux() {
   local project="$1"
   local session=""
@@ -3341,7 +3461,9 @@ kill_project_tmux() {
   current_session=""
   in_tmux && current_session="$(tmux display-message -p '#{session_name}' 2>/dev/null || true)"
   if [[ -n "$current_session" && "$current_session" == "$session" ]]; then
-    warn "you are attached to tmux session '$session'; close it yourself"
+    strand_current_window "$session"
+    DEFERRED_KILL_KIND="session"
+    DEFERRED_KILL_TARGET="$session"
     return 0
   fi
 
@@ -3387,6 +3509,9 @@ delete_project() {
   rm -rf "${PROJECTS_DIR:?}/${project:?}" || die "could not remove $PROJECTS_DIR/$project"
   kill_project_tmux "$project"
   echo "Deleted project '$project'"
+
+  # Last, because it takes this process with it.
+  run_deferred_kill
 }
 
 # --- capture -----------------------------------------------------------------

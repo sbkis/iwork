@@ -3014,6 +3014,138 @@ test_resurrect_rejects_an_unknown_argument() {
   assert_contains "with the usage line" "iwork resurrect" "$(iw resurrect feat-one 2>&1)"
 }
 
+# --- rm from inside the thing being killed ------------------------------------
+
+# iw() runs iwork outside tmux, which can never reach the case these cover: the
+# window or session being destroyed is the one the caller is standing in. That
+# only happens when iwork runs *in* the pane, so it gets a runner of its own,
+# carrying the same sandbox environment iw() does.
+make_pane_runner() {
+  cat > "$SB/bin/iwp" <<RUNNER
+#!/bin/bash
+export PATH="$SB/bin:\$PATH"
+export HOME="$SB_HOME"
+export GIT_CONFIG_GLOBAL="$SB_HOME/.gitconfig"
+export TMUX_TMPDIR="$SB/tmux"
+export IWORK_CONFIG_FILE="$SB/config"
+export IWORK_REPO_DIR="$SB_REPOS"
+export IWORK_TASKS_DIR="$SB_TASKS"
+export IWORK_PROJECTS_DIR="$SB_PROJECTS"
+export IWORK_EDITOR="nvim"
+export IWORK_ASSUME_YES=1
+export CLAUDE_CODE_SESSION_ID=""
+export CLAUDE_PID=""
+exec "$IWORK_SRC" "\$@"
+RUNNER
+  chmod +x "$SB/bin/iwp"
+}
+
+wait_until_gone() {
+  local path="$1" waited=0
+
+  while (( waited < 100 )); do
+    [[ -e "$path" ]] || return 0
+    command sleep 0.1
+    waited=$((waited + 1))
+  done
+
+  return 1
+}
+
+test_rm_kills_the_window_you_are_standing_in() {
+  command -v tmux >/dev/null 2>&1 || { printf '    skip (no tmux)\n'; return 0; }
+  mk_repo backend
+  WANT_TMUX=1 iw --detach feat/one -r backend >/dev/null 2>&1
+  # A second task, so there is somewhere for the client to be moved to.
+  WANT_TMUX=1 iw --detach feat/two -r backend >/dev/null 2>&1
+  make_pane_runner
+
+  local pane
+  pane="$(tmux_t list-panes -t '=tasks:feat-one' -F '#{pane_id}' 2>/dev/null | head -1)"
+  [[ -n "$pane" ]] || { printf '    skip (no pane for the task)\n'; return 0; }
+
+  # This used to warn "close it yourself" and leave both the window and the
+  # folder in place.
+  tmux_t send-keys -t "$pane" 'iwp rm -f feat-one' Enter 2>/dev/null
+
+  if ! wait_until_gone "$SB_TASKS/feat-one"; then
+    bad "rm never removed the task folder from inside its own window"
+    return 0
+  fi
+  ok
+
+  # The deferred kill lands just after the folder goes, so give it a moment.
+  local waited=0
+  while (( waited < 50 )); do
+    case "$(tmux_t list-windows -t '=tasks' -F '#{window_name}' 2>/dev/null | tr '\n' ' ')" in
+      *feat-one*) command sleep 0.1; waited=$((waited + 1)) ;;
+      *) break ;;
+    esac
+  done
+
+  local windows
+  windows="$(tmux_t list-windows -t '=tasks' -F '#{window_name}' 2>/dev/null | tr '\n' ' ')"
+  case "$windows" in
+    *feat-one*) bad "rm left the window it was standing in behind" ;;
+    *) ok ;;
+  esac
+  assert_contains "and the other task is untouched" "feat-two" "$windows"
+}
+
+test_rm_kills_the_big_session_you_are_standing_in() {
+  command -v tmux >/dev/null 2>&1 || { printf '    skip (no tmux)\n'; return 0; }
+  mk_repo backend
+  mk_repo frontend
+  WANT_TMUX=1 iw --detach --big feat/one -r backend frontend >/dev/null 2>&1
+  tmux_t has-session -t '=tasks-feat-one' 2>/dev/null || {
+    printf '    skip (--big session not created in this environment)\n'; return 0; }
+  # Somewhere to land: without this the client would simply detach.
+  WANT_TMUX=1 iw --detach feat/two -r backend >/dev/null 2>&1
+  make_pane_runner
+
+  local pane
+  pane="$(tmux_t list-panes -t '=tasks-feat-one:feat-one' -F '#{pane_id}' 2>/dev/null | head -1)"
+  [[ -n "$pane" ]] || { printf '    skip (no pane for the task)\n'; return 0; }
+
+  tmux_t send-keys -t "$pane" 'iwp rm -f feat-one' Enter 2>/dev/null
+
+  if ! wait_until_gone "$SB_TASKS/feat-one"; then
+    bad "rm never removed the task folder from inside its own session"
+    return 0
+  fi
+  ok
+
+  local waited=0
+  while (( waited < 50 )); do
+    tmux_t has-session -t '=tasks-feat-one' 2>/dev/null || break
+    command sleep 0.1
+    waited=$((waited + 1))
+  done
+
+  if tmux_t has-session -t '=tasks-feat-one' 2>/dev/null; then
+    bad "rm left the session it was standing in behind"
+  else
+    ok
+  fi
+  assert_dir "and the other task survived" "$SB_TASKS/feat-two"
+}
+
+test_rm_from_another_window_still_kills_immediately() {
+  command -v tmux >/dev/null 2>&1 || { printf '    skip (no tmux)\n'; return 0; }
+  mk_repo backend
+  WANT_TMUX=1 iw --detach feat/one -r backend >/dev/null 2>&1
+
+  # Nothing is deferred when the caller is not standing in the target, so the
+  # window is gone by the time rm returns.
+  WANT_TMUX=1 iw rm -f feat-one >/dev/null 2>&1
+
+  case "$(tmux_t list-windows -t '=tasks' -F '#{window_name}' 2>/dev/null | tr '\n' ' ')" in
+    *feat-one*) bad "rm left the task window behind" ;;
+    *) ok ;;
+  esac
+  assert_no_file "and the task folder is gone" "$SB_TASKS/feat-one"
+}
+
 # --- runner -------------------------------------------------------------------
 
 echo "iwork tests  ($IWORK_SRC)"
