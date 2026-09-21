@@ -169,6 +169,19 @@ tmux_t() { env -u TMUX TMUX_TMPDIR="$SB/tmux" tmux -f /dev/null "$@"; }
 # send-keys returns once the keys are in the pane's input buffer, not once the
 # command has started, so a test that reads pane state straight afterwards races
 # the shell and sees the shell.
+# A session's live name carries whatever marker its windows currently justify,
+# and folding two of them re-derives it -- so tests look sessions up by base.
+windows_of_session() {
+  local base="$1" name="" live=""
+
+  while IFS= read -r name; do
+    if [[ "${name#[*!]}" == "$base" ]]; then live="$name"; break; fi
+  done < <(tmux_t list-sessions -F '#{session_name}' 2>/dev/null)
+
+  [[ -n "$live" ]] || return 0
+  tmux_t list-windows -t "=$live" -F '#{window_name}' 2>/dev/null | tr '\n' ' '
+}
+
 wait_for_pane_command() {
   local pane="$1" want="$2" waited=0
 
@@ -3144,6 +3157,83 @@ test_rm_from_another_window_still_kills_immediately() {
     *) ok ;;
   esac
   assert_no_file "and the task folder is gone" "$SB_TASKS/feat-one"
+}
+
+# --- duplicate sessions -------------------------------------------------------
+
+# A marked session does not reserve its plain name, so tmux will happily hold
+# '!tasks' and 'tasks' at the same time -- which is how one logical session ends
+# up split in two, with every lookup answering from whichever it sees first.
+# Building that state by hand is exactly what the race produces.
+
+test_a_marked_session_does_not_reserve_its_plain_name() {
+  command -v tmux >/dev/null 2>&1 || { printf '    skip (no tmux)\n'; return 0; }
+  mk_repo backend
+  WANT_TMUX=1 iw --detach feat/one -r backend >/dev/null 2>&1
+  tmux_t rename-session -t '=tasks' '!tasks' 2>/dev/null
+
+  # The premise of the whole bug: if tmux refused this, no duplicate could ever
+  # exist and none of the folding below would be needed.
+  assert_ok "tmux allows a second session under the unmarked name" \
+    tmux_t new-session -d -s tasks -n stray
+  assert_eq "so two sessions now share one base" "2" \
+    "$(tmux_t list-sessions -F '#{session_name}' 2>/dev/null | sed 's/^[*!]//' | grep -c '^tasks$' | tr -d ' ')"
+}
+
+test_resurrect_folds_a_split_session_back_together() {
+  command -v tmux >/dev/null 2>&1 || { printf '    skip (no tmux)\n'; return 0; }
+  mk_repo backend
+  WANT_TMUX=1 iw --detach feat/one -r backend >/dev/null 2>&1
+  WANT_TMUX=1 iw --detach feat/two -r backend >/dev/null 2>&1
+  tmux_t rename-session -t '=tasks' '!tasks' 2>/dev/null
+
+  # feat/three lands in a second, unmarked 'tasks' -- the split the race makes.
+  iw feat/three -r backend >/dev/null 2>&1
+  tmux_t new-session -d -s tasks -n feat-three 2>/dev/null
+
+  assert_contains "resurrect reports the fold" "folded the duplicate tmux sessions" \
+    "$(WANT_TMUX=1 iw resurrect 2>&1)"
+
+  assert_eq "one session is left under that name" "1" \
+    "$(tmux_t list-sessions -F '#{session_name}' 2>/dev/null | sed 's/^[*!]//' | grep -c '^tasks$' | tr -d ' ')"
+
+  # The point of folding rather than killing: nothing that was open is lost.
+  local windows
+  windows="$(windows_of_session tasks)"
+  assert_contains "the first task survived" "feat-one" "$windows"
+  assert_contains "the second too" "feat-two" "$windows"
+  assert_contains "and the one from the duplicate came across" "feat-three" "$windows"
+}
+
+test_resurrect_dry_run_reports_duplicates_without_folding() {
+  command -v tmux >/dev/null 2>&1 || { printf '    skip (no tmux)\n'; return 0; }
+  mk_repo backend
+  WANT_TMUX=1 iw --detach feat/one -r backend >/dev/null 2>&1
+  tmux_t rename-session -t '=tasks' '!tasks' 2>/dev/null
+  tmux_t new-session -d -s tasks -n stray 2>/dev/null
+
+  assert_contains "the dry run names the split" "would fold the duplicate tmux sessions" \
+    "$(WANT_TMUX=1 iw resurrect -n 2>&1)"
+  assert_eq "and both sessions are still there" "2" \
+    "$(tmux_t list-sessions -F '#{session_name}' 2>/dev/null | sed 's/^[*!]//' | grep -c '^tasks$' | tr -d ' ')"
+}
+
+test_creating_a_task_folds_a_twin_it_finds() {
+  command -v tmux >/dev/null 2>&1 || { printf '    skip (no tmux)\n'; return 0; }
+  mk_repo backend
+  WANT_TMUX=1 iw --detach feat/one -r backend >/dev/null 2>&1
+  tmux_t rename-session -t '=tasks' '!tasks' 2>/dev/null
+  # The twin, as a losing invocation would have left it.
+  tmux_t new-session -d -s tasks -n stray 2>/dev/null
+
+  # Any later task creation resolves the marked one and folds the stray in
+  # rather than adding to the split.
+  WANT_TMUX=1 iw --detach feat/two -r backend >/dev/null 2>&1
+
+  assert_eq "one session under that name" "1" \
+    "$(tmux_t list-sessions -F '#{session_name}' 2>/dev/null | sed 's/^[*!]//' | grep -c '^tasks$' | tr -d ' ')"
+  assert_contains "with the stray window folded in" "stray" \
+    "$(windows_of_session tasks)"
 }
 
 # --- runner -------------------------------------------------------------------

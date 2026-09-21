@@ -2448,6 +2448,68 @@ refresh_session_marker() {
   mark_session "$base" "$session"
 }
 
+# Two sessions for one thing, in creation order. tmux refuses a second session
+# under a name that is taken, and that refusal is what normally makes two
+# racing invocations safe: the loser is told the name exists and uses it. The
+# marker defeats it -- '!tasks' does not reserve 'tasks' -- so anything that
+# resolved a session as absent just before a marker landed on it can go on to
+# build a second session for the same thing. From then on the two drift: half a
+# project's windows in one, half in the other, and every lookup answering with
+# whichever it happens to see first.
+sessions_sharing_base() {
+  local base="$1"
+  local created=""
+  local name=""
+
+  while IFS=' ' read -r created name; do
+    [[ -n "$name" ]] || continue
+    [[ "${name#[*!]}" == "$base" ]] || continue
+    printf '%s\n' "$name"
+  done < <(tmux list-sessions -F '#{session_created} #{session_name}' 2>/dev/null | sort -n)
+}
+
+# tmux offers no way to make resolve-then-create atomic, so the split is
+# repaired instead of prevented: every window into the session that has been
+# there longest, and the drained twin goes with its last window. Called right
+# after a session is created, which is the moment a twin can appear, and again
+# by 'resurrect' for a tree that is already split.
+merge_duplicate_sessions() {
+  local base="$1"
+  local keep=""
+  local name=""
+  local window_id=""
+  local window_name=""
+  local folded=0
+
+  [[ -z "$IWORK_NO_TMUX" ]] || return 0
+  command -v tmux >/dev/null 2>&1 || return 0
+
+  while IFS= read -r name; do
+    [[ -n "$name" ]] || continue
+
+    if [[ -z "$keep" ]]; then
+      keep="$name"
+      continue
+    fi
+
+    while IFS=' ' read -r window_id window_name; do
+      [[ -n "$window_id" ]] || continue
+      tmux move-window -s "$window_id" -t "=$keep:" 2>/dev/null ||
+        warn "could not move tmux window '$window_name' out of duplicate session '$name'"
+    done < <(tmux list-windows -t "=$name" -F '#{window_id} #{window_name}' 2>/dev/null)
+
+    # Draining the last window destroys the session; this is for the case where
+    # one of them could not be moved.
+    tmux kill-session -t "=$name" 2>/dev/null || true
+    # stderr, not stdout: spawn_agent_window returns a window id through its
+    # stdout, and a notice printed there would be read as part of it.
+    printf "  folded duplicate tmux session '%s' into '%s'\n" "$name" "$keep" >&2
+    folded=$((folded + 1))
+  done < <(sessions_sharing_base "$base")
+
+  (( folded == 0 )) || refresh_session_marker "$base"
+}
+
 # Prints "<window-id> <window-name>" for the window called $name in $session,
 # ignoring any leading '*' / '!' status marker.
 find_window_in_session() {
@@ -3302,7 +3364,9 @@ move_window_to_session() {
       warn "could not create tmux session '$base' for '$window_name'"
       return 1
     fi
-    target="$base"
+
+    merge_duplicate_sessions "$base"
+    target="$(resolve_session_name "$base" || printf '%s' "$base")"
   fi
 
   [[ "$target" != "$session" ]] || return 1
@@ -4236,6 +4300,10 @@ spawn_agent_window() {
   local live=""
   local target=""
 
+  # A session that split earlier is repaired the moment anything touches it
+  # again, rather than only when 'resurrect' is run.
+  merge_duplicate_sessions "$session"
+
   # The status hooks mark session names too, so the session may not be sitting
   # under the name we were handed.
   if live="$(resolve_session_name "$session")"; then
@@ -4252,6 +4320,9 @@ spawn_agent_window() {
       warn "could not create tmux session '$session'"
       return 1
     fi
+
+    # A marked twin may have appeared while we were deciding there was none.
+    merge_duplicate_sessions "$session"
   fi
 
   tmux split-window -h -t "$pane_id" -c "$dir" 2>/dev/null || warn "could not split tmux window '$name'"
@@ -4453,6 +4524,11 @@ open_task_session() {
       return 0
     fi
     created=1
+
+    # Folding into a twin leaves the name we just used pointing at nothing, so
+    # everything below has to go by whatever survived.
+    merge_duplicate_sessions "$base_session"
+    session="$(resolve_session_name "$base_session" || printf '%s' "$base_session")"
 
     tmux split-window -h -t "$pane_id" -c "$folder_path" 2>/dev/null || warn "could not split tmux window '$folder'"
     tmux select-pane -t "$pane_id" 2>/dev/null || true
@@ -4681,6 +4757,25 @@ resurrect_close_session() {
   echo "  closed session '$session': no such task"
 }
 
+# Sessions that split in two: one logical session living under both its plain
+# name and its marked one. Folded back together before anything else looks at
+# the tree, so the sweep and the task pass see one session per thing.
+resurrect_fold_duplicates() {
+  local base=""
+
+  while IFS= read -r base; do
+    [[ -n "$base" ]] || continue
+
+    if [[ -n "$RESURRECT_DRY" ]]; then
+      echo "  would fold the duplicate tmux sessions named '$base' into one"
+      continue
+    fi
+
+    merge_duplicate_sessions "$base"
+    echo "  folded the duplicate tmux sessions named '$base' into one"
+  done < <(iwork_sessions | sed 's/^[*!]//' | sort | uniq -d)
+}
+
 # Windows left over from tasks that are gone. A restorer replays the snapshot it
 # happened to have, so it brings back windows for tasks torn down since.
 #
@@ -4892,6 +4987,7 @@ cmd_resurrect() {
 
   [[ -z "$RESURRECT_DRY" ]] || echo "Dry run — nothing is changed."
 
+  resurrect_section "Duplicate sessions:" resurrect_fold_duplicates
   resurrect_section "Leftovers:" resurrect_sweep
   resurrect_section "Tasks:" resurrect_tasks
   resurrect_section "Projects:" resurrect_projects

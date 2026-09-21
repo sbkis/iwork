@@ -972,6 +972,28 @@ them for projects that never had one is not a restore. `resurrect` restarts the
 masters that are there, and names the projects that have none so you can start
 one yourself with `iwork master <project>`.
 
+### Duplicate sessions
+
+A marked session does not reserve its plain name: to tmux, `!tasks` and `tasks`
+are two different sessions. That matters because tmux refusing a duplicate name
+is what normally makes two racing `iwork` invocations safe — the loser is told
+the name is taken and uses the session that is already there. The marker removes
+that protection, so an invocation that checked for a session just before a marker
+landed on it can go on to build a second one for the same thing. From then on the
+two drift: half a project's windows in one, half in the other.
+
+There is no way to make check-then-create atomic in tmux, so the split is
+repaired rather than prevented. Any command that is about to use one of iwork's
+sessions folds a split it finds first — every window into whichever session has
+been there longest, then the drained one goes with its last window, and the
+marker is re-derived. Nothing that was open is lost, and `resurrect` does the
+same sweep across every session at once:
+
+```bash
+iwork resurrect -n    # names any split it finds, changes nothing
+iwork resurrect
+```
+
 ### Stale status markers
 
 The `*` / `!` markers on window and session names are written by the Claude Code
