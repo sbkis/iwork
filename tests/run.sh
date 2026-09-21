@@ -3379,6 +3379,86 @@ test_tmux_config_is_printable_and_points_at_this_iwork() {
   assert_contains "and shows how to read the state" "@iwork_state" "$out"
 }
 
+# --- add-repo on a task whose repos drifted apart -----------------------------
+
+# iwork's model is one branch across a task, but nothing enforces it: an agent
+# can commit a worktree onto its own branch, and then there is no single branch
+# for add-repo to follow.
+drift_a_worktree() {
+  local task="$1" repo="$2" branch="$3"
+  git -C "$SB_TASKS/$task/$repo" checkout -q -b "$branch"
+}
+
+test_add_repo_lists_every_branch_when_they_disagree() {
+  mk_repo backend
+  mk_repo frontend
+  mk_repo shared
+  iw feat/one -r backend frontend >/dev/null 2>&1
+  drift_a_worktree feat-one frontend feat/went-its-own-way
+
+  local out
+  out="$(iw add-repo feat-one -r shared 2>&1)"
+
+  # Naming just the first disagreement left you without the list to choose from.
+  assert_contains "the first branch is named" "feat/one" "$out"
+  assert_contains "and so is the one that drifted" "feat/went-its-own-way" "$out"
+  assert_contains "with the repo each is on" "frontend" "$out"
+  assert_contains "and a way out" "-b <branch>" "$out"
+  assert_no_file "nothing was added" "$SB_TASKS/feat-one/shared/.git"
+}
+
+test_add_repo_takes_the_branch_when_told() {
+  mk_repo backend
+  mk_repo frontend
+  mk_repo shared
+  iw feat/one -r backend frontend >/dev/null 2>&1
+  drift_a_worktree feat-one frontend feat/went-its-own-way
+
+  assert_ok "-b gets past the ambiguity" \
+    iw add-repo feat-one -b feat/one -r shared
+  assert_dir "and the worktree is there" "$SB_TASKS/feat-one/shared"
+  assert_eq "on the branch that was named" "feat/one" \
+    "$(git -C "$SB_TASKS/feat-one/shared" branch --show-current)"
+}
+
+test_add_repo_b_can_name_a_new_branch() {
+  mk_repo backend
+  mk_repo shared
+  iw feat/one -r backend >/dev/null 2>&1
+
+  # Not only for disambiguating: -b is also how a new repo joins on a branch of
+  # its own, which is the state that made the task mixed in the first place.
+  assert_ok "-b accepts a branch nothing is on yet" \
+    iw add-repo feat-one -b feat/brand-new -r shared
+  assert_eq "and the worktree is on it" "feat/brand-new" \
+    "$(git -C "$SB_TASKS/feat-one/shared" branch --show-current)"
+}
+
+test_branch_flag_is_refused_when_creating_a_task() {
+  mk_repo backend
+
+  # The branch is the first argument there, so -b would be a second answer to
+  # the same question.
+  assert_fails "-b is refused on task creation" \
+    iw feat/one -b feat/other -r backend
+  assert_contains "and says where it belongs" "applies only to add-repo" \
+    "$(iw feat/one -b feat/other -r backend 2>&1)"
+}
+
+test_project_add_lists_the_branches_too() {
+  mk_repo backend
+  mk_repo frontend
+  iw feat/one -r backend frontend >/dev/null 2>&1
+  drift_a_worktree feat-one frontend feat/went-its-own-way
+
+  # A project records one branch per task, so this hits the same wall and used
+  # to give the same dead-end message.
+  local out
+  out="$(iw project add myproj feat-one 2>&1)"
+  assert_contains "the branches are listed" "feat/went-its-own-way" "$out"
+  assert_contains "with its own way out" "records one branch per task" "$out"
+}
+
 # --- runner -------------------------------------------------------------------
 
 echo "iwork tests  ($IWORK_SRC)"

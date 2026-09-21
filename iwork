@@ -81,7 +81,8 @@ usage() {
   cat <<'EOF'
 Usage: iwork [flags] <branch-name> [--from <task|branch>] -r <repo1> [repo2 ...]
                                    [-p <project>]
-       iwork add-repo [<task>] [--from <task|branch>] -r <repo1> [repo2 ...]
+       iwork add-repo [<task>] [-b <branch>] [--from <task|branch>]
+                      -r <repo1> [repo2 ...]
        iwork [--no-tmux] rm [-f] <task|--current> [-r <repo1> [repo2 ...]]
        iwork [flags] park <task> [-p <project>]
        iwork [--no-tmux] list
@@ -230,6 +231,9 @@ Subcommands:
                  task's own window or session, it finishes the removal and
                  closes that window last, moving you to another window or
                  session first and saying where it put you.
+                 -b names the branch for the new worktrees instead of
+                 reading it off the ones already there, which is what a task
+                 whose repos have drifted onto different branches needs.
   park           Move the current repo/branch into a task folder
   list           List task folders (with window status in tmux)
   cd             Switch to the task window, or cd into the task folder
@@ -826,10 +830,15 @@ park_current_repo() {
 
 detect_branch_from_worktree_folder() {
   local folder="$1"
+  local hint="${2:-}"
   local folder_path=""
   local child_path=""
+  local name=""
   local branch=""
   local detected_branch=""
+  local mixed=""
+  local listing=""
+  local width=0
 
   folder_path="$(resolve_worktree_folder "$folder")"
 
@@ -845,17 +854,31 @@ detect_branch_from_worktree_folder() {
 
     validate_branch "$branch"
 
+    name="${child_path##*/}"
+    (( ${#name} <= width )) || width=${#name}
+    listing="${listing}${name}"$'\t'"${branch}"$'\n'
+
     if [[ -z "$detected_branch" ]]; then
       detected_branch="$branch"
-      continue
-    fi
-
-    if [[ "$detected_branch" != "$branch" ]]; then
-      die "worktree folder '$folder' contains multiple branches ('$detected_branch' and '$branch')"
+    elif [[ "$detected_branch" != "$branch" ]]; then
+      mixed=1
     fi
   done
 
   [[ -n "$detected_branch" ]] || die "could not determine a branch from existing worktrees in $folder"
+
+  # Naming only the first two that disagreed said a task was mixed without
+  # showing what it was mixed between -- which is the list you have to pick
+  # from, and the reason the message was a dead end.
+  if [[ -n "$mixed" ]]; then
+    die "task '$folder' has worktrees on more than one branch, so there is no
+  single branch to follow:
+
+$(printf '%s' "$listing" | awk -F'\t' -v w="$width" '{printf "    %-*s  %s\n", w, $1, $2}')${hint:+
+
+$hint}"
+  fi
+
   printf '%s\n' "$detected_branch"
 }
 
@@ -1364,6 +1387,12 @@ parse_task_args() {
         validate_project_name "$PROJECT_FLAG"
         shift 2
         ;;
+      -b|--branch)
+        [[ $# -gt 1 ]] || die "expected a branch name after $1"
+        BRANCH_FLAG="$2"
+        validate_branch "$BRANCH_FLAG"
+        shift 2
+        ;;
       -r)
         [[ ${#repos[@]} -eq 0 ]] || die "-r was given more than once"
         shift
@@ -1812,7 +1841,7 @@ _iwork() {
   fi
 
   if [[ -z "$cmd" ]]; then
-    COMPREPLY=( $(compgen -W "add-repo rm park list cd claude codex master resurrect project todo log decided done drop init install-hooks --no-tmux --no-context --detach -d --big --from --message -m -h --help --completion" -- "$cur") )
+    COMPREPLY=( $(compgen -W "add-repo rm park list cd claude codex master resurrect project todo log decided done drop init install-hooks --no-tmux --no-context --detach -d --big --from -b --branch --message -m -h --help --completion" -- "$cur") )
     return 0
   fi
 
@@ -2028,6 +2057,8 @@ _iwork() {
       '-d[create the task window without switching to it]' \
       '--big[give the task its own tmux session with a window per repo]' \
       '--from[start the new branches from this task or branch]' \
+      '-b[branch for the new worktrees (add-repo only)]' \
+      '--branch[branch for the new worktrees (add-repo only)]' \
       '--message[first prompt for the agent, so it starts work on its own]' \
       '-m[first prompt for the agent, so it starts work on its own]' \
       '--completion[print shell integration]'
@@ -2176,6 +2207,8 @@ _iwork() {
         '-d[create the task window without switching to it]' \
         '--big[give the task its own tmux session with a window per repo]' \
         '--from[start the new branches from this task or branch]' \
+        '-b[branch for the new worktrees (add-repo only)]' \
+        '--branch[branch for the new worktrees (add-repo only)]' \
         '--no-tmux[skip tmux window handling]' \
         '--no-context[skip writing task context files]'
       return 0
@@ -5579,6 +5612,7 @@ PY
 }
 
 PROJECT_FLAG=""
+BRANCH_FLAG=""
 
 # Scoped help, so an agent has somewhere to discover its own verbs without
 # reading the full 'iwork -h', which is mostly operator material and advertises
@@ -5721,7 +5755,9 @@ cmd_project() {
       require_projects_dir
       task="$(resolve_task_arg "${2:-}")"
       [[ -d "$TASKS_DIR/$task" ]] || die "no such task: $task"
-      branch="$(detect_branch_from_worktree_folder "$task")"
+      branch="$(detect_branch_from_worktree_folder "$task" \
+        "  The project records one branch per task. Put the worktrees on one
+  branch first, or attach a task that already is.")"
       attach_task_to_project "$task" "$1" "$branch"
       ;;
     rm)
@@ -6155,7 +6191,16 @@ if [[ "${1:-}" == "add-repo" ]]; then
 
   warn_message_undelivered "add-repo does not start an agent"
 
-  branch="$(detect_branch_from_worktree_folder "$folder_name")"
+  # Normally the branch is read off the worktrees already there. A task whose
+  # repos have drifted onto different branches has no single answer, so -b is
+  # how you give it one.
+  if [[ -n "$BRANCH_FLAG" ]]; then
+    branch="$BRANCH_FLAG"
+  else
+    branch="$(detect_branch_from_worktree_folder "$folder_name" \
+      "  Pick one for the new worktree, or name another:
+    iwork add-repo $folder_name -b <branch> -r ${repos[*]}")"
+  fi
 
   create_worktrees "$branch" "$folder_name" "${repos[@]}"
   refresh_task_blocks "$folder_name" "$branch"
@@ -6229,6 +6274,9 @@ require_config
 validate_branch "$branch"
 
 parse_task_args "expected -r <repos> after branch name" "$@"
+
+[[ -z "$BRANCH_FLAG" ]] ||
+  die "-b applies only to add-repo; when creating a task the branch is the first argument"
 
 # A master stands in its own project, so a task spawned from there belongs to it
 # without having to say so — and naming it on every line is one typo away from
