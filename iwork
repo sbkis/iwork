@@ -3,7 +3,7 @@ set -euo pipefail
 
 SELF_PATH="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)/$(basename "${BASH_SOURCE[0]:-$0}")"
 IWORK_CONFIG_FILE="${IWORK_CONFIG_FILE:-${XDG_CONFIG_HOME:-$HOME/.config}/iwork/config}"
-IWORK_CONFIG_VARS=(IWORK_REPO_DIR IWORK_TASKS_DIR IWORK_PROJECTS_DIR IWORK_TMUX_SESSION IWORK_PROJECTS_TMUX_SESSION IWORK_CONTEXT_TEMPLATE IWORK_PROJECT_TEMPLATE IWORK_EDITOR IWORK_NO_TMUX IWORK_NO_CONTEXT IWORK_DETACH IWORK_BIG IWORK_ASSUME_YES IWORK_PROJECT IWORK_SHOW_LOG_LINES)
+IWORK_CONFIG_VARS=(IWORK_REPO_DIR IWORK_TASKS_DIR IWORK_PROJECTS_DIR IWORK_TMUX_SESSION IWORK_PROJECTS_TMUX_SESSION IWORK_CONTEXT_TEMPLATE IWORK_PROJECT_TEMPLATE IWORK_EDITOR IWORK_NO_TMUX IWORK_NO_CONTEXT IWORK_DETACH IWORK_BIG IWORK_ASSUME_YES IWORK_PROJECT IWORK_SHOW_LOG_LINES IWORK_SESSION_MARKERS)
 
 load_config() {
   local var="" restore=""
@@ -31,6 +31,18 @@ TASKS_DIR="${IWORK_TASKS_DIR:-${REPO_DIR:+$REPO_DIR/tasks}}"
 PROJECTS_DIR="${IWORK_PROJECTS_DIR:-${REPO_DIR:+$REPO_DIR/projects}}"
 TASKS_SESSION="${IWORK_TMUX_SESSION:-tasks}"
 PROJECTS_SESSION="${IWORK_PROJECTS_TMUX_SESSION:-projects}"
+# UNSTABLE, and off by default. Putting the agent marker on a session *name*
+# makes that name change under every other tool: anything that looks a session
+# up by the name it last saw -- tmux-sessionx, a keybinding, a restorer -- misses
+# it once a marker has flipped, and a switcher that creates what it cannot find
+# then builds a second session under the stale name. That is where duplicate
+# sessions come from, and no amount of care inside iwork can prevent it, because
+# the instability is the feature.
+#
+# The state is always published as the '@iwork_state' tmux option instead, which
+# a status line can read without any name having to change. Window names still
+# carry their marker: they are iwork's own, and switchers do not key on them.
+IWORK_SESSION_MARKERS="${IWORK_SESSION_MARKERS:-off}"
 IWORK_NO_TMUX="${IWORK_NO_TMUX:-}"
 IWORK_NO_CONTEXT="${IWORK_NO_CONTEXT:-}"
 IWORK_DETACH="${IWORK_DETACH:-}"
@@ -81,6 +93,7 @@ Usage: iwork [flags] <branch-name> [--from <task|branch>] -r <repo1> [repo2 ...]
        iwork init
        iwork install-hooks [settings-path]
        iwork --completion <bash|zsh>
+       iwork --tmux-config
 
        iwork project list
        iwork project show [-n <count>] [-p <project> | <project>]
@@ -146,13 +159,21 @@ left pane, a shell in the right); claude/codex/cd switch to it if it
 exists, wherever it turns out to be.
 
 Claude Code hooks (see install-hooks) mark the window name with the agent
-state: *task = busy, !task = waiting for you. Session names carry the same
-marker, taken from the windows in them: '!projects-bla' means something in
-that project wants you, '*projects-bla' that something is working and
-nothing is waiting, and an unmarked name that neither is true. The marker
-is part of the name, so a marked session does not answer to 'tmux attach
--t tasks': pick it out of the session list (prefix + s), or match it by
-pattern -- the README has the keybinding.
+state: *task = busy, !task = waiting for you.
+
+A session's state is published as the '@iwork_state' tmux option instead of
+being written into its name: '!' when an agent in there is waiting for you,
+'*' when one is working, empty when neither. 'iwork --tmux-config' prints a
+status line and a session picker that read it, and a hook that repairs a
+split session.
+
+IWORK_SESSION_MARKERS=on puts the marker back on the session name too
+('!projects-bla'), which is how earlier versions behaved. It is off by
+default and UNSTABLE: the name then changes underneath every other tool,
+and a session switcher that looks one up by the name it last saw will miss
+it and -- if it creates what it cannot find, as tmux-sessionx does --
+build a second session under the stale name. The hook in --tmux-config
+folds such a split back together if you want the marker anyway.
 
 -m <message> hands the agent the message as its first prompt, so a new task
 starts working the moment it comes up instead of waiting for you to type it.
@@ -1457,6 +1478,38 @@ create_worktrees() {
   echo "  $folder_path"
 }
 
+# The tmux side of iwork: what a session's agent state looks like once it is no
+# longer welded into the session's name, plus the guard for switchers that
+# create whatever they cannot find.
+print_tmux_config() {
+  local self_path_q=""
+
+  printf -v self_path_q '%q' "$SELF_PATH"
+
+  cat <<EOF
+# --- iwork -------------------------------------------------------------------
+# Add to ~/.tmux.conf, or: run-shell '$SELF_PATH --tmux-config > /tmp/iwork.tmux'
+#
+# iwork publishes each session's agent state as the '@iwork_state' option --
+# '!' when an agent in there is waiting for you, '*' when one is working,
+# empty otherwise. Reading it from there rather than from the session's name is
+# what keeps the name stable, and a stable name is what every session switcher,
+# keybinding and restorer depends on.
+
+# 1. The state, in the status line, for the session you are looking at.
+set -g status-right '#{?#{==:#{@iwork_state},!},[needs you] ,#{?#{==:#{@iwork_state},*},[working] ,}}#{session_name}'
+
+# 2. The state in the session picker, which is where you actually go looking.
+bind-key S choose-tree -Zs -O name -F '#{?session_format,#{@iwork_state}#{session_name}: #{session_windows} windows,#{window_name}}'
+
+# 3. A switcher that creates what it cannot find will build a second session
+#    under a name iwork has since renamed. This folds any such split the moment
+#    it appears, whichever tool made it. Harmless if nothing is wrong.
+set-hook -g session-created 'run-shell -b "$self_path_q --fold-sessions"'
+# --- /iwork ------------------------------------------------------------------
+EOF
+}
+
 print_bash_completion() {
   local self_path_q=""
 
@@ -2423,14 +2476,38 @@ session_agent_marker() {
   printf '%s\n' "$marker"
 }
 
-# Puts that state on the session name. $base is the name without a marker,
-# $session the live one, which may already carry a stale marker.
+session_markers_enabled() {
+  case "$IWORK_SESSION_MARKERS" in
+    1|on|yes|true) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# Publishes that state. $base is the name without a marker, $session the live
+# one, which may already carry a stale marker.
+#
+# The '@iwork_state' option is set either way and is the portable half: it holds
+# '!', '*' or nothing, it is attached to the session rather than woven into its
+# identity, and a status line can read it without anything having to be renamed:
+#
+#   set -g status-right "#{?#{==:#{@iwork_state},!},NEEDS YOU,}"
+#
+# The rename only happens with IWORK_SESSION_MARKERS on. With it off the name
+# converges back to the plain one, so a tree that was marked before does not
+# stay marked forever.
 mark_session() {
   local base="$1"
   local session="$2"
   local marker=""
 
   marker="$(session_agent_marker "$session")"
+  # No '=' prefix here: set-option rejects it as a session target, unlike every
+  # other command in this file. '-q' would have hidden that by suppressing the
+  # error, and the option would simply never have been written.
+  tmux set-option -t "$session" @iwork_state "$marker" 2>/dev/null || true
+
+  session_markers_enabled || marker=""
+
   [[ "$session" != "${marker}${base}" ]] || return 0
 
   tmux rename-session -t "=$session" "${marker}${base}" 2>/dev/null || true
@@ -5355,6 +5432,8 @@ run_init() {
     fi
     echo '# IWORK_TMUX_SESSION=tasks'
     echo '# IWORK_PROJECTS_TMUX_SESSION=projects'
+    echo '# IWORK_SESSION_MARKERS=off   # on = put the agent marker on session'
+    echo '#                             # names too (UNSTABLE: see iwork -h)'
     echo '# IWORK_CONTEXT_TEMPLATE="$HOME/.config/iwork/task-context.md.tmpl"'
   } > "$IWORK_CONFIG_FILE" || die "could not write $IWORK_CONFIG_FILE"
 
@@ -5846,6 +5925,35 @@ case "${1:-}" in
   --resolve-park-target-path)
     require_config
     resolve_park_target_path "${2:-}"
+    exit 0
+    ;;
+  --fold-sessions)
+    # For the tmux 'session-created' hook. Any switcher that looks a session up
+    # by the exact name it last saw will miss one whose marker has flipped since,
+    # and the ones that create what they cannot find then build a second session
+    # under the stale name. This runs the moment that happens and folds it back,
+    # whichever tool did it. Silent and always successful: a tmux hook is not a
+    # place to report anything.
+    [[ -z "$IWORK_NO_TMUX" ]] || exit 0
+    command -v tmux >/dev/null 2>&1 || exit 0
+    require_config
+    while IFS= read -r fold_base; do
+      [[ -n "$fold_base" ]] || continue
+      merge_duplicate_sessions "$fold_base" >/dev/null 2>&1 || true
+    done < <(iwork_sessions | sed 's/^[*!]//' | sort | uniq -d)
+
+    # '@iwork_state' is derived on every hook, but a session whose windows
+    # changed without one -- folded, moved into, restored -- would keep
+    # advertising what was true before. It is the only place the state is
+    # published now, so a stale value is the whole status line being wrong.
+    while IFS= read -r fold_base; do
+      [[ -n "$fold_base" ]] || continue
+      refresh_session_marker "$fold_base" 2>/dev/null || true
+    done < <(iwork_sessions | sed 's/^[*!]//' | sort -u)
+    exit 0
+    ;;
+  --tmux-config)
+    print_tmux_config
     exit 0
     ;;
   --switch-task-window)

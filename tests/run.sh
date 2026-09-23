@@ -153,6 +153,7 @@ iw() {
   [[ -n "${WANT_ENTRY_MAX:-}" ]] && env_args+=(IWORK_ENTRY_MAX_CHARS="$WANT_ENTRY_MAX")
   [[ -n "${WANT_SHOW_LINES+x}" ]] && env_args+=(IWORK_SHOW_LOG_LINES="$WANT_SHOW_LINES")
   [[ -n "${WANT_PROJECT_ENV:-}" ]] && env_args+=(IWORK_PROJECT="$WANT_PROJECT_ENV")
+  [[ -n "${WANT_SESSION_MARKERS:-}" ]] && env_args+=(IWORK_SESSION_MARKERS="$WANT_SESSION_MARKERS")
 
   env -u TMUX "${env_args[@]}" "$IWORK_SRC" "$@"
 }
@@ -1427,6 +1428,9 @@ test_hook_still_renames_tmux_windows() {
 
 test_hook_marks_a_big_tasks_own_session() {
   command -v tmux >/dev/null 2>&1 || { printf '    skip (no tmux)\n'; return 0; }
+  # The marker on a session *name* is opt-in; this is the test of that feature,
+  # so it turns it on for every path it drives.
+  local WANT_SESSION_MARKERS=on
   mk_repo backend
   iw feat/one -r backend -p myproj >/dev/null 2>&1
 
@@ -1447,6 +1451,7 @@ test_hook_marks_a_big_tasks_own_session() {
       HOME="$SB_HOME" IWORK_CONFIG_FILE="$SB/config" \
       IWORK_REPO_DIR="$SB_REPOS" IWORK_TASKS_DIR="$SB_TASKS" \
       IWORK_PROJECTS_DIR="$SB_PROJECTS" \
+      IWORK_SESSION_MARKERS="${WANT_SESSION_MARKERS:-on}" \
       "$IWORK_SRC" --hook >/dev/null 2>&1
   }
 
@@ -1478,6 +1483,9 @@ test_hook_marks_a_big_tasks_own_session() {
 
 test_hook_marks_the_shared_session_from_its_windows() {
   command -v tmux >/dev/null 2>&1 || { printf '    skip (no tmux)\n'; return 0; }
+  # The marker on a session *name* is opt-in; this is the test of that feature,
+  # so it turns it on for every path it drives.
+  local WANT_SESSION_MARKERS=on
   mk_repo backend
   iw feat/one -r backend -p myproj >/dev/null 2>&1
   iw feat/two -r backend -p myproj >/dev/null 2>&1
@@ -1499,6 +1507,7 @@ test_hook_marks_the_shared_session_from_its_windows() {
       HOME="$SB_HOME" IWORK_CONFIG_FILE="$SB/config" \
       IWORK_REPO_DIR="$SB_REPOS" IWORK_TASKS_DIR="$SB_TASKS" \
       IWORK_PROJECTS_DIR="$SB_PROJECTS" \
+      IWORK_SESSION_MARKERS="${WANT_SESSION_MARKERS:-on}" \
       "$IWORK_SRC" --hook >/dev/null 2>&1
   }
   shared_name() { tmux_t list-sessions -F '#{session_name}' 2>/dev/null | grep -E '^[*!]?tasks$'; }
@@ -3234,6 +3243,140 @@ test_creating_a_task_folds_a_twin_it_finds() {
     "$(tmux_t list-sessions -F '#{session_name}' 2>/dev/null | sed 's/^[*!]//' | grep -c '^tasks$' | tr -d ' ')"
   assert_contains "with the stray window folded in" "stray" \
     "$(windows_of_session tasks)"
+}
+
+# --- session markers are opt-in ----------------------------------------------
+
+# Renaming a session to carry its agent state is the one thing iwork does that
+# makes a session's *name* move under other tools. Every session switcher looks
+# a session up by the name it last saw, and the ones that create what they
+# cannot find build a second session under the stale name. So the rename is off
+# by default and the state is published as a tmux option instead.
+
+marker_hook() {
+  local event="$1" pane="$2" socket="$3" markers="${4:-}"
+
+  printf '{"hook_event_name":"%s"}' "$event" | env \
+    TMUX="$socket,1,0" TMUX_PANE="$pane" TMUX_TMPDIR="$SB/tmux" \
+    HOME="$SB_HOME" IWORK_CONFIG_FILE="$SB/config" \
+    IWORK_REPO_DIR="$SB_REPOS" IWORK_TASKS_DIR="$SB_TASKS" \
+    IWORK_PROJECTS_DIR="$SB_PROJECTS" \
+    IWORK_SESSION_MARKERS="$markers" \
+    "$IWORK_SRC" --hook >/dev/null 2>&1
+}
+
+marker_fixture() {
+  mk_repo backend
+  iw feat/one -r backend >/dev/null 2>&1
+  tmux_t new-session -d -s tasks -n feat-one -c "$SB_TASKS/feat-one" 2>/dev/null
+  MARKER_PANE="$(tmux_t list-panes -t '=tasks:feat-one' -F '#{pane_id}' 2>/dev/null | head -1)"
+  MARKER_SOCKET="$(tmux_t display-message -p '#{socket_path}' 2>/dev/null)"
+  [[ -n "$MARKER_PANE" && -n "$MARKER_SOCKET" ]]
+}
+
+test_session_name_is_left_alone_by_default() {
+  command -v tmux >/dev/null 2>&1 || { printf '    skip (no tmux)\n'; return 0; }
+  marker_fixture || { printf '    skip (could not start isolated tmux server)\n'; return 0; }
+
+  marker_hook Stop "$MARKER_PANE" "$MARKER_SOCKET"
+
+  assert_eq "the session keeps its plain name" "tasks" \
+    "$(tmux_t display-message -p -t "$MARKER_PANE" '#{session_name}')"
+  # The window still carries it: window names are iwork's own, and no switcher
+  # keys on them.
+  assert_eq "while the window still shows the state" "!feat-one" \
+    "$(tmux_t display-message -p -t "$MARKER_PANE" '#{window_name}')"
+}
+
+test_session_state_is_published_as_a_tmux_option() {
+  command -v tmux >/dev/null 2>&1 || { printf '    skip (no tmux)\n'; return 0; }
+  marker_fixture || { printf '    skip (could not start isolated tmux server)\n'; return 0; }
+
+  # Reading it back through a format is the point -- that is how a status line
+  # or a picker gets at it. Writing it with a '=' session target silently did
+  # nothing, which only a read-back catches.
+  marker_hook Stop "$MARKER_PANE" "$MARKER_SOCKET"
+  assert_eq "waiting is published" "!" \
+    "$(tmux_t display-message -p -t "$MARKER_PANE" '#{@iwork_state}')"
+
+  marker_hook UserPromptSubmit "$MARKER_PANE" "$MARKER_SOCKET"
+  assert_eq "and so is working" "*" \
+    "$(tmux_t display-message -p -t "$MARKER_PANE" '#{@iwork_state}')"
+}
+
+test_session_markers_can_be_turned_on() {
+  command -v tmux >/dev/null 2>&1 || { printf '    skip (no tmux)\n'; return 0; }
+  marker_fixture || { printf '    skip (could not start isolated tmux server)\n'; return 0; }
+
+  marker_hook Stop "$MARKER_PANE" "$MARKER_SOCKET" on
+  assert_eq "the name carries the marker when asked for" "!tasks" \
+    "$(tmux_t display-message -p -t "$MARKER_PANE" '#{session_name}')"
+  assert_eq "and the option is still published" "!" \
+    "$(tmux_t display-message -p -t "$MARKER_PANE" '#{@iwork_state}')"
+}
+
+test_turning_markers_off_converges_a_marked_session_back() {
+  command -v tmux >/dev/null 2>&1 || { printf '    skip (no tmux)\n'; return 0; }
+  marker_fixture || { printf '    skip (could not start isolated tmux server)\n'; return 0; }
+
+  marker_hook Stop "$MARKER_PANE" "$MARKER_SOCKET" on
+  assert_eq "marked while the feature was on" "!tasks" \
+    "$(tmux_t display-message -p -t "$MARKER_PANE" '#{session_name}')"
+
+  # Otherwise a tree marked before the setting changed would stay marked for as
+  # long as those sessions live.
+  marker_hook Stop "$MARKER_PANE" "$MARKER_SOCKET"
+  assert_eq "and back to the plain name once it is off" "tasks" \
+    "$(tmux_t display-message -p -t "$MARKER_PANE" '#{session_name}')"
+}
+
+test_fold_sessions_repairs_a_switcher_duplicate() {
+  command -v tmux >/dev/null 2>&1 || { printf '    skip (no tmux)\n'; return 0; }
+  mk_repo backend
+  WANT_TMUX=1 iw --detach feat/one -r backend >/dev/null 2>&1
+  tmux_t rename-session -t '=tasks' '!tasks' 2>/dev/null
+
+  # What a switcher does when it looks up the name it last saw, misses, and
+  # creates one: an empty session under the stale name.
+  tmux_t new-session -d -s tasks -n '' 2>/dev/null
+
+  WANT_TMUX=1 iw --fold-sessions >/dev/null 2>&1
+
+  assert_eq "one session is left under that name" "1" \
+    "$(tmux_t list-sessions -F '#{session_name}' 2>/dev/null | sed 's/^[*!]//' | grep -c '^tasks$' | tr -d ' ')"
+  assert_contains "with the real task still in it" "feat-one" "$(windows_of_session tasks)"
+}
+
+test_fold_sessions_refreshes_published_state() {
+  command -v tmux >/dev/null 2>&1 || { printf '    skip (no tmux)\n'; return 0; }
+  mk_repo backend
+  WANT_TMUX=1 iw --detach feat/one -r backend >/dev/null 2>&1
+
+  # A window marked without a hook behind it -- folded in, moved, restored --
+  # leaves the session advertising what was true before. That option is the only
+  # place the state is published now, so a stale value is the status line lying.
+  tmux_t rename-window -t '=tasks:feat-one' '!feat-one' 2>/dev/null
+
+  WANT_TMUX=1 iw --fold-sessions >/dev/null 2>&1
+
+  local pane
+  pane="$(tmux_t list-panes -t '=tasks' -F '#{pane_id}' 2>/dev/null | head -1)"
+  assert_eq "the session advertises what its windows say" "!" \
+    "$(tmux_t display-message -p -t "$pane" '#{@iwork_state}')"
+
+  # Sessions iwork does not own are none of its business.
+  tmux_t new-session -d -s mine -n w 2>/dev/null
+  WANT_TMUX=1 iw --fold-sessions >/dev/null 2>&1
+  assert_eq "and a session iwork does not own is left alone" "mine" \
+    "$(tmux_t list-sessions -F '#{session_name}' 2>/dev/null | grep '^mine$')"
+}
+
+test_tmux_config_is_printable_and_points_at_this_iwork() {
+  local out
+  out="$(iw --tmux-config 2>&1)"
+  assert_contains "it sets the session-created guard" "set-hook -g session-created" "$out"
+  assert_contains "calling this iwork" "--fold-sessions" "$out"
+  assert_contains "and shows how to read the state" "@iwork_state" "$out"
 }
 
 # --- runner -------------------------------------------------------------------
