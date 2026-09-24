@@ -139,9 +139,7 @@ setw -g automatic-rename off        # let iwork own the task window names
 
 bind Tab switch-client -l           # prefix+Tab: toggle last session
 
-# prefix+T: jump to the tasks session, whatever marker it is wearing.
-# A plain `-t tasks` misses `!tasks` and `*tasks` — the marker is part of the name.
-bind T run-shell "tmux switch-client -t \"\$(tmux list-sessions | cut -d: -f1 | grep -m1 -E '^[*!]?tasks\$')\""
+bind T switch-client -t tasks       # prefix+T: jump to the tasks session
 
 # Waiting-agent counter in the status bar. -a covers every session, so it also
 # counts agents inside per-task `tasks-*` sessions (see Big tasks below).
@@ -149,13 +147,19 @@ set -g status-right '!#(tmux list-windows -a -F "#W" 2>/dev/null | grep -c "^!")
 ```
 
 Only `iwork` marks names with `!`, so counting across all sessions is safe. Count
-**windows**, not sessions: a session's marker is a summary of its windows, so
-counting both would count the same waiting agent twice.
+**windows**, not sessions.
 
-`prefix + s` is where the session markers pay off — every session in the list says
-whether something in it is working, waiting, or idle: the shared `tasks`, each
-project's session, and the per-task `tasks-*` sessions alike. One row per project
-is the whole point of the layout below.
+Then add the tmux-side integration, which `iwork` will write for you:
+
+```bash
+iwork --tmux-config
+```
+
+It prints three things: a status line and a session picker that show each
+session's agent state, and a `session-created` hook that repairs a split session.
+All three read `@iwork_state` rather than the session's name — see
+[Session state without renaming](#session-state-without-renaming) for why that
+matters.
 
 ## Quick start
 
@@ -357,14 +361,15 @@ lock. Only the rewrite operations (`done`, `drop`) take one.
 A **window** speaks for one agent, and keeps its marker until that agent moves:
 `*feat-x` while it works, `!feat-x` once it wants you.
 
-A **session** speaks for all the agents in it, so its marker is not stored — it is
-derived from its windows on every hook, and `!` outranks `*`:
+A **session** speaks for all the agents in it, so its state is not stored — it is
+derived from its windows on every hook, and `!` outranks `*`. It is published as
+the `@iwork_state` option on the session rather than written into its name:
 
-| Session name | Meaning |
+| `@iwork_state` | Meaning |
 |---|---|
-| `!projects-claims` | at least one agent in there is waiting for you |
-| `*projects-claims` | one is working, none is waiting |
-| `projects-claims` | neither — nothing in there wants anything |
+| `!` | at least one agent in there is waiting for you |
+| `*` | one is working, none is waiting |
+| empty | neither — nothing in there wants anything |
 
 That holds for every session iwork owns: the shared `tasks`, each
 `projects-<project>` (its master and its tasks counted together), and a `--big`
@@ -374,11 +379,12 @@ only be replaced by the next event from that same agent, while a session recompu
 from what is actually there. `iwork rm` re-derives it too, so closing the last
 waiting task drops the `!` immediately rather than leaving the name lying.
 
-The cost: the marker is part of the name, so a marked session does not answer to
-`tmux attach -t tasks`. Everything inside `iwork` (`list`, `cd`, `claude`, `codex`,
-`add-repo`, `rm`) matches the name with the marker ignored, and the
-[keybinding above](#6-recommended-tmux-config-optional) does the same for
-`prefix + T`.
+Reading it from an option rather than the name is what keeps session names stable
+for everything else — see
+[Session state without renaming](#session-state-without-renaming). Everything
+inside `iwork` (`list`, `cd`, `claude`, `codex`, `add-repo`, `rm`) matches a
+session name with any marker ignored regardless, so a tree marked by an older
+version, or by `IWORK_SESSION_MARKERS=on`, keeps working.
 
 ### Live state is never cached
 
@@ -890,13 +896,12 @@ How it fits with everything else:
 - **The agent window keeps the task name**, so the Claude Code status hooks still
   rename it `*task` / `!task`, and `iwork list` reports it — tagged `(session)` so
   you can see which tasks own one.
-- **The session name is marked too** — `*tasks-feat-big-thing` while the agent
-  works, `!tasks-feat-big-thing` when it wants you, on the same rule as the shared
-  sessions ([what the markers mean](#what-the-markers-mean)). The session list
-  (`prefix + s`) shows names and nothing else, so without this a task that owns a
-  session was the one place the state did not reach. Everything that looks a
-  session up by name (`cd`, `claude`, `codex`, `add-repo`, `rm`, `list`) ignores
-  the marker.
+- **The session's state is published too**, as `@iwork_state` on the session —
+  the session list (`prefix + s`) shows names and nothing else, so a task that
+  owns a session would otherwise be the one place the state did not reach. See
+  [Session state without renaming](#session-state-without-renaming). Everything
+  that looks a session up by name (`cd`, `claude`, `codex`, `add-repo`, `rm`,
+  `list`) tolerates a marker regardless, so an older marked tree keeps working.
 - **`cd`, `claude`, `codex`** find a task wherever its window is — its own
   session, its project's, or the shared one — whether or not you pass `--big`
   again.
@@ -971,6 +976,89 @@ A master is a standing agent holding its project's brief, so starting a batch of
 them for projects that never had one is not a restore. `resurrect` restarts the
 masters that are there, and names the projects that have none so you can start
 one yourself with `iwork master <project>`.
+
+### Session state without renaming
+
+Earlier versions wrote a session's agent state into its **name** — `!projects-x`
+when something in there wanted you, `*projects-x` when something was working.
+It read well in `prefix + s`, and it was the wrong place to put it.
+
+A session's name is its identity to every other tool. Renaming it constantly
+means anything that looks a session up by the name it last saw will miss it:
+keybindings, scripts, session restorers, and session switchers. Switchers are
+the worst case, because several of them *create* whatever they cannot find.
+[tmux-sessionx](https://github.com/omerxx/tmux-sessionx) does exactly this:
+
+```bash
+if ! tmux has-session -t="$target" 2>/dev/null; then
+    ...
+    tmux new-session -ds "$target" -c "$z_target" -n "$z_target"
+```
+
+Render the list, pick a session, and if an agent changes state in between, the
+name you picked no longer exists — so you get a brand-new empty session under
+the stale name, sitting next to the real one. That is where duplicate sessions
+come from, and nothing inside iwork can prevent it, because the instability *is*
+the feature.
+
+So the state lives in a tmux option instead. `@iwork_state` is set on every
+iwork session — `!`, `*`, or empty — and the name never moves:
+
+```tmux
+# in the status line, for the session you are looking at
+set -g status-right '#{?#{==:#{@iwork_state},!},[needs you] ,}#{session_name}'
+
+# in the session picker, which is where you actually go looking
+bind-key S choose-tree -Zs -O name \
+  -F '#{?session_format,#{@iwork_state}#{session_name}: #{session_windows} windows,#{window_name}}'
+```
+
+`iwork --tmux-config` prints both, ready to paste.
+
+**Window** names still carry their marker. Those are iwork's own — it creates the
+windows and nothing else looks them up by name — so the counter above still
+works, and `iwork list` still reports per-task state.
+
+#### Putting the marker back (unstable)
+
+```sh
+IWORK_SESSION_MARKERS=on
+```
+
+in `~/.config/iwork/config` restores the old behaviour. It is off by default and
+labelled unstable for the reason above: with it on, session names move under
+other tools and duplicates become possible again. If you want it anyway, take
+the `session-created` hook from `iwork --tmux-config` as well — it folds a split
+back together the moment a switcher creates one:
+
+```tmux
+set-hook -g session-created 'run-shell -b "iwork --fold-sessions"'
+```
+
+Turning the setting back off is enough to undo it: the next time iwork touches a
+marked session, the name converges back to the plain one.
+
+### Duplicate sessions
+
+A marked session does not reserve its plain name: to tmux, `!tasks` and `tasks`
+are two different sessions. That matters because tmux refusing a duplicate name
+is what normally makes two racing `iwork` invocations safe — the loser is told
+the name is taken and uses the session that is already there. The marker removes
+that protection, so an invocation that checked for a session just before a marker
+landed on it can go on to build a second one for the same thing. From then on the
+two drift: half a project's windows in one, half in the other.
+
+There is no way to make check-then-create atomic in tmux, so the split is
+repaired rather than prevented. Any command that is about to use one of iwork's
+sessions folds a split it finds first — every window into whichever session has
+been there longest, then the drained one goes with its last window, and the
+marker is re-derived. Nothing that was open is lost, and `resurrect` does the
+same sweep across every session at once:
+
+```bash
+iwork resurrect -n    # names any split it finds, changes nothing
+iwork resurrect
+```
 
 ### Stale status markers
 
@@ -1071,6 +1159,7 @@ overrides.
 | `IWORK_PROJECT_TEMPLATE` | `~/.config/iwork/project-context.md.tmpl` | Template for the project block injected into those files (same deal: seeded once, then yours) |
 | `IWORK_PROJECT` | unset | Fallback project for `todo`/`log`/`decided`/`done`/`drop`. A task's own `.project` link always wins over it; `-p` wins over both |
 | `IWORK_ENTRY_MAX_CHARS` | `800` | Longest `todo`/`log`/`decided` entry. Anything longer is truncated with a marker, since `project show` prints entries back and the `SessionStart` hook injects them into every session |
+| `IWORK_SESSION_MARKERS` | `off` | **Unstable.** `on` writes the agent marker into session *names* as well as window names. Makes session names unstable for every other tool — see [Session state without renaming](#session-state-without-renaming) |
 | `IWORK_SHOW_LOG_LINES` | `12` | How many log entries and past tasks `iwork project show` prints. Must be a positive integer; anything else warns and falls back to 12 |
 | `IWORK_EDITOR` | `nvim` | Editor started in each repo window under `--big`; run as a command line with the worktree appended |
 | `IWORK_NO_TMUX` | unset | Set to skip all tmux handling (same as the `--no-tmux` flag) |
