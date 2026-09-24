@@ -635,6 +635,41 @@ iwork project rm                     # detaches it again; project read from the 
 One caveat when retrofitting: `project add` reads the branch from one of the
 task's worktrees, so a task folder with no worktree in it is rejected.
 
+### When a task's repos are on different branches
+
+A task is meant to be one branch across several repos, and `add-repo` reads that
+branch off the worktrees already there. Nothing enforces it, though — an agent
+can commit a worktree onto a branch of its own — and once the repos disagree
+there is no single branch for a new worktree to follow:
+
+```
+Error: task 'feat-claims' has worktrees on more than one branch, so there is no
+  single branch to follow:
+
+    accounting-api    feat/claim-case-queue
+    rent-api          feat/org-claim-case-queue
+    rent-frontend-v2  feat/claims-feedback
+
+  Pick one for the new worktree, or name another:
+    iwork add-repo feat-claims -b <branch> -r email-templates
+```
+
+`-b` names the branch instead of deriving it:
+
+```bash
+iwork add-repo feat-claims -b feat/org-claim-case-queue -r email-templates
+iwork add-repo feat-claims -b feat/something-new -r email-templates
+```
+
+The branch need not be one the task is already on — `-b` is equally the way to
+bring a repo in on a branch of its own, which is how a task ends up mixed in the
+first place. It applies to `add-repo` only; when creating a task the branch is
+the first argument.
+
+`project add` hits the same wall, because a project records one branch per task.
+There `-b` does not apply: put the worktrees on one branch first, or attach a
+task that already is.
+
 A `~/.config/iwork/task-context.md.tmpl` created before the marker blocks
 existed has no `<!-- iwork:repos -->` markers, and the template is never
 overwritten — so `add-repo` had no block to refresh and the repo list in tasks
