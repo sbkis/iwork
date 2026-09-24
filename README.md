@@ -1004,6 +1004,31 @@ Things it will not do:
   worktrees and that generated agent context keeps the folder alive; `rm` warns
   and lists what stayed behind.
 
+### Removing the task you are standing in
+
+`rm` works from inside the task's own tmux window, or from inside the session a
+`--big` task owns. It used to refuse that case — killing the window would have
+killed the `iwork` process running in it, so the task folder never got removed —
+and told you to close the window yourself, which left a window pointing at a
+directory that was half gone.
+
+It now finishes the job and closes the window last:
+
+1. Everything else in the window (or every other window in the session) is killed
+   at the usual moment, so no editor or agent is left alive to write the task
+   folder back up while it is being deleted.
+2. The worktrees, the context files and the folder go.
+3. Your client is moved somewhere that will outlive the kill — another window in
+   the same session if there is one, otherwise another session — and only then
+   does the window or session you were in go with it.
+
+`rm` says where it put you. If nothing else is open in tmux at all, there is
+nowhere to go and the client detaches, which is the same thing that would happen
+if you closed the last window by hand.
+
+`project delete` behaves the same way when you run it from inside the project's
+own session.
+
 ### Orphaned worktrees
 
 If a worktree directory is renamed with plain `mv` instead of `git worktree move`,
