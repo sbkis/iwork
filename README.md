@@ -203,6 +203,9 @@ iwork skills
 # Upgrade the agent CLIs and restart every agent onto them
 iwork update-agents
 
+# Which build you are on (the script's line count — it is the release)
+iwork --version
+
 # Make the task part of a longer-horizon project (created on first use)
 iwork feat/token-api -r auth-service -p auth-rewrite
 

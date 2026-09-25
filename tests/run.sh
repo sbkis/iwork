@@ -454,6 +454,18 @@ test_unknown_option_still_rejected() {
     iw feat/one -r backend --frobnicate
 }
 
+test_version_is_the_line_count() {
+  local want=""
+  want="iwork version $(( $(wc -l < "$IWORK_SRC") ))"
+
+  assert_eq "--version prints the script's length" "$want" "$(iw --version)"
+
+  # Installed the way the README says: a symlink on PATH, and no config yet.
+  ln -s "$IWORK_SRC" "$SB/bin/iwork-link"
+  assert_eq "--version counts the script, not the symlink" "$want" \
+    "$(env HOME="$SB_HOME" IWORK_CONFIG_FILE="$SB/none" "$SB/bin/iwork-link" --version)"
+}
+
 # --- projects dir ------------------------------------------------------------
 
 test_project_created_on_first_use() {
