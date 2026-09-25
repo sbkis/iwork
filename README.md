@@ -197,6 +197,9 @@ iwork list
 iwork resurrect -n
 iwork resurrect
 
+# Relink every task's .claude/skills from its worktrees
+iwork skills
+
 # Make the task part of a longer-horizon project (created on first use)
 iwork feat/token-api -r auth-service -p auth-rewrite
 
@@ -684,6 +687,87 @@ still warns at the point it matters.
 `iwork project cat` reads files inside the project only — a symlink pointing out
 of it is refused. `project grep` forwards its extra arguments to ripgrep,
 including paths, so that one is a convenience rather than a boundary.
+
+## Skills from the worktrees
+
+Claude Code loads a project's skills from the directory the session is rooted in.
+An iwork task is rooted **above** its worktrees, so a skill defined in one of them
+was simply out of scope for the agent iwork starts:
+
+```
+tasks/feat-login/          <- the session is rooted here
+├── backend-api/
+│   └── .claude/skills/    <- never loaded
+└── frontend/
+    └── .claude/skills/    <- never loaded
+```
+
+The failure is quiet and reads like the wrong thing. A repo's `AGENTS.md` saying
+*"invoke the translator-skill before calling a task complete"* is not being
+ignored — it cannot be followed, and `Skill(translator-skill)` answers
+`Unknown skill`, which looks like the skill is broken rather than out of reach.
+
+So a task now gets a `.claude/skills/` of its own, holding a link to every skill
+in every worktree:
+
+```
+tasks/feat-login/.claude/skills/
+├── db-migrations      -> ../../backend-api/.claude/skills/db-migrations
+└── translator-skill   -> ../../frontend/.claude/skills/translator-skill
+```
+
+It is rebuilt whenever iwork starts an agent for the task, so a repo that gains
+or drops a skill is picked up without anything being re-created. Only links iwork
+made are replaced — a directory you put there by hand is yours and stays.
+
+### Healing tasks that already exist
+
+Linking happens whenever iwork starts an agent, which only ever fixes the task
+you are about to work in. A tree full of tasks made before this existed would
+each wait their turn, and one you never reopen would wait forever. `iwork skills`
+walks the whole tasks directory instead — the same list `iwork list` prints:
+
+```bash
+iwork skills -n     # what it would link, per task
+iwork skills        # do it
+iwork skills feat-login-bug   # just this one
+```
+
+```
+feat-claims-milestone-5   35 skill(s)
+    'code-review-skill' comes from more than one repo -> <repo>-code-review-skill
+feat-guarantee-redesign   35 skill(s)
+feat-photo-write-path     7 skill(s)
+mobile-listing-real-estate  -
+```
+
+It is idempotent, so running it on a healthy tree changes nothing.
+
+### When two repos define the same skill
+
+This is the case worth being careful about. If `backend-api` and `frontend` both
+define `code-review-skill`, they are different skills with the same name, and
+linking either one under the bare name would hand the agent the wrong repo's
+rules **without saying so** — worse than the unknown-skill error it replaces,
+because it looks like it worked.
+
+Both are linked with their repo in front instead, and no bare name is invented:
+
+```
+backend-api-code-review-skill   -> backend-api/.claude/skills/code-review-skill
+frontend-code-review-skill      -> frontend/.claude/skills/code-review-skill
+```
+
+iwork says which names this happened to. `code-review-skill` on its own stays
+unknown, which is the honest answer: there are two, and only you know which one
+the change in front of you needs.
+
+### The limit
+
+This fixes sessions rooted at the task, which is where `iwork` starts them. A
+session you start by hand *inside* a worktree is rooted there and sees that
+repo's skills only — the same as any ordinary checkout. Run agents from the task
+root and everything is in scope.
 
 ## Branch tracking
 

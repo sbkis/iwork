@@ -3459,6 +3459,181 @@ test_project_add_lists_the_branches_too() {
   assert_contains "with its own way out" "records one branch per task" "$out"
 }
 
+# --- skills from the worktrees -----------------------------------------------
+
+# Claude Code loads project skills from the directory the session is rooted in,
+# and an iwork task is rooted above its worktrees -- so a skill defined in one
+# of them was out of scope for the agent iwork starts, and every "invoke the
+# <x>-skill" line in that repo's AGENTS.md silently could not be followed.
+
+add_skill() {
+  local repo="$1" name="$2"
+  mkdir -p "$SB_REPOS/$repo/.claude/skills/$name"
+  cat > "$SB_REPOS/$repo/.claude/skills/$name/SKILL.md" <<SKILL
+---
+name: $name
+description: Test skill $name from $repo.
+---
+Body.
+SKILL
+  git -C "$SB_REPOS/$repo" add -A >/dev/null 2>&1
+  git -C "$SB_REPOS/$repo" commit -qm "add $name" >/dev/null 2>&1
+  # Worktrees branch from origin/main, so a commit that stays local is a commit
+  # the task never sees.
+  git -C "$SB_REPOS/$repo" push -q origin main >/dev/null 2>&1
+}
+
+test_skills_from_every_worktree_reach_the_task_root() {
+  mk_repo backend
+  mk_repo frontend
+  add_skill backend db-migrations
+  add_skill frontend translator-skill
+
+  iw feat/one -r backend frontend >/dev/null 2>&1
+
+  local skills="$SB_TASKS/feat-one/.claude/skills"
+  assert_link "the backend skill is reachable" "$skills/db-migrations"
+  assert_link "and so is the frontend one" "$skills/translator-skill"
+  # Following the link has to land on a real skill, not just exist.
+  assert_file "the link resolves to the skill itself" "$skills/translator-skill/SKILL.md"
+}
+
+test_a_skill_two_repos_both_define_is_qualified() {
+  mk_repo backend
+  mk_repo frontend
+  add_skill backend code-review-skill
+  add_skill frontend code-review-skill
+  add_skill frontend only-frontend-skill
+
+  iw feat/one -r backend frontend >/dev/null 2>&1
+
+  local skills="$SB_TASKS/feat-one/.claude/skills"
+  # Linking one of them under the bare name would hand the agent the other
+  # repo's review rules without saying so — worse than the unknown-skill error
+  # it replaces, because it looks like it worked.
+  assert_no_file "no bare name is invented for an ambiguous skill" "$skills/code-review-skill"
+  assert_link "the backend one is named for its repo" "$skills/backend-code-review-skill"
+  assert_link "and so is the frontend one" "$skills/frontend-code-review-skill"
+  assert_link "while an unambiguous skill keeps its plain name" "$skills/only-frontend-skill"
+
+  assert_contains "and the clash is reported" "defined by more than one repo" \
+    "$(iw --no-tmux claude feat-one 2>&1)"
+}
+
+test_skill_links_follow_the_repos_as_they_change() {
+  mk_repo backend
+  add_skill backend db-migrations
+  iw feat/one -r backend >/dev/null 2>&1
+
+  local skills="$SB_TASKS/feat-one/.claude/skills"
+  assert_link "linked at creation" "$skills/db-migrations"
+
+  # A repo gains and loses skills after the task was made; the task should not
+  # keep advertising what is no longer there.
+  rm -rf "$SB_TASKS/feat-one/backend/.claude/skills/db-migrations"
+  mkdir -p "$SB_TASKS/feat-one/backend/.claude/skills/brand-new"
+  printf -- '---\nname: brand-new\ndescription: New.\n---\nBody.\n' \
+    > "$SB_TASKS/feat-one/backend/.claude/skills/brand-new/SKILL.md"
+
+  iw --no-tmux claude feat-one >/dev/null 2>&1
+
+  assert_no_file "the dropped skill's link is gone" "$skills/db-migrations"
+  assert_link "and the new one is linked" "$skills/brand-new"
+}
+
+test_skill_linking_leaves_hand_made_entries_alone() {
+  mk_repo backend
+  add_skill backend db-migrations
+  iw feat/one -r backend >/dev/null 2>&1
+
+  # A real directory in there is somebody's own work, not ours to clear out.
+  local skills="$SB_TASKS/feat-one/.claude/skills"
+  mkdir -p "$skills/mine"
+  printf -- '---\nname: mine\ndescription: Mine.\n---\nBody.\n' > "$skills/mine/SKILL.md"
+
+  iw --no-tmux claude feat-one >/dev/null 2>&1
+
+  assert_file "a hand-made skill survives a refresh" "$skills/mine/SKILL.md"
+  assert_link "and the linked ones are still there" "$skills/db-migrations"
+}
+
+test_a_task_with_no_skills_gets_no_empty_claude_dir() {
+  mk_repo backend
+  iw feat/one -r backend >/dev/null 2>&1
+
+  # An empty .claude/ in every task would be noise, and 'rm' would have to
+  # explain it.
+  assert_no_file "no skills, no directory" "$SB_TASKS/feat-one/.claude"
+}
+
+test_skills_command_heals_every_task_at_once() {
+  mk_repo backend
+  mk_repo frontend
+  add_skill backend db-migrations
+  add_skill frontend translator-skill
+
+  iw feat/one -r backend >/dev/null 2>&1
+  iw feat/two -r backend frontend >/dev/null 2>&1
+
+  # The state a tree made before any of this existed is in: worktrees with
+  # skills, and no links anywhere.
+  rm -rf "$SB_TASKS/feat-one/.claude" "$SB_TASKS/feat-two/.claude"
+
+  local out
+  out="$(iw skills 2>&1)"
+  assert_contains "it reports the first task" "feat-one" "$out"
+  assert_contains "and the second" "feat-two" "$out"
+  assert_link "the first is relinked" "$SB_TASKS/feat-one/.claude/skills/db-migrations"
+  assert_link "and so is the second" "$SB_TASKS/feat-two/.claude/skills/translator-skill"
+}
+
+test_skills_command_takes_one_task() {
+  mk_repo backend
+  add_skill backend db-migrations
+  iw feat/one -r backend >/dev/null 2>&1
+  iw feat/two -r backend >/dev/null 2>&1
+  rm -rf "$SB_TASKS/feat-one/.claude" "$SB_TASKS/feat-two/.claude"
+
+  iw skills feat-one >/dev/null 2>&1
+
+  assert_link "the named task is relinked" "$SB_TASKS/feat-one/.claude/skills/db-migrations"
+  assert_no_file "and the other is left alone" "$SB_TASKS/feat-two/.claude"
+}
+
+test_skills_dry_run_changes_nothing() {
+  mk_repo backend
+  add_skill backend db-migrations
+  iw feat/one -r backend >/dev/null 2>&1
+  rm -rf "$SB_TASKS/feat-one/.claude"
+
+  local out
+  out="$(iw skills -n 2>&1)"
+  assert_contains "it says it is a dry run" "Dry run" "$out"
+  assert_contains "and what it would link" "1 skill(s)" "$out"
+  assert_no_file "while nothing is written" "$SB_TASKS/feat-one/.claude"
+}
+
+test_skills_command_names_the_ambiguous_ones() {
+  mk_repo backend
+  mk_repo frontend
+  add_skill backend code-review-skill
+  add_skill frontend code-review-skill
+  iw feat/one -r backend frontend >/dev/null 2>&1
+
+  # Which name is ambiguous is the part the operator has to act on.
+  assert_contains "the clash is named, not just counted" "'code-review-skill' comes from more than one repo" \
+    "$(iw skills 2>&1)"
+}
+
+test_skills_command_refuses_an_unknown_task() {
+  mk_repo backend
+  iw feat/one -r backend >/dev/null 2>&1
+
+  assert_fails "an unknown task is refused" iw skills feat-nope
+  assert_contains "and says so" "no such task" "$(iw skills feat-nope 2>&1)"
+  assert_fails "as is a second task name" iw skills feat-one feat-two
+}
+
 # --- runner -------------------------------------------------------------------
 
 echo "iwork tests  ($IWORK_SRC)"
