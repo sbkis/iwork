@@ -3634,6 +3634,159 @@ test_skills_command_refuses_an_unknown_task() {
   assert_fails "as is a second task name" iw skills feat-one feat-two
 }
 
+# --- cull --------------------------------------------------------------------
+
+# A master cannot be protected by a prompt it answers itself, so cull is trusted
+# for what it refuses: a task goes only when git can give all of it back.
+
+commit_in_task() {
+  local task="$1" repo="$2" push="$3"
+  printf 'work\n' > "$SB_TASKS/$task/$repo/work.txt"
+  git -C "$SB_TASKS/$task/$repo" add -A >/dev/null 2>&1
+  git -C "$SB_TASKS/$task/$repo" commit -qm "work" >/dev/null 2>&1
+  [[ -z "$push" ]] || git -C "$SB_TASKS/$task/$repo" push -q -u origin HEAD >/dev/null 2>&1
+}
+
+test_cull_removes_a_task_git_can_give_back() {
+  mk_repo backend
+  iw feat/one -r backend -p myproj >/dev/null 2>&1
+  commit_in_task feat-one backend push
+
+  local out
+  out="$(iw cull --all -p myproj 2>&1)"
+  assert_contains "it says what it culled" "Culled 1" "$out"
+  assert_no_file "the task is gone" "$SB_TASKS/feat-one"
+  # The branch is what makes it re-creatable, so it must survive.
+  assert_ok "and the branch is still there" \
+    git -C "$SB_REPOS/backend" rev-parse --verify feat/one
+}
+
+test_cull_keeps_a_task_with_uncommitted_work() {
+  mk_repo backend
+  iw feat/one -r backend -p myproj >/dev/null 2>&1
+  commit_in_task feat-one backend push
+  printf 'half done\n' > "$SB_TASKS/feat-one/backend/scratch.txt"
+
+  local out
+  out="$(iw cull --all -p myproj 2>&1)"
+  assert_contains "the reason is named" "uncommitted changes in backend" "$out"
+  assert_dir "and the task stays" "$SB_TASKS/feat-one"
+}
+
+test_cull_takes_commits_that_never_reached_a_remote() {
+  mk_repo backend
+  iw feat/one -r backend -p myproj >/dev/null 2>&1
+  commit_in_task feat-one backend ""
+
+  # Unpushed is not unsafe. rm keeps branches, so the commits are still in the
+  # repo once the worktree is gone. Blocking on this sounded careful and was
+  # merely wrong -- it kept most of a real project's tasks for a risk that does
+  # not exist.
+  iw cull -p myproj feat-one >/dev/null 2>&1
+  assert_no_file "the task is culled" "$SB_TASKS/feat-one"
+  assert_ok "and the branch still has the commit" \
+    git -C "$SB_REPOS/backend" rev-parse --verify feat/one
+  assert_contains "which is where the work went" "work" \
+    "$(git -C "$SB_REPOS/backend" show --name-only --format= feat/one 2>&1)"
+}
+
+test_cull_keeps_a_task_with_files_that_were_never_committed() {
+  mk_repo backend
+  iw feat/one -r backend -p myproj >/dev/null 2>&1
+  commit_in_task feat-one backend push
+  # Written at the task root rather than inside a repo, so git never saw it.
+  printf 'handoff\n' > "$SB_TASKS/feat-one/HANDOFF.md"
+
+  local out
+  out="$(iw cull --all -p myproj 2>&1)"
+  assert_contains "the file is named" "HANDOFF.md was never committed" "$out"
+  assert_dir "and the task stays" "$SB_TASKS/feat-one"
+  assert_file "with the file intact" "$SB_TASKS/feat-one/HANDOFF.md"
+}
+
+test_cull_only_touches_its_own_project() {
+  mk_repo backend
+  iw feat/mine -r backend -p myproj >/dev/null 2>&1
+  iw feat/theirs -r backend -p otherproj >/dev/null 2>&1
+  commit_in_task feat-mine backend push
+  commit_in_task feat-theirs backend push
+
+  iw cull --all -p myproj >/dev/null 2>&1
+  assert_no_file "its own task is culled" "$SB_TASKS/feat-mine"
+  assert_dir "another project's task is untouched" "$SB_TASKS/feat-theirs"
+
+  # And naming it explicitly is refused rather than quietly obeyed.
+  assert_fails "a task from another project is refused" \
+    iw cull -p myproj feat-theirs
+  assert_contains "and says why" "not in project" \
+    "$(iw cull -p myproj feat-theirs 2>&1)"
+}
+
+test_cull_needs_the_tasks_named_or_all() {
+  mk_repo backend
+  iw feat/one -r backend -p myproj >/dev/null 2>&1
+  commit_in_task feat-one backend push
+
+  # A master's tasks are mostly tasks it is still using, so taking the lot has
+  # to be asked for rather than being what a bare command does.
+  assert_fails "a bare cull is refused" iw cull -p myproj
+  assert_contains "and says how to mean it" "pass --all" "$(iw cull -p myproj 2>&1)"
+  assert_dir "nothing was culled" "$SB_TASKS/feat-one"
+
+  iw cull -p myproj feat-one >/dev/null 2>&1
+  assert_no_file "naming it works" "$SB_TASKS/feat-one"
+}
+
+test_cull_keeps_a_task_whose_agent_is_working() {
+  command -v tmux >/dev/null 2>&1 || { printf '    skip (no tmux)\n'; return 0; }
+  mk_repo backend
+  WANT_TMUX=1 iw --detach feat/one -r backend -p myproj >/dev/null 2>&1
+  commit_in_task feat-one backend push
+
+  # Culling takes the window and whatever is running in it, and a clean worktree
+  # says nothing about what an agent is part way through doing to it.
+  tmux_t rename-window -t '=projects-myproj:feat-one' '*feat-one' 2>/dev/null ||
+    tmux_t rename-window -t '=tasks:feat-one' '*feat-one' 2>/dev/null
+
+  local out
+  out="$(WANT_TMUX=1 iw cull -p myproj feat-one 2>&1)"
+  assert_contains "the reason is named" "working in it right now" "$out"
+  assert_dir "and the task stays" "$SB_TASKS/feat-one"
+}
+
+test_cull_dry_run_changes_nothing() {
+  mk_repo backend
+  iw feat/one -r backend -p myproj >/dev/null 2>&1
+  commit_in_task feat-one backend push
+
+  local out
+  out="$(iw cull -n -p myproj 2>&1)"
+  assert_contains "it says it is a dry run" "Dry run" "$out"
+  assert_contains "and what it would cull" "would be culled" "$out"
+  assert_dir "while the task is still there" "$SB_TASKS/feat-one"
+}
+
+test_cull_works_from_the_project_directory() {
+  mk_repo backend
+  iw feat/one -r backend -p myproj >/dev/null 2>&1
+  commit_in_task feat-one backend push
+
+  # Where a master sits, and where 'rm' refuses to run.
+  iw_in "$SB_PROJECTS/myproj" cull feat-one >/dev/null 2>&1
+  assert_no_file "the task is culled without naming the project" "$SB_TASKS/feat-one"
+}
+
+test_rm_still_refuses_from_the_project_directory() {
+  mk_repo backend
+  iw feat/one -r backend -p myproj >/dev/null 2>&1
+
+  # cull is the narrow opening; rm itself stays shut.
+  assert_fails "rm is still refused there" \
+    iw_in "$SB_PROJECTS/myproj" rm -f feat-one
+  assert_contains "and points at cull" "iwork cull" \
+    "$(iw_in "$SB_PROJECTS/myproj" rm -f feat-one 2>&1)"
+}
+
 # --- runner -------------------------------------------------------------------
 
 echo "iwork tests  ($IWORK_SRC)"

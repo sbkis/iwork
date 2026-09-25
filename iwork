@@ -85,6 +85,7 @@ Usage: iwork [flags] <branch-name> [--from <task|branch>] -r <repo1> [repo2 ...]
                       -r <repo1> [repo2 ...]
        iwork [--no-tmux] rm [-f] <task|--current> [-r <repo1> [repo2 ...]]
        iwork [flags] park <task> [-p <project>]
+       iwork cull [-n] [--all] [-p <project>] [<task> ...]
        iwork [--no-tmux] list
        iwork [--no-tmux] cd <task>
        iwork [flags] claude <task> [claude-args...]
@@ -247,6 +248,16 @@ Subcommands:
                  -b names the branch for the new worktrees instead of
                  reading it off the ones already there, which is what a task
                  whose repos have drifted onto different branches needs.
+  cull           Tear down tasks in a project, keeping only what git can give
+                 back. A task goes when its worktrees are clean, nothing in the
+                 task folder was left uncommitted, no directory is orphaned and
+                 no agent is working in it; anything else is named and kept.
+                 Branches survive, as with rm, so a culled task comes back with
+                 'iwork <branch> --from <branch>'. Committed-but-unpushed work
+                 is not a blocker: the branch still has it. Name the tasks, or
+                 --all for every eligible one; -n lists them with what would
+                 stop each. Unlike rm this runs from a project directory, so a
+                 master can tidy up after itself
   park           Move the current repo/branch into a task folder
   list           List task folders (with window status in tmux)
   cd             Switch to the task window, or cd into the task folder
@@ -1776,7 +1787,7 @@ _iwork() {
       fi
       return 0
       ;;
-    cd|claude|codex)
+    cd|claude|codex|cull)
       if (( COMP_CWORD == cmd_i + 1 )); then
         folders="$("$_bin" --complete-worktree-folders "$cur" 2>/dev/null)" || return 0
         COMPREPLY=( $(compgen -W "$folders" -- "$cur") )
@@ -1858,7 +1869,7 @@ _iwork() {
   fi
 
   if [[ -z "$cmd" ]]; then
-    COMPREPLY=( $(compgen -W "add-repo rm park list cd claude codex master resurrect skills project todo log decided done drop init install-hooks --no-tmux --no-context --detach -d --big --from -b --branch --message -m -h --help --completion" -- "$cur") )
+    COMPREPLY=( $(compgen -W "add-repo rm park list cd claude codex master resurrect skills cull project todo log decided done drop init install-hooks --no-tmux --no-context --detach -d --big --from -b --branch --message -m -h --help --completion" -- "$cur") )
     return 0
   fi
 
@@ -2061,6 +2072,7 @@ _iwork() {
       'master[open the project master session that runs the tasks]' \
       'resurrect[restart the agents and windows a dead tmux server took]' \
       'skills[relink each task'"'"'s .claude/skills from its worktrees]' \
+      'cull[tear down tasks git can give back, for a project'"'"'s master]' \
       'project[manage the memory shared across a project'\''s tasks]' \
       'todo[capture something that needs doing, but not in this PR]' \
       'log[append one line to the project log]' \
@@ -2143,7 +2155,7 @@ _iwork() {
         '--note[record a plain note]'
       return 0
       ;;
-    cd|claude|codex|skills)
+    cd|claude|codex|skills|cull)
       if (( CURRENT == cmd_i + 1 )); then
         folders=("${(@f)$("$_bin" --complete-worktree-folders "$PREFIX" 2>/dev/null)}")
         _describe -t folders 'worktree folder' folders
@@ -3026,7 +3038,8 @@ stays current if the tool grows new ones, so prefer it over this list going
 stale. Task and tmux management — creating tasks, `add-repo`, `rm`, `park`,
 `resurrect`, `install-hooks` — belongs to the operator, not to you: those change
 or destroy worktrees, or restart every agent at once, so do not run them unless
-you were asked to directly.
+you were asked to directly. `iwork cull` belongs to a project master rather
+than to a task.
 
 PROJECT.md is curated by hand and is not yours to rewrite. If it has gone stale,
 say so instead of fixing it.'
@@ -3818,6 +3831,186 @@ delete_project() {
   run_deferred_kill
 }
 
+# --- cull --------------------------------------------------------------------
+
+# Tearing tasks down was the operator's alone, for two reasons that both still
+# hold: 'rm' destroys worktrees that may hold uncommitted work in a window
+# nobody is watching, and confirm() reads /dev/tty -- which a pane running an
+# agent has, so the agent answers its own prompt and the safety net catches
+# nothing.
+#
+# 'cull' is the part of that a master can be trusted with, and it is trusted for
+# what it refuses rather than for anything it asks. A task goes only when
+# everything in it can be got back out of git: clean worktrees, no directory git
+# has lost track of, and nothing sitting in the task folder that was never
+# committed at all. Anything else is named, kept, and left to the person running
+# this -- the boundary, not a gap in it.
+#
+# Committed-but-unpushed work is deliberately not a blocker. 'rm' keeps
+# branches, so those commits are still in the repo after the worktree goes and
+# 'iwork <branch> --from <branch>' brings them back. Blocking on it sounded
+# careful and was merely wrong: it kept most of a real project's tasks for a
+# risk that does not exist.
+
+# Why this task cannot be culled, one reason per line. Silence means it can.
+task_cull_blockers() {
+  local folder="$1"
+  local folder_path="$TASKS_DIR/$folder"
+  local wt=""
+  local name=""
+  local child=""
+  local line=""
+  local window_name=""
+
+  while IFS= read -r wt; do
+    [[ -n "$wt" ]] || continue
+    name="${wt##*/}"
+
+    if [[ -n "$(git -C "$wt" status --porcelain --untracked-files=all 2>/dev/null || true)" ]]; then
+      printf 'uncommitted changes in %s\n' "$name"
+    fi
+  done < <(list_task_worktrees "$folder_path")
+
+  # Culling takes the task's window and whatever is running in it. A clean
+  # worktree says nothing about whether an agent is part way through making it
+  # dirty again.
+  if [[ -z "$IWORK_NO_TMUX" ]] && command -v tmux >/dev/null 2>&1; then
+    line="$(locate_task_window "$folder" 2>/dev/null || true)"
+    if [[ -n "$line" ]]; then
+      window_name="${line##* }"
+      case "$window_name" in
+        '*'*) printf 'an agent is working in it right now\n' ;;
+      esac
+    fi
+  fi
+
+  # A directory whose worktree registration is gone: git can no longer say what
+  # is in it, so nothing here can say it is safe.
+  while IFS= read -r wt; do
+    [[ -n "$wt" ]] || continue
+    printf '%s is orphaned, so git cannot vouch for it\n' "${wt##*/}"
+  done < <(list_task_orphans "$folder_path")
+
+  # Files written at the task root rather than inside a repo were never in git
+  # to begin with.
+  for child in "$folder_path"/* "$folder_path"/.[!.]*; do
+    [[ -e "$child" || -L "$child" ]] || continue
+
+    name="${child##*/}"
+    case "$name" in
+      CLAUDE.md|AGENTS.md|.claude|.project) continue ;;
+    esac
+
+    is_worktree_root "$child" && continue
+    [[ -d "$child" && -e "$child/.git" ]] && continue
+
+    printf '%s was never committed anywhere\n' "$name"
+  done
+}
+
+cmd_cull() {
+  local dry=""
+  local project=""
+  local folder=""
+  local folders=""
+  local blockers=""
+  local reason=""
+  local removed=0
+  local kept=0
+  local wanted=""
+  local all=""
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -n|--dry-run) dry=1; shift ;;
+      --all) all=1; shift ;;
+      -p|--project)
+        [[ $# -ge 2 ]] || die "expected a project name after $1"
+        project="$2"
+        shift 2
+        ;;
+      -h|--help) usage 0 ;;
+      -*) die "unknown option '$1'" ;;
+      *)
+        validate_worktree_folder_name "$1"
+        wanted="${wanted:+$wanted }$1"
+        shift
+        ;;
+    esac
+  done
+
+  resolve_project_context "$project"
+  project="$RESOLVED_PROJECT"
+
+  warn_message_undelivered "cull does not start an agent"
+
+  # Culling every task a project has is a real thing to want and a terrible
+  # default: a master's tasks are mostly tasks it is still using. Naming them is
+  # the normal way in, and --all has to be spelled out.
+  if [[ -z "$wanted" && -z "$all" && -z "$dry" ]]; then
+    die "name the tasks to cull, or pass --all for every one that is eligible.
+  'iwork cull -n' lists them with what would stop each."
+  fi
+
+  if [[ -n "$wanted" ]]; then
+    # Named tasks still have to belong to the project: a master tidying its own
+    # work has no business reaching into somebody else's.
+    for folder in $wanted; do
+      [[ -d "$TASKS_DIR/$folder" ]] || die "no such task: $folder"
+      [[ "$(task_project_name "$folder" || true)" == "$project" ]] ||
+        die "task '$folder' is not in project '$project'; cull only takes its own"
+    done
+    folders="$(printf '%s\n' $wanted)"
+  else
+    folders="$(project_tasks_live "$project")"
+  fi
+
+  if [[ -z "$folders" ]]; then
+    echo "Project '$project' has no tasks to cull."
+    return 0
+  fi
+
+  [[ -z "$dry" ]] || echo "Dry run — nothing is changed."
+
+  while IFS= read -r folder; do
+    [[ -n "$folder" ]] || continue
+
+    blockers="$(task_cull_blockers "$folder")"
+
+    if [[ -n "$blockers" ]]; then
+      kept=$((kept + 1))
+      echo "$folder: kept"
+      while IFS= read -r reason; do
+        [[ -n "$reason" ]] || continue
+        echo "  - $reason"
+      done <<< "$blockers"
+      continue
+    fi
+
+    if [[ -n "$dry" ]]; then
+      echo "$folder: would be culled"
+      removed=$((removed + 1))
+      continue
+    fi
+
+    echo "$folder:"
+    # force=1 skips the confirmation, which is the point: cull has already made
+    # a stronger check than the prompt could, and an agent cannot answer a
+    # prompt honestly anyway.
+    remove_worktrees "$folder" 1
+    removed=$((removed + 1))
+  done <<< "$folders"
+
+  echo ""
+  if [[ -n "$dry" ]]; then
+    echo "$removed would be culled, $kept kept."
+  else
+    echo "Culled $removed, kept $kept. Branches were left untouched."
+  fi
+
+  (( kept == 0 )) || echo "Kept tasks hold work git cannot give back; removing those is 'iwork rm'."
+}
+
 # --- capture -----------------------------------------------------------------
 
 # One line, and bounded. project show prints these back and the SessionStart
@@ -4096,6 +4289,12 @@ project_tasks_live() {
     [[ -n "$folder" ]] || continue
     [[ "$(task_project_name "$folder" || true)" == "$project" ]] && printf '%s\n' "$folder"
   done < <(list_worktree_folders)
+
+  # A while loop exits with the status of the last command in its body, and that
+  # last command is a test that is false whenever the final task belongs to some
+  # other project. Under 'set -e' that killed any caller that assigned this to a
+  # variable, silently and with no output at all.
+  return 0
 }
 
 # Tasks known only from history.tsv: last event per task, in the order they
@@ -5380,11 +5579,18 @@ hook_master_brief() {
   echo "  iwork project agents                 who is live, and in which task"
   echo "  iwork project show|grep|cat          the shared memory"
   echo "  iwork decided \"...\"  iwork todo \"...\"   record as you go"
+  echo "  iwork cull <task...>                 tear down tasks you are done with"
+  echo "      Only the ones git can give back: it refuses anything with"
+  echo "      uncommitted changes, a file left at the task root, or an agent"
+  echo "      working in it, and names which. Branches are kept, so a culled"
+  echo "      task comes back with 'iwork <branch> --from <branch>'."
+  echo "      'iwork cull -n' lists every task with what would stop it."
   echo ""
-  echo "Not yours: 'iwork rm' and 'iwork project delete' destroy worktrees and"
-  echo "memory that may hold uncommitted work in a window nobody is watching, so"
-  echo "they refuse to run from here. Ask the operator rather than working around"
-  echo "them. 'iwork park' is theirs as well."
+  echo "Not yours: 'iwork project delete' destroys memory, and 'iwork rm -f'"
+  echo "drops uncommitted work in a window nobody is watching; both refuse to run"
+  echo "from here. Plain 'iwork rm <task>' does work, and stops on anything dirty"
+  echo "— cull is the same promise over several tasks at once. 'iwork park' is"
+  echo "the operator's."
   echo ""
   echo "Stacking is the reason this session exists. --from branches one task off"
   echo "another, so a chain of PRs can be opened before the first of them merges."
@@ -5848,7 +6054,8 @@ sibling tasks are appending to while you work:
      add --nth <n> if an id somehow matches more than one todo
 
 Managing — the operator's, not an agent's; these change or destroy tasks, so do
-not run them unless you were asked to directly:
+not run them unless you were asked to directly (a project's master may also run
+'iwork cull', which removes only tasks git can give back):
   iwork project add <project> [<task>]   attach a task that already exists
   iwork project rm [<project>] [<task>]  detach a task, keeping the memory
   iwork project delete [-f] <project>    delete a project and its memory
@@ -6230,6 +6437,12 @@ case "${1:-}" in
     ;;
 esac
 
+if [[ "${1:-}" == "cull" ]]; then
+  shift
+  cmd_cull "$@"
+  exit 0
+fi
+
 if [[ "${1:-}" == "list" && $# -eq 1 ]]; then
   require_config
   if tmux_enabled; then
@@ -6344,10 +6557,18 @@ if [[ "${1:-}" == "rm" ]]; then
   #
   # A guardrail rather than a sandbox — cd out and it is gone. It is here to
   # catch the accident.
-  if in_master_context; then
-    die "'rm' does not run from a project directory: it destroys worktrees, and a
-  master agent sits here. Run it from anywhere else — 'cd' out first — or, if
-  you are an agent, ask the person running this."
+  # A master sits in the project directory, and -f is the flag that turns rm
+  # into something it must never be for an agent: it drops uncommitted work and
+  # skips the confirmation. The confirmation was never the protection here
+  # anyway -- confirm() reads /dev/tty, which a pane running an agent has, so
+  # the agent answers its own prompt. Refusing -f is what actually holds: a
+  # dirty worktree stops rm dead with no way past it from in here.
+  if [[ -n "$rm_force" ]] && in_master_context; then
+    die "-f does not run from a project directory: it drops uncommitted work, and
+  a master agent sits here. Without it, 'rm' works fine and stops on anything
+  dirty — or use 'iwork cull' to take every task git can give back at once. If
+  you really mean -f, run it from anywhere else — 'cd' out first — or, if you
+  are an agent, ask the person running this."
   fi
 
   # rm deletes worktrees, so inferring the task from the directory has to be
