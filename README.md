@@ -502,6 +502,60 @@ Standing in the project beats `IWORK_PROJECT` for the same reason a task's
 `.project` link does: an env var exported once in a shell profile must not
 quietly redirect the thing in front of you.
 
+### Culling: how a master tears down its own tasks
+
+`rm` is the operator's, and for a reason worth stating: it destroys worktrees
+that may hold uncommitted work in a window nobody is watching, and the
+confirmation that would normally catch that is no help against an agent —
+`confirm()` reads `/dev/tty`, which a pane running an agent has, so the agent
+answers its own prompt.
+
+`iwork cull` is the part a master can be trusted with, and it is trusted for what
+it **refuses** rather than for anything it asks:
+
+```bash
+iwork cull -n                    # every task, with what would stop each
+iwork cull feat-a feat-b         # these two
+iwork cull --all                 # every one that is eligible
+```
+
+A task goes only when git can give all of it back. It is kept, and the reason
+named, when:
+
+- a worktree has **uncommitted changes** (untracked files included)
+- the task folder holds a file that **was never committed** — a note written at
+  the task root rather than inside a repo
+- a directory is **orphaned**, so git cannot say what is in it
+- **an agent is working in it** (`*`), since culling takes the window and
+  whatever is running in it
+
+Branches survive, exactly as they do under `rm`, so a culled task comes back:
+
+```bash
+iwork feat/login-bug --from feat/login-bug -r backend-api
+```
+
+**Committed-but-unpushed work is deliberately not a blocker.** The branch still
+has those commits once the worktree is gone. An earlier version refused on it,
+which sounded careful and was merely wrong — it kept most of a real project's
+tasks to protect against a risk that does not exist.
+
+Naming the tasks is the normal way in. A master's tasks are mostly tasks it is
+still using, so taking the lot has to be spelled out with `--all`.
+
+### And `rm` itself, from a project directory
+
+`rm` now runs there too — only `-f` is refused:
+
+```bash
+iwork rm feat-login-bug       # works; stops dead on anything dirty
+iwork rm -f feat-login-bug    # refused from a project directory
+```
+
+`-f` is the flag that turns `rm` into something it must never be for an agent: it
+drops uncommitted work and skips the confirmation. Refusing it is what actually
+protects, since the confirmation never could.
+
 ### The master: one agent whose job is the project
 
 ```bash
