@@ -237,8 +237,9 @@ Subcommands:
                  bare one.
   rm             Remove worktrees from a task; without -r, remove every
                  worktree, the generated context files (CLAUDE.md,
-                 AGENTS.md, .claude/), the task folder and its tmux
-                 window/session. Branches are always left intact. A
+                 AGENTS.md, .claude/), anything else left in the folder,
+                 the folder itself and its tmux window/session. Everything it
+                 is about to delete is listed by name before it asks. Branches are always left intact. A
                  directory whose worktree registration is gone is reported
                  as orphaned and needs -f, since git can no longer say
                  whether it holds uncommitted work. Run from inside the
@@ -947,6 +948,32 @@ list_task_worktrees() {
   done
 }
 
+# Everything in a task folder that is neither a worktree nor iwork's own: the
+# files an agent left at the task root rather than inside a repo. Dotfiles are
+# included -- a stray .env is exactly the kind of thing that keeps a folder
+# alive -- but the four iwork writes itself are not, since they are removed by
+# name further down and listing them twice would be noise.
+list_task_strays() {
+  local folder_path="$1"
+  local child=""
+  local name=""
+
+  for child in "$folder_path"/* "$folder_path"/.[!.]* "$folder_path"/..?*; do
+    [[ -e "$child" || -L "$child" ]] || continue
+
+    name="${child##*/}"
+    case "$name" in
+      CLAUDE.md|AGENTS.md|.claude|.project) continue ;;
+    esac
+
+    # A worktree, or a directory that was one: both are handled as worktrees.
+    is_worktree_root "$child" && continue
+    [[ -d "$child" && -e "$child/.git" ]] && continue
+
+    printf '%s\n' "$child"
+  done
+}
+
 # Directories that were worktrees but whose registration is gone: they still
 # carry a .git that no longer resolves, usually because the directory was
 # renamed with plain mv and git later pruned the missing path. git can tell us
@@ -1145,6 +1172,7 @@ remove_worktrees() {
   local folder_path=""
   local worktrees=()
   local orphans=()
+  local strays=()
   local targets=()
   local orphan_targets=()
   local dirty=()
@@ -1181,6 +1209,16 @@ remove_worktrees() {
   while IFS= read -r wt; do
     [[ -n "$wt" ]] && orphans+=("$wt")
   done < <(list_task_orphans "$folder_path")
+
+  # Anything in the task folder that is neither a worktree nor something iwork
+  # generated: notes an agent left at the task root, a downloaded file, a
+  # scratch script. These used to be discovered only after everything else was
+  # gone, by rmdir failing -- so 'rm' reported success, kept the folder, and
+  # left you to finish it by hand. They are listed with the rest now and go
+  # with it.
+  while IFS= read -r wt; do
+    [[ -n "$wt" ]] && strays+=("$wt")
+  done < <(list_task_strays "$folder_path")
 
   if (( ${#worktrees[@]} == 0 && ${#orphans[@]} == 0 )); then
     if [[ -z "$remove_all" ]]; then
@@ -1231,6 +1269,10 @@ remove_worktrees() {
   done
 
   if [[ -n "$remove_all" ]]; then
+    for wt in "${strays[@]+${strays[@]}}"; do
+      echo "  - ${wt##*/}  (not a worktree; iwork did not put it here)"
+    done
+
     echo "  - the task folder itself"
 
     # Worth spelling out: killing the session takes any editors with it.
@@ -1320,6 +1362,12 @@ remove_worktrees() {
   # would delete the project memory instead of the link.
   for target in "$folder_path/CLAUDE.md" "$folder_path/AGENTS.md" "$folder_path/.claude" "$folder_path/.project"; do
     [[ -e "$target" || -L "$target" ]] || continue
+    rm -rf "$target" || warn "could not remove $target"
+  done
+
+  # Listed in the plan above, so by here they have been seen and either
+  # confirmed or forced.
+  for target in "${strays[@]+${strays[@]}}"; do
     rm -rf "$target" || warn "could not remove $target"
   done
 
@@ -3892,20 +3940,14 @@ task_cull_blockers() {
   done < <(list_task_orphans "$folder_path")
 
   # Files written at the task root rather than inside a repo were never in git
-  # to begin with.
-  for child in "$folder_path"/* "$folder_path"/.[!.]*; do
-    [[ -e "$child" || -L "$child" ]] || continue
-
-    name="${child##*/}"
-    case "$name" in
-      CLAUDE.md|AGENTS.md|.claude|.project) continue ;;
-    esac
-
-    is_worktree_root "$child" && continue
-    [[ -d "$child" && -e "$child/.git" ]] && continue
-
-    printf '%s was never committed anywhere\n' "$name"
-  done
+  # to begin with. The same walk 'rm' uses to decide what it is about to delete,
+  # so the two cannot drift into disagreeing about what counts as iwork's own --
+  # which would be the worst kind of disagreement: cull refusing to touch a file
+  # that rm would silently take, or the reverse.
+  while IFS= read -r child; do
+    [[ -n "$child" ]] || continue
+    printf '%s was never committed anywhere\n' "${child##*/}"
+  done < <(list_task_strays "$folder_path")
 }
 
 cmd_cull() {

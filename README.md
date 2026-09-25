@@ -1252,8 +1252,9 @@ iwork rm -f feat-login-bug               # don't ask, and drop uncommitted work
 
 `rm` removes git worktrees (via `git worktree remove`, then a prune in the parent
 repo) and, when no `-r` is given, the generated agent context (`CLAUDE.md`,
-`AGENTS.md`, `.claude/`), the task folder, and the task's tmux window or session.
-It shows what it is about to do and asks for confirmation first.
+`AGENTS.md`, `.claude/`), anything else left in the task folder, the folder
+itself, and the task's tmux window or session. It shows what it is about to do —
+every one of those, by name — and asks for confirmation first.
 
 Things it will not do:
 
@@ -1261,9 +1262,14 @@ Things it will not do:
   goes away.
 - **Throw away uncommitted work.** If any target worktree is dirty, `rm` names it
   and stops. Pass `-f` to remove it anyway (which also skips the prompt).
-- **Delete files it didn't create.** Anything in the task folder other than the
-  worktrees and that generated agent context keeps the folder alive; `rm` warns
-  and lists what stayed behind.
+- **Delete anything without listing it first.** Files in the task folder that
+  iwork did not create — a note an agent left at the task root, a downloaded
+  file, a scratch script — are named in the plan above the confirmation, marked
+  `(not a worktree; iwork did not put it here)`, and removed with the task.
+  Previously they were never deleted, which sounded safer than it was: `rmdir`
+  failed at the very end, `rm` reported success, and the folder stayed behind
+  half-emptied for you to finish by hand. Removing one repo with `-r` never
+  touches them, because the task survives.
 
 ### Removing the task you are standing in
 
