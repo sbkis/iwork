@@ -104,6 +104,7 @@ Usage: iwork [flags] <branch-name> [--from <task|branch>] -r <repo1> [repo2 ...]
        iwork install-hooks [settings-path]
        iwork --completion <bash|zsh>
        iwork --tmux-config
+       iwork --version
 
        iwork project list
        iwork project show [-n <count>] [-p <project> | <project>]
@@ -1936,7 +1937,7 @@ _iwork() {
   fi
 
   if [[ -z "$cmd" ]]; then
-    COMPREPLY=( $(compgen -W "add-repo rm park list cd claude codex master resurrect skills cull update-agents project todo log decided done drop init install-hooks --no-tmux --no-context --detach -d --big --from -b --branch --message -m -h --help --completion" -- "$cur") )
+    COMPREPLY=( $(compgen -W "add-repo rm park list cd claude codex master resurrect skills cull update-agents project todo log decided done drop init install-hooks --no-tmux --no-context --detach -d --big --from -b --branch --message -m -h --help --version --completion" -- "$cur") )
     return 0
   fi
 
@@ -2159,6 +2160,7 @@ _iwork() {
       '--branch[branch for the new worktrees (add-repo only)]' \
       '--message[first prompt for the agent, so it starts work on its own]' \
       '-m[first prompt for the agent, so it starts work on its own]' \
+      '--version[print the version]' \
       '--completion[print shell integration]'
     return 0
   fi
@@ -6770,6 +6772,11 @@ esac
 case "${1:-}" in
   -h|--help)
     usage 0
+    ;;
+  --version)
+    # The script is the release, so its length is the version.
+    printf 'iwork version %d\n' "$(wc -l < "$SELF_PATH")"
+    exit 0
     ;;
   --completion)
     case "${2:-}" in
