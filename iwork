@@ -221,6 +221,14 @@ section instead.
 Subcommands:
   init           Interactively create the config file
   add-repo       Add one or more repos to an existing task folder
+  (skills)       A task also gets a .claude/skills/ linking every skill its
+                 worktrees define, because Claude Code loads skills from the
+                 directory a session is rooted in and a task sits above its
+                 repos -- so without this, 'invoke the <x>-skill' in a repo's
+                 AGENTS.md cannot be followed. Refreshed whenever iwork starts
+                 an agent. A name two repos both define is linked as
+                 <repo>-<name> for each, since there is no right answer for the
+                 bare one.
   rm             Remove worktrees from a task; without -r, remove every
                  worktree, the generated context files (CLAUDE.md,
                  AGENTS.md, .claude/), the task folder and its tmux
@@ -674,6 +682,9 @@ run_tool_in_worktree() {
   shift 2
   require_config
   folder_path="$(resolve_worktree_folder "$folder")"
+  # Cheap and idempotent, and this is the moment it matters: a repo may have
+  # gained or dropped a skill since the task was made.
+  link_task_skills "$folder"
   master_default_detach
 
   if tmux_enabled; then
@@ -819,6 +830,7 @@ park_current_repo() {
   echo "  $wt_path"
 
   write_task_context "$folder_name" "$branch"
+  link_task_skills "$folder_name"
 
   if [[ -n "$project" ]]; then
     attach_task_to_project "$folder_name" "$project" "$branch"
@@ -2789,6 +2801,105 @@ seed_context_template() {
     return 1
   fi
   return 0
+}
+
+# Claude Code loads a project's skills from the directory the session is rooted
+# in. An iwork task is rooted *above* its worktrees, so a skill defined in one
+# of them is simply out of scope -- and every "invoke the <x>-skill" line in
+# that repo's CLAUDE.md/AGENTS.md silently cannot be followed. Not ignored:
+# unfollowable, with an "Unknown skill" that reads like the skill is broken
+# rather than out of reach.
+#
+# So the task gets a .claude/skills/ of its own, holding a link to every skill
+# in every worktree. Two facts make this work, both checked against a real
+# session rather than assumed: Claude Code follows symlinks out of the skills
+# directory, and the *directory* name is what a skill is invoked by, not the
+# name in its frontmatter.
+list_task_skills() {
+  local folder_path="$1"
+  local wt=""
+  local skill=""
+  local name=""
+
+  while IFS= read -r wt; do
+    [[ -n "$wt" ]] || continue
+    [[ -d "$wt/.claude/skills" ]] || continue
+
+    for skill in "$wt/.claude/skills"/*/; do
+      skill="${skill%/}"
+      [[ -f "$skill/SKILL.md" ]] || continue
+      name="${skill##*/}"
+      printf '%s\t%s\t%s\n' "${wt##*/}" "$name" "$skill"
+    done
+  done < <(list_task_worktrees "$folder_path")
+}
+
+link_task_skills() {
+  local folder="$1"
+  local folder_path="$TASKS_DIR/$folder"
+  local dest="$folder_path/.claude/skills"
+  local rows=""
+  local dupes=""
+  local repo=""
+  local name=""
+  local path=""
+  local link=""
+  local linked=0
+  local clashed=""
+
+  [[ -d "$folder_path" ]] || return 0
+  rows="$(list_task_skills "$folder_path")"
+
+  # Only ever remove links this put here. A directory someone added by hand is
+  # theirs, and a task with no skills at all should not be left holding an
+  # empty .claude either.
+  if [[ -d "$dest" ]]; then
+    for link in "$dest"/*; do
+      [[ -L "$link" ]] && rm -f "$link"
+    done
+    rmdir "$dest" 2>/dev/null && rmdir "$folder_path/.claude" 2>/dev/null || true
+  fi
+
+  [[ -n "$rows" ]] || return 0
+
+  mkdir -p "$dest" || { warn "could not create $dest"; return 0; }
+
+  # A name two repos both define is the dangerous case: linking one of them
+  # under the bare name hands the agent the other repo's rules without saying
+  # so, which is worse than the unknown-skill error it replaces. Both get the
+  # repo in front instead, so the choice is visible and has to be made.
+  dupes="$(printf '%s\n' "$rows" | cut -f2 | sort | uniq -d)"
+
+  while IFS=$'\t' read -r repo name path; do
+    [[ -n "$name" && -n "$path" ]] || continue
+
+    if [[ -n "$dupes" ]] && printf '%s\n' "$dupes" | grep -qxF -- "$name"; then
+      link="$dest/$repo-$name"
+      case " $clashed " in
+        *" $name "*) ;;
+        *) clashed="${clashed:+$clashed }$name" ;;
+      esac
+    else
+      link="$dest/$name"
+    fi
+
+    if ln -sfn "$path" "$link" 2>/dev/null; then
+      linked=$((linked + 1))
+    else
+      warn "could not link skill '$name' from $repo"
+    fi
+  done <<< "$rows"
+
+  (( linked > 0 )) || return 0
+
+  echo "  -> linked $linked skill(s) from the worktrees into .claude/skills"
+
+  if [[ -n "$clashed" ]]; then
+    for name in $clashed; do
+      echo "     '$name' is defined by more than one repo, so each is linked as"
+      echo "     <repo>-$name -- there is no one right answer for the bare name"
+    done
+  fi
 }
 
 write_task_context() {
@@ -6204,6 +6315,7 @@ if [[ "${1:-}" == "add-repo" ]]; then
 
   create_worktrees "$branch" "$folder_name" "${repos[@]}"
   refresh_task_blocks "$folder_name" "$branch"
+  link_task_skills "$folder_name"
   extend_task_session "$folder_name"
   exit 0
 fi
@@ -6306,6 +6418,7 @@ fi
 
 create_worktrees "$branch" "$folder_name" "${repos[@]}"
 write_task_context "$folder_name" "$branch"
+link_task_skills "$folder_name"
 
 if [[ -n "$PROJECT_FLAG" ]]; then
   attach_task_to_project "$folder_name" "$PROJECT_FLAG" "$branch"
