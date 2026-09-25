@@ -200,6 +200,9 @@ iwork resurrect
 # Relink every task's .claude/skills from its worktrees
 iwork skills
 
+# Upgrade the agent CLIs and restart every agent onto them
+iwork update-agents
+
 # Make the task part of a longer-horizon project (created on first use)
 iwork feat/token-api -r auth-service -p auth-rewrite
 
@@ -1091,6 +1094,75 @@ that window first.
 Set `IWORK_BIG=1` in your config to make every task work this way.
 
 
+## Updating the agents across every task
+
+A running agent keeps the binary it started with, so upgrading its CLI changes
+nothing for the sessions that are already up — and in a tree iwork is driving,
+that is all of them. You would have to visit every window, quit, and start it
+again on the right conversation.
+
+```bash
+iwork update-agents -n     # versions, upgrade commands, and who would restart
+iwork update-agents        # do it
+```
+
+It is named for what it updates. `iwork update` would sooner or later have to
+mean updating iwork itself, and one of the two would have had to move.
+
+### Agent-agnostic
+
+iwork starts `claude` or `codex`, so `update-agents` handles both, and restarts
+each agent **with the tool it was already running** — restarting a codex task
+under claude would not be a restart, it would be a swap. Which tool a pane runs
+is read from the process in front of its shell, because that is the only place
+the answer exists.
+
+| Agent | Resumes with | Scope |
+|---|---|---|
+| `claude` | `claude --continue` | the last conversation in that directory |
+| `codex` | `codex resume --last` | the last session in that directory |
+
+Both were read off the tools' own `--help`. Codex filters resume candidates by
+working directory unless `--all` is passed, which is what makes restarting a
+whole tree of them safe rather than handing every task the same conversation.
+
+Only tools that actually moved cause a restart: a tree of claude tasks has no
+business running codex's updater, and nothing is bounced onto a binary that did
+not change.
+
+### How each upgrade is worked out
+
+Guessing wrong here is worse than not guessing: running a tool's own installer
+beside a package-managed copy leaves two of them and a `PATH` that decides which
+you get. So the command is read off **where the binary actually lives**, after
+following symlinks:
+
+| The binary resolves to | Command |
+|---|---|
+| `…/Caskroom/<cask>/…` | `brew upgrade --cask <cask>` |
+| `…/Cellar/<formula>/…` | `brew upgrade <formula>` |
+| `…/node_modules/<pkg>/…` | `npm install -g <pkg>@latest` |
+| `…/Something.app/…` | nothing — an app bundle updates itself, and iwork says so rather than running something wrong |
+| anything else | the tool's own updater (`claude install stable`, `codex update`) |
+
+The cask, formula and package names come out of the path, so nothing is
+hardcoded to one tool. If none of it fits, iwork stops and tells you which
+setting to write:
+
+```sh
+IWORK_UPDATE_CLAUDE="npm install -g @anthropic-ai/claude-code@latest"
+IWORK_RESUME_CODEX="codex resume --last"
+```
+
+### What it will not do
+
+- **Interrupt an agent mid-answer.** A window marked `*` is working, and gets
+  reported rather than restarted. `--busy` includes them.
+- **Churn for nothing.** If no tool moved, nothing is restarted and it says so.
+  `--restart` does it anyway.
+- **Restart after a failed upgrade.** If an upgrade command fails, the run stops
+  there.
+
 ## Recovering from a dead tmux server
 
 When the tmux server dies it takes every agent with it and nothing else. The
@@ -1338,6 +1410,8 @@ overrides.
 | `IWORK_PROJECT_TEMPLATE` | `~/.config/iwork/project-context.md.tmpl` | Template for the project block injected into those files (same deal: seeded once, then yours) |
 | `IWORK_PROJECT` | unset | Fallback project for `todo`/`log`/`decided`/`done`/`drop`. A task's own `.project` link always wins over it; `-p` wins over both |
 | `IWORK_ENTRY_MAX_CHARS` | `800` | Longest `todo`/`log`/`decided` entry. Anything longer is truncated with a marker, since `project show` prints entries back and the `SessionStart` hook injects them into every session |
+| `IWORK_UPDATE_CLAUDE`, `IWORK_UPDATE_CODEX` | detected | The command `iwork update-agents` runs to upgrade that agent. Empty means work it out from where its binary lives |
+| `IWORK_RESUME_CLAUDE`, `IWORK_RESUME_CODEX` | per agent | How that agent is told to resume. Defaults to `claude --continue` and `codex resume --last` |
 | `IWORK_SESSION_MARKERS` | `off` | **Unstable.** `on` writes the agent marker into session *names* as well as window names. Makes session names unstable for every other tool — see [Session state without renaming](#session-state-without-renaming) |
 | `IWORK_SHOW_LOG_LINES` | `12` | How many log entries and past tasks `iwork project show` prints. Must be a positive integer; anything else warns and falls back to 12 |
 | `IWORK_EDITOR` | `nvim` | Editor started in each repo window under `--big`; run as a command line with the worktree appended |
