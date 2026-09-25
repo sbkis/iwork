@@ -3566,6 +3566,74 @@ test_a_task_with_no_skills_gets_no_empty_claude_dir() {
   assert_no_file "no skills, no directory" "$SB_TASKS/feat-one/.claude"
 }
 
+test_skills_command_heals_every_task_at_once() {
+  mk_repo backend
+  mk_repo frontend
+  add_skill backend db-migrations
+  add_skill frontend translator-skill
+
+  iw feat/one -r backend >/dev/null 2>&1
+  iw feat/two -r backend frontend >/dev/null 2>&1
+
+  # The state a tree made before any of this existed is in: worktrees with
+  # skills, and no links anywhere.
+  rm -rf "$SB_TASKS/feat-one/.claude" "$SB_TASKS/feat-two/.claude"
+
+  local out
+  out="$(iw skills 2>&1)"
+  assert_contains "it reports the first task" "feat-one" "$out"
+  assert_contains "and the second" "feat-two" "$out"
+  assert_link "the first is relinked" "$SB_TASKS/feat-one/.claude/skills/db-migrations"
+  assert_link "and so is the second" "$SB_TASKS/feat-two/.claude/skills/translator-skill"
+}
+
+test_skills_command_takes_one_task() {
+  mk_repo backend
+  add_skill backend db-migrations
+  iw feat/one -r backend >/dev/null 2>&1
+  iw feat/two -r backend >/dev/null 2>&1
+  rm -rf "$SB_TASKS/feat-one/.claude" "$SB_TASKS/feat-two/.claude"
+
+  iw skills feat-one >/dev/null 2>&1
+
+  assert_link "the named task is relinked" "$SB_TASKS/feat-one/.claude/skills/db-migrations"
+  assert_no_file "and the other is left alone" "$SB_TASKS/feat-two/.claude"
+}
+
+test_skills_dry_run_changes_nothing() {
+  mk_repo backend
+  add_skill backend db-migrations
+  iw feat/one -r backend >/dev/null 2>&1
+  rm -rf "$SB_TASKS/feat-one/.claude"
+
+  local out
+  out="$(iw skills -n 2>&1)"
+  assert_contains "it says it is a dry run" "Dry run" "$out"
+  assert_contains "and what it would link" "1 skill(s)" "$out"
+  assert_no_file "while nothing is written" "$SB_TASKS/feat-one/.claude"
+}
+
+test_skills_command_names_the_ambiguous_ones() {
+  mk_repo backend
+  mk_repo frontend
+  add_skill backend code-review-skill
+  add_skill frontend code-review-skill
+  iw feat/one -r backend frontend >/dev/null 2>&1
+
+  # Which name is ambiguous is the part the operator has to act on.
+  assert_contains "the clash is named, not just counted" "'code-review-skill' comes from more than one repo" \
+    "$(iw skills 2>&1)"
+}
+
+test_skills_command_refuses_an_unknown_task() {
+  mk_repo backend
+  iw feat/one -r backend >/dev/null 2>&1
+
+  assert_fails "an unknown task is refused" iw skills feat-nope
+  assert_contains "and says so" "no such task" "$(iw skills feat-nope 2>&1)"
+  assert_fails "as is a second task name" iw skills feat-one feat-two
+}
+
 # --- runner -------------------------------------------------------------------
 
 echo "iwork tests  ($IWORK_SRC)"

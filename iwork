@@ -90,6 +90,7 @@ Usage: iwork [flags] <branch-name> [--from <task|branch>] -r <repo1> [repo2 ...]
        iwork [flags] claude <task> [claude-args...]
        iwork [flags] codex <task> [codex-args...]
        iwork [flags] master [<project>]
+       iwork skills [-n] [<task>]
        iwork resurrect [-n] [--fresh] [--big <task>]...
        iwork init
        iwork install-hooks [settings-path]
@@ -221,6 +222,10 @@ section instead.
 Subcommands:
   init           Interactively create the config file
   add-repo       Add one or more repos to an existing task folder
+  skills         Relink .claude/skills for every task, or just the named one;
+                 -n shows what it would do. Linking already happens whenever
+                 iwork starts an agent, so this is for tasks made before that
+                 existed, or ones you have not reopened since.
   (skills)       A task also gets a .claude/skills/ linking every skill its
                  worktrees define, because Claude Code loads skills from the
                  directory a session is rooted in and a task sits above its
@@ -684,7 +689,7 @@ run_tool_in_worktree() {
   folder_path="$(resolve_worktree_folder "$folder")"
   # Cheap and idempotent, and this is the moment it matters: a repo may have
   # gained or dropped a skill since the task was made.
-  link_task_skills "$folder"
+  report_task_skills "$folder"
   master_default_detach
 
   if tmux_enabled; then
@@ -830,7 +835,7 @@ park_current_repo() {
   echo "  $wt_path"
 
   write_task_context "$folder_name" "$branch"
-  link_task_skills "$folder_name"
+  report_task_skills "$folder_name"
 
   if [[ -n "$project" ]]; then
     attach_task_to_project "$folder_name" "$project" "$branch"
@@ -1853,7 +1858,7 @@ _iwork() {
   fi
 
   if [[ -z "$cmd" ]]; then
-    COMPREPLY=( $(compgen -W "add-repo rm park list cd claude codex master resurrect project todo log decided done drop init install-hooks --no-tmux --no-context --detach -d --big --from -b --branch --message -m -h --help --completion" -- "$cur") )
+    COMPREPLY=( $(compgen -W "add-repo rm park list cd claude codex master resurrect skills project todo log decided done drop init install-hooks --no-tmux --no-context --detach -d --big --from -b --branch --message -m -h --help --completion" -- "$cur") )
     return 0
   fi
 
@@ -2055,6 +2060,7 @@ _iwork() {
       'codex[open the task tmux window and run codex]' \
       'master[open the project master session that runs the tasks]' \
       'resurrect[restart the agents and windows a dead tmux server took]' \
+      'skills[relink each task'"'"'s .claude/skills from its worktrees]' \
       'project[manage the memory shared across a project'\''s tasks]' \
       'todo[capture something that needs doing, but not in this PR]' \
       'log[append one line to the project log]' \
@@ -2137,7 +2143,7 @@ _iwork() {
         '--note[record a plain note]'
       return 0
       ;;
-    cd|claude|codex)
+    cd|claude|codex|skills)
       if (( CURRENT == cmd_i + 1 )); then
         folders=("${(@f)$("$_bin" --complete-worktree-folders "$PREFIX" 2>/dev/null)}")
         _describe -t folders 'worktree folder' folders
@@ -2834,6 +2840,12 @@ list_task_skills() {
   done < <(list_task_worktrees "$folder_path")
 }
 
+# Results of the last run, so a caller can report them its own way: the
+# agent-starting paths want a line in passing, 'iwork skills' wants a column.
+SKILLS_LINKED=0
+SKILLS_CLASHED=""
+SKILLS_DRY=""
+
 link_task_skills() {
   local folder="$1"
   local folder_path="$TASKS_DIR/$folder"
@@ -2844,8 +2856,9 @@ link_task_skills() {
   local name=""
   local path=""
   local link=""
-  local linked=0
-  local clashed=""
+
+  SKILLS_LINKED=0
+  SKILLS_CLASHED=""
 
   [[ -d "$folder_path" ]] || return 0
   rows="$(list_task_skills "$folder_path")"
@@ -2853,7 +2866,7 @@ link_task_skills() {
   # Only ever remove links this put here. A directory someone added by hand is
   # theirs, and a task with no skills at all should not be left holding an
   # empty .claude either.
-  if [[ -d "$dest" ]]; then
+  if [[ -z "$SKILLS_DRY" && -d "$dest" ]]; then
     for link in "$dest"/*; do
       [[ -L "$link" ]] && rm -f "$link"
     done
@@ -2862,7 +2875,9 @@ link_task_skills() {
 
   [[ -n "$rows" ]] || return 0
 
-  mkdir -p "$dest" || { warn "could not create $dest"; return 0; }
+  if [[ -z "$SKILLS_DRY" ]]; then
+    mkdir -p "$dest" || { warn "could not create $dest"; return 0; }
+  fi
 
   # A name two repos both define is the dangerous case: linking one of them
   # under the bare name hands the agent the other repo's rules without saying
@@ -2875,31 +2890,35 @@ link_task_skills() {
 
     if [[ -n "$dupes" ]] && printf '%s\n' "$dupes" | grep -qxF -- "$name"; then
       link="$dest/$repo-$name"
-      case " $clashed " in
+      case " $SKILLS_CLASHED " in
         *" $name "*) ;;
-        *) clashed="${clashed:+$clashed }$name" ;;
+        *) SKILLS_CLASHED="${SKILLS_CLASHED:+$SKILLS_CLASHED }$name" ;;
       esac
     else
       link="$dest/$name"
     fi
 
-    if ln -sfn "$path" "$link" 2>/dev/null; then
-      linked=$((linked + 1))
+    if [[ -n "$SKILLS_DRY" ]] || ln -sfn "$path" "$link" 2>/dev/null; then
+      SKILLS_LINKED=$((SKILLS_LINKED + 1))
     else
       warn "could not link skill '$name' from $repo"
     fi
   done <<< "$rows"
+}
 
-  (( linked > 0 )) || return 0
+# What the paths that start an agent say about it, in passing.
+report_task_skills() {
+  local name=""
 
-  echo "  -> linked $linked skill(s) from the worktrees into .claude/skills"
+  link_task_skills "$1"
+  (( SKILLS_LINKED > 0 )) || return 0
 
-  if [[ -n "$clashed" ]]; then
-    for name in $clashed; do
-      echo "     '$name' is defined by more than one repo, so each is linked as"
-      echo "     <repo>-$name -- there is no one right answer for the bare name"
-    done
-  fi
+  echo "  -> linked $SKILLS_LINKED skill(s) from the worktrees into .claude/skills"
+
+  for name in $SKILLS_CLASHED; do
+    echo "     '$name' is defined by more than one repo, so each is linked as"
+    echo "     <repo>-$name -- there is no one right answer for the bare name"
+  done
 }
 
 write_task_context() {
@@ -5170,6 +5189,78 @@ resurrect_section() {
   printf '%s\n' "$body"
 }
 
+# Every task at once. Linking happens whenever iwork starts an agent, but that
+# only ever heals the task you are about to work in -- a tree full of tasks made
+# before this existed would each wait their turn, and a task you never reopen
+# would wait forever. This walks the tasks directory instead, which is the same
+# list 'iwork list' prints.
+cmd_skills() {
+  local only=""
+  local folder=""
+  local folders=""
+  local width=0
+  local touched=0
+  local name=""
+
+  SKILLS_DRY=""
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -n|--dry-run) SKILLS_DRY=1; shift ;;
+      -h|--help) usage 0 ;;
+      -*) die "unknown option '$1'" ;;
+      *)
+        [[ -z "$only" ]] || die "usage: iwork skills [-n] [<task>]"
+        only="$1"
+        shift
+        ;;
+    esac
+  done
+
+  require_config
+  warn_message_undelivered "skills does not start an agent"
+
+  if [[ -n "$only" ]]; then
+    validate_worktree_folder_name "$only"
+    [[ -d "$TASKS_DIR/$only" ]] || die "no such task: $only"
+    folders="$only"
+  else
+    folders="$(list_worktree_folders)"
+  fi
+
+  [[ -n "$folders" ]] || { echo "No tasks."; return 0; }
+
+  while IFS= read -r folder; do
+    (( ${#folder} <= width )) || width=${#folder}
+  done <<< "$folders"
+
+  [[ -z "$SKILLS_DRY" ]] || echo "Dry run — nothing is changed."
+
+  while IFS= read -r folder; do
+    [[ -n "$folder" ]] || continue
+    link_task_skills "$folder"
+
+    if (( SKILLS_LINKED == 0 )); then
+      printf '%-*s  %s\n' "$width" "$folder" "-"
+      continue
+    fi
+
+    touched=$((touched + 1))
+    printf '%-*s  %s\n' "$width" "$folder" "$SKILLS_LINKED skill(s)"
+
+    # Named rather than counted: which name is ambiguous is the part you have
+    # to act on, and the one thing this cannot decide for you.
+    for name in $SKILLS_CLASHED; do
+      printf '    %s\n' "'$name' comes from more than one repo -> <repo>-$name"
+    done
+  done <<< "$folders"
+
+  (( touched > 0 )) || return 0
+  [[ -n "$SKILLS_DRY" ]] || echo ""
+  [[ -n "$SKILLS_DRY" ]] || echo "Skills are relinked whenever iwork starts an agent, so this is only"
+  [[ -n "$SKILLS_DRY" ]] || echo "needed for tasks you have not reopened since."
+}
+
 cmd_resurrect() {
   local folder=""
 
@@ -6149,6 +6240,12 @@ if [[ "${1:-}" == "list" && $# -eq 1 ]]; then
   exit 0
 fi
 
+if [[ "${1:-}" == "skills" ]]; then
+  shift
+  cmd_skills "$@"
+  exit 0
+fi
+
 if [[ "${1:-}" == "resurrect" ]]; then
   shift
   cmd_resurrect "$@"
@@ -6315,7 +6412,7 @@ if [[ "${1:-}" == "add-repo" ]]; then
 
   create_worktrees "$branch" "$folder_name" "${repos[@]}"
   refresh_task_blocks "$folder_name" "$branch"
-  link_task_skills "$folder_name"
+  report_task_skills "$folder_name"
   extend_task_session "$folder_name"
   exit 0
 fi
@@ -6418,7 +6515,7 @@ fi
 
 create_worktrees "$branch" "$folder_name" "${repos[@]}"
 write_task_context "$folder_name" "$branch"
-link_task_skills "$folder_name"
+report_task_skills "$folder_name"
 
 if [[ -n "$PROJECT_FLAG" ]]; then
   attach_task_to_project "$folder_name" "$PROJECT_FLAG" "$branch"

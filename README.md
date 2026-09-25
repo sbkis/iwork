@@ -197,6 +197,9 @@ iwork list
 iwork resurrect -n
 iwork resurrect
 
+# Relink every task's .claude/skills from its worktrees
+iwork skills
+
 # Make the task part of a longer-horizon project (created on first use)
 iwork feat/token-api -r auth-service -p auth-rewrite
 
@@ -716,6 +719,29 @@ tasks/feat-login/.claude/skills/
 It is rebuilt whenever iwork starts an agent for the task, so a repo that gains
 or drops a skill is picked up without anything being re-created. Only links iwork
 made are replaced — a directory you put there by hand is yours and stays.
+
+### Healing tasks that already exist
+
+Linking happens whenever iwork starts an agent, which only ever fixes the task
+you are about to work in. A tree full of tasks made before this existed would
+each wait their turn, and one you never reopen would wait forever. `iwork skills`
+walks the whole tasks directory instead — the same list `iwork list` prints:
+
+```bash
+iwork skills -n     # what it would link, per task
+iwork skills        # do it
+iwork skills feat-login-bug   # just this one
+```
+
+```
+feat-claims-milestone-5   35 skill(s)
+    'code-review-skill' comes from more than one repo -> <repo>-code-review-skill
+feat-guarantee-redesign   35 skill(s)
+feat-photo-write-path     7 skill(s)
+mobile-listing-real-estate  -
+```
+
+It is idempotent, so running it on a healthy tree changes nothing.
 
 ### When two repos define the same skill
 
