@@ -154,6 +154,7 @@ iw() {
   [[ -n "${WANT_SHOW_LINES+x}" ]] && env_args+=(IWORK_SHOW_LOG_LINES="$WANT_SHOW_LINES")
   [[ -n "${WANT_PROJECT_ENV:-}" ]] && env_args+=(IWORK_PROJECT="$WANT_PROJECT_ENV")
   [[ -n "${WANT_SESSION_MARKERS:-}" ]] && env_args+=(IWORK_SESSION_MARKERS="$WANT_SESSION_MARKERS")
+  [[ -n "${WANT_UPDATE_CLAUDE+x}" ]] && env_args+=(IWORK_UPDATE_CLAUDE="$WANT_UPDATE_CLAUDE")
 
   env -u TMUX "${env_args[@]}" "$IWORK_SRC" "$@"
 }
@@ -3785,6 +3786,194 @@ test_rm_still_refuses_from_the_project_directory() {
     iw_in "$SB_PROJECTS/myproj" rm -f feat-one
   assert_contains "and points at cull" "iwork cull" \
     "$(iw_in "$SB_PROJECTS/myproj" rm -f feat-one 2>&1)"
+}
+
+# --- update ------------------------------------------------------------------
+
+# The suite's default claude stub exits at once, which is the shape of a *dead*
+# agent. These need a live one -- something the pane keeps running -- and a
+# version that an update command can be seen to change.
+# tmux reports a pane's foreground command by the executable's own name, so a
+# shell script called 'claude' shows up as its interpreter and a symlink to
+# /bin/sleep shows up as sleep. Neither can stand in for an agent, and a copy of
+# a signed system binary is killed on exec by macOS -- so the long-running half
+# of the stub is compiled.
+fake_claude() {
+  command -v cc >/dev/null 2>&1 || return 1
+
+  mkdir -p "$SB/libexec"
+  printf '#include <unistd.h>\nint main(void){for(;;)sleep(60);return 0;}\n' > "$SB/agent.c"
+  cc -o "$SB/libexec/claude" "$SB/agent.c" 2>/dev/null || return 1
+
+  printf '2.0.0 (Claude Code)\n' > "$SB/claude-version"
+  cat > "$SB/bin/claude" <<STUB
+#!/bin/sh
+case "\$1" in
+  --version) cat "$SB/claude-version"; exit 0 ;;
+esac
+exec "$SB/libexec/claude"
+STUB
+  chmod +x "$SB/bin/claude"
+}
+
+bump_version_command() {
+  printf "printf '3.0.0 (Claude Code)\\\\n' > %s" "$SB/claude-version"
+}
+
+# send-keys returns before the agent has started, and update-agents works out
+# which agent a pane runs from the process in front of it -- so a test that does
+# not wait finds no agents at all.
+wait_for_agent() {
+  local pane=""
+  pane="$(tmux_t list-panes -t "$1" -F '#{pane_id}' 2>/dev/null | head -1)"
+  [[ -n "$pane" ]] || return 1
+  wait_for_pane_command "$pane" claude
+}
+
+agent_pid_of() {
+  local pane="" shell_pid=""
+  pane="$(tmux_t list-panes -t "$1" -F '#{pane_id}' 2>/dev/null | head -1)"
+  [[ -n "$pane" ]] || return 1
+  shell_pid="$(tmux_t display-message -p -t "$pane" '#{pane_pid}' 2>/dev/null)"
+  [[ -n "$shell_pid" ]] || return 1
+  pgrep -P "$shell_pid" 2>/dev/null | head -1
+}
+
+test_update_detects_how_each_agent_was_installed() {
+  # How a tool is upgraded is read off where its binary actually lives, so that
+  # a dmg, an npm install and a brew cask are not all handed brew's command --
+  # and so a tool that cannot be upgraded from the CLI says so instead of having
+  # something wrong run against it.
+  local fake="$SB/fakeinst"
+  mkdir -p "$fake/bin"
+
+  mk_at() {
+    mkdir -p "$(dirname "$fake/$1")"
+    printf '#!/bin/sh\nexit 0\n' > "$fake/$1"
+    chmod +x "$fake/$1"
+    ln -sf "$fake/$1" "$fake/bin/$2"
+  }
+
+  # Not named claude or codex: the sandbox stubs those on PATH ahead of this,
+  # and the stub would be what got detected.
+  mk_at 'opt/homebrew/Caskroom/caskish/0.1/bin/caskish'         caskish
+  mk_at 'usr/lib/node_modules/@anthropic-ai/claude-code/cli.js' npmish
+  mk_at 'Applications/Claude.app/Contents/MacOS/claude'         dmgish
+
+  local out
+  out="$(PATH="$fake/bin:$PATH" iw --detect-agent-update caskish 2>&1)"
+  assert_eq "a brew cask names its cask" "brew upgrade --cask caskish" "$out"
+
+  out="$(PATH="$fake/bin:$PATH" iw --detect-agent-update npmish 2>&1)"
+  assert_eq "an npm install names its package" "npm install -g @anthropic-ai/claude-code@latest" "$out"
+
+  PATH="$fake/bin:$PATH" assert_fails "an app bundle has no command to run" \
+    iw --detect-agent-update dmgish
+  assert_contains "and says why" "app bundle" \
+    "$(PATH="$fake/bin:$PATH" iw --detect-agent-update dmgish 2>&1)"
+
+  unset -f mk_at
+}
+
+test_update_dry_run_names_the_command_and_changes_nothing() {
+  command -v tmux >/dev/null 2>&1 || { printf '    skip (no tmux)\n'; return 0; }
+  mk_repo backend
+  fake_claude || { printf '    skip (no cc to build the agent stub)\n'; return 0; }
+  WANT_TMUX=1 iw --detach feat/one -r backend >/dev/null 2>&1
+  wait_for_agent '=tasks:feat-one' || { printf '    skip (agent never started)\n'; return 0; }
+
+  local before out
+  before="$(agent_pid_of '=tasks:feat-one')"
+  out="$(WANT_TMUX=1 WANT_UPDATE_CLAUDE="$(bump_version_command)" iw update-agents -n 2>&1)"
+
+  assert_contains "the version it is on is named" "2.0.0" "$out"
+  assert_contains "and the command that would run" "claude-version" "$out"
+  assert_contains "and the agent it would restart" "feat-one: would restart" "$out"
+  assert_eq "while the agent is untouched" "$before" "$(agent_pid_of '=tasks:feat-one')"
+  assert_grep "and the version is unchanged" "2.0.0" "$SB/claude-version"
+}
+
+test_update_restarts_agents_when_the_version_moves() {
+  command -v tmux >/dev/null 2>&1 || { printf '    skip (no tmux)\n'; return 0; }
+  mk_repo backend
+  fake_claude || { printf '    skip (no cc to build the agent stub)\n'; return 0; }
+  WANT_TMUX=1 iw --detach feat/one -r backend >/dev/null 2>&1
+  wait_for_agent '=tasks:feat-one' || { printf '    skip (agent never started)\n'; return 0; }
+
+  local before
+  before="$(agent_pid_of '=tasks:feat-one')"
+  [[ -n "$before" ]] || { printf '    skip (no live agent in the pane)\n'; return 0; }
+
+  WANT_TMUX=1 WANT_UPDATE_CLAUDE="$(bump_version_command)" iw update-agents -f >/dev/null 2>&1
+
+  assert_grep "the update ran" "3.0.0" "$SB/claude-version"
+
+  # The point of the restart: the process is a new one, so it is running the
+  # binary the update just put there.
+  local waited=0 after=""
+  while (( waited < 60 )); do
+    after="$(agent_pid_of '=tasks:feat-one')"
+    [[ -n "$after" && "$after" != "$before" ]] && break
+    command sleep 0.1
+    waited=$((waited + 1))
+  done
+  if [[ -n "$after" && "$after" != "$before" ]]; then ok; else
+    bad "the agent was not restarted (pid still '$before')"
+  fi
+}
+
+test_update_stops_when_the_version_did_not_move() {
+  command -v tmux >/dev/null 2>&1 || { printf '    skip (no tmux)\n'; return 0; }
+  mk_repo backend
+  fake_claude || { printf '    skip (no cc to build the agent stub)\n'; return 0; }
+  WANT_TMUX=1 iw --detach feat/one -r backend >/dev/null 2>&1
+  wait_for_agent '=tasks:feat-one' || { printf '    skip (agent never started)\n'; return 0; }
+
+  local before out
+  before="$(agent_pid_of '=tasks:feat-one')"
+  # An update that changes nothing should not churn every agent for nothing.
+  out="$(WANT_TMUX=1 WANT_UPDATE_CLAUDE="true" iw update-agents -f 2>&1)"
+
+  assert_contains "it says there is nothing to restart" "nothing needs restarting" "$out"
+  assert_eq "and the agent is left running" "$before" "$(agent_pid_of '=tasks:feat-one')"
+}
+
+test_update_leaves_a_working_agent_alone_unless_asked() {
+  command -v tmux >/dev/null 2>&1 || { printf '    skip (no tmux)\n'; return 0; }
+  mk_repo backend
+  fake_claude || { printf '    skip (no cc to build the agent stub)\n'; return 0; }
+  WANT_TMUX=1 iw --detach feat/one -r backend >/dev/null 2>&1
+  wait_for_agent '=tasks:feat-one' || { printf '    skip (agent never started)\n'; return 0; }
+  # '*' is what the status hooks put on a window whose agent is mid-answer.
+  tmux_t rename-window -t '=tasks:feat-one' '*feat-one' 2>/dev/null
+
+  local before out
+  before="$(agent_pid_of '=tasks:*feat-one')"
+  out="$(WANT_TMUX=1 WANT_UPDATE_CLAUDE="$(bump_version_command)" iw update-agents -f 2>&1)"
+
+  assert_contains "a working agent is reported, not restarted" "working right now" "$out"
+  assert_eq "and left running" "$before" "$(agent_pid_of '=tasks:*feat-one')"
+
+  printf '2.0.0 (Claude Code)\n' > "$SB/claude-version"
+  assert_contains "--busy includes it" "feat-one: restarted" \
+    "$(WANT_TMUX=1 WANT_UPDATE_CLAUDE="$(bump_version_command)" iw update-agents -f --busy 2>&1)"
+}
+
+test_update_does_not_restart_anything_when_the_update_fails() {
+  command -v tmux >/dev/null 2>&1 || { printf '    skip (no tmux)\n'; return 0; }
+  mk_repo backend
+  fake_claude || { printf '    skip (no cc to build the agent stub)\n'; return 0; }
+  WANT_TMUX=1 iw --detach feat/one -r backend >/dev/null 2>&1
+  wait_for_agent '=tasks:feat-one' || { printf '    skip (agent never started)\n'; return 0; }
+
+  local before
+  before="$(agent_pid_of '=tasks:feat-one')"
+  # Restarting every agent onto a binary that did not change is pure churn.
+  WANT_TMUX=1 WANT_UPDATE_CLAUDE="false" assert_fails "a failed update stops the run" \
+    iw update-agents -f
+  assert_contains "and says so" "no agent was restarted" \
+    "$(WANT_TMUX=1 WANT_UPDATE_CLAUDE="false" iw update-agents -f 2>&1)"
+  assert_eq "the agent is untouched" "$before" "$(agent_pid_of '=tasks:feat-one')"
 }
 
 # --- runner -------------------------------------------------------------------

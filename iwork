@@ -3,7 +3,7 @@ set -euo pipefail
 
 SELF_PATH="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)/$(basename "${BASH_SOURCE[0]:-$0}")"
 IWORK_CONFIG_FILE="${IWORK_CONFIG_FILE:-${XDG_CONFIG_HOME:-$HOME/.config}/iwork/config}"
-IWORK_CONFIG_VARS=(IWORK_REPO_DIR IWORK_TASKS_DIR IWORK_PROJECTS_DIR IWORK_TMUX_SESSION IWORK_PROJECTS_TMUX_SESSION IWORK_CONTEXT_TEMPLATE IWORK_PROJECT_TEMPLATE IWORK_EDITOR IWORK_NO_TMUX IWORK_NO_CONTEXT IWORK_DETACH IWORK_BIG IWORK_ASSUME_YES IWORK_PROJECT IWORK_SHOW_LOG_LINES IWORK_SESSION_MARKERS)
+IWORK_CONFIG_VARS=(IWORK_REPO_DIR IWORK_TASKS_DIR IWORK_PROJECTS_DIR IWORK_TMUX_SESSION IWORK_PROJECTS_TMUX_SESSION IWORK_CONTEXT_TEMPLATE IWORK_PROJECT_TEMPLATE IWORK_EDITOR IWORK_NO_TMUX IWORK_NO_CONTEXT IWORK_DETACH IWORK_BIG IWORK_ASSUME_YES IWORK_PROJECT IWORK_SHOW_LOG_LINES IWORK_SESSION_MARKERS IWORK_UPDATE_CLAUDE IWORK_UPDATE_CODEX IWORK_RESUME_CLAUDE IWORK_RESUME_CODEX)
 
 load_config() {
   local var="" restore=""
@@ -43,6 +43,12 @@ PROJECTS_SESSION="${IWORK_PROJECTS_TMUX_SESSION:-projects}"
 # a status line can read without any name having to change. Window names still
 # carry their marker: they are iwork's own, and switchers do not key on them.
 IWORK_SESSION_MARKERS="${IWORK_SESSION_MARKERS:-off}"
+# Per-agent overrides for 'update-agents': how each is upgraded, and how each is
+# told to pick a conversation back up. Empty means use what iwork knows.
+IWORK_UPDATE_CLAUDE="${IWORK_UPDATE_CLAUDE:-}"
+IWORK_UPDATE_CODEX="${IWORK_UPDATE_CODEX:-}"
+IWORK_RESUME_CLAUDE="${IWORK_RESUME_CLAUDE:-}"
+IWORK_RESUME_CODEX="${IWORK_RESUME_CODEX:-}"
 IWORK_NO_TMUX="${IWORK_NO_TMUX:-}"
 IWORK_NO_CONTEXT="${IWORK_NO_CONTEXT:-}"
 IWORK_DETACH="${IWORK_DETACH:-}"
@@ -92,6 +98,7 @@ Usage: iwork [flags] <branch-name> [--from <task|branch>] -r <repo1> [repo2 ...]
        iwork [flags] codex <task> [codex-args...]
        iwork [flags] master [<project>]
        iwork skills [-n] [<task>]
+       iwork update-agents [-n] [-f] [--busy] [--restart]
        iwork resurrect [-n] [--fresh] [--big <task>]...
        iwork init
        iwork install-hooks [settings-path]
@@ -235,6 +242,18 @@ Subcommands:
                  an agent. A name two repos both define is linked as
                  <repo>-<name> for each, since there is no right answer for the
                  bare one.
+  update-agents  Upgrade the agent CLIs in use, then restart every agent onto
+                 the conversation it was having, so they run the new build -- a
+                 running agent keeps the binary it started with, so upgrading
+                 alone changes nothing for sessions already up. Each agent is
+                 restarted with the tool it was running (claude --continue,
+                 codex resume --last), and only tools that actually moved cause
+                 a restart. An agent mid-answer is reported and left alone
+                 unless --busy; --restart restarts even when nothing moved.
+                 How each tool is upgraded is read off where its binary lives
+                 -- a brew cask, an npm install and an app bundle are not the
+                 same thing -- and IWORK_UPDATE_<TOOL> overrides it. -n prints
+                 the plan
   rm             Remove worktrees from a task; without -r, remove every
                  worktree, the generated context files (CLAUDE.md,
                  AGENTS.md, .claude/), the task folder and its tmux
@@ -1869,7 +1888,7 @@ _iwork() {
   fi
 
   if [[ -z "$cmd" ]]; then
-    COMPREPLY=( $(compgen -W "add-repo rm park list cd claude codex master resurrect skills cull project todo log decided done drop init install-hooks --no-tmux --no-context --detach -d --big --from -b --branch --message -m -h --help --completion" -- "$cur") )
+    COMPREPLY=( $(compgen -W "add-repo rm park list cd claude codex master resurrect skills cull update-agents project todo log decided done drop init install-hooks --no-tmux --no-context --detach -d --big --from -b --branch --message -m -h --help --completion" -- "$cur") )
     return 0
   fi
 
@@ -2073,6 +2092,7 @@ _iwork() {
       'resurrect[restart the agents and windows a dead tmux server took]' \
       'skills[relink each task'"'"'s .claude/skills from its worktrees]' \
       'cull[tear down tasks git can give back, for a project'"'"'s master]' \
+      'update-agents[upgrade the agent CLIs and restart every agent onto them]' \
       'project[manage the memory shared across a project'\''s tasks]' \
       'todo[capture something that needs doing, but not in this PR]' \
       'log[append one line to the project log]' \
@@ -5015,6 +5035,387 @@ open_task() {
   fi
 }
 
+# --- updating the agents -----------------------------------------------------
+
+# A running agent keeps the binary it started with, so upgrading the CLI changes
+# nothing for the sessions already up -- and in a tree iwork is driving, that is
+# all of them. 'update-agents' does both halves: the upgrade, then a restart of
+# every agent onto the conversation it was having.
+#
+# Named for what it updates. 'iwork update' would sooner or later have to mean
+# updating iwork itself, and one of the two would have had to move.
+
+# Which agent a pane is running, from the command in front of its shell. This is
+# the only place the answer exists: iwork does not record which tool it started
+# for a task, and a pane is the thing that actually knows.
+pane_agent_tool() {
+  case "$(pane_command "$1")" in
+    # 'node' is a claude reporting itself by its interpreter rather than by its
+    # own name; codex is a single binary and always says codex.
+    claude|node) printf 'claude\n' ;;
+    codex) printf 'codex\n' ;;
+    *) return 1 ;;
+  esac
+}
+
+# IWORK_RESUME_CLAUDE, IWORK_UPDATE_CODEX, and so on. Indirect expansion rather
+# than an associative array: bash 3.2 is still what macOS ships.
+agent_config_suffix() {
+  printf '%s' "$1" | tr '[:lower:]-' '[:upper:]_'
+}
+
+agent_config_value() {
+  local kind="$1"
+  local tool="$2"
+  local var=""
+
+  var="IWORK_${kind}_$(agent_config_suffix "$tool")"
+  printf '%s' "${!var:-}"
+}
+
+# How each agent is told to pick a conversation back up. Both were read off the
+# tools' own --help rather than assumed, and both are scoped to the directory
+# the session runs in -- codex filters resume candidates by cwd unless --all is
+# passed -- which is what makes restarting a whole tree of them safe rather than
+# handing every task the same conversation.
+agent_resume_command() {
+  local tool="$1"
+  local override=""
+
+  override="$(agent_config_value RESUME "$tool")"
+  [[ -z "$override" ]] || { printf '%s\n' "$override"; return 0; }
+
+  case "$tool" in
+    claude) printf 'claude --continue\n' ;;
+    codex) printf 'codex resume --last\n' ;;
+    *) return 1 ;;
+  esac
+}
+
+# Follow a symlink chain by hand: 'readlink -f' is GNU, and macOS ships bash 3.2
+# and a readlink without it.
+resolve_symlinks() {
+  local path="$1"
+  local target=""
+  local hops=0
+
+  [[ -n "$path" ]] || return 1
+
+  while [[ -L "$path" ]] && (( hops < 40 )); do
+    target="$(readlink "$path")" || return 1
+    case "$target" in
+      /*) path="$target" ;;
+      *) path="$(dirname "$path")/$target" ;;
+    esac
+    hops=$((hops + 1))
+  done
+
+  printf '%s\n' "$path"
+}
+
+# How an agent is upgraded, worked out from where its binary actually lives
+# rather than from a guess about how it got there. Guessing wrong is worse than
+# not guessing: running a tool's own installer beside a package-managed copy
+# leaves two of them and a PATH that decides which you get.
+#
+# Prints the command. Returns 2 when the install is real but nothing on the
+# command line updates it, so the caller can say which of the two it is.
+detect_tool_update_command() {
+  local tool="$1"
+  local path=""
+  local name=""
+
+  path="$(resolve_symlinks "$(command -v "$tool" 2>/dev/null)")" || return 1
+  [[ -n "$path" ]] || return 1
+
+  case "$path" in
+    */Caskroom/*)
+      # /opt/homebrew/Caskroom/<cask>/<version>/... -- the cask names itself.
+      name="${path#*/Caskroom/}"
+      name="${name%%/*}"
+      printf 'brew upgrade --cask %s\n' "$name"
+      return 0
+      ;;
+    */Cellar/*)
+      name="${path#*/Cellar/}"
+      name="${name%%/*}"
+      printf 'brew upgrade %s\n' "$name"
+      return 0
+      ;;
+    */node_modules/*)
+      name="${path#*/node_modules/}"
+      case "$name" in
+        @*) name="${name%%/*}/$(printf '%s' "${name#*/}" | cut -d/ -f1)" ;;
+        *) name="${name%%/*}" ;;
+      esac
+      printf 'npm install -g %s@latest\n' "$name"
+      return 0
+      ;;
+    *.app/*)
+      # Dragged out of a .dmg. The app updates itself; nothing here can.
+      return 2
+      ;;
+  esac
+
+  # Nothing recognised the path, so fall back to the tool's own updater -- which
+  # is the one thing that does know how it was installed.
+  case "$tool" in
+    claude) printf 'claude install stable\n' ;;
+    codex) printf 'codex update\n' ;;
+    *) return 1 ;;
+  esac
+}
+
+agent_update_command() {
+  local tool="$1"
+  local override=""
+
+  override="$(agent_config_value UPDATE "$tool")"
+  [[ -z "$override" ]] || { printf '%s\n' "$override"; return 0; }
+
+  detect_tool_update_command "$tool"
+}
+
+# The whole line, not a parsed field: 'claude --version' leads with the number
+# and 'codex --version' leads with its name, and all this is ever used for is
+# telling whether the string changed.
+agent_version() {
+  command -v "$1" >/dev/null 2>&1 || return 1
+  "$1" --version 2>/dev/null | head -1
+}
+
+# The pid of whatever the pane's shell is running in front of it.
+pane_foreground_pid() {
+  local pane="$1"
+  local shell_pid=""
+
+  shell_pid="$(tmux display-message -p -t "$pane" '#{pane_pid}' 2>/dev/null)" || return 1
+  [[ -n "$shell_pid" ]] || return 1
+
+  pgrep -P "$shell_pid" 2>/dev/null | head -1
+}
+
+# Stop the agent, then start it again on the same conversation, with the tool it
+# was already running -- restarting a codex task under claude would not be a
+# restart, it would be a swap.
+restart_task_agent() {
+  local pane="$1"
+  local what="$2"
+  local tool="$3"
+  local resume=""
+  local pid=""
+  local waited=0
+
+  resume="$(agent_resume_command "$tool")" || {
+    warn "$what: no resume command known for '$tool'; set IWORK_RESUME_$(agent_config_suffix "$tool")"
+    return 0
+  }
+
+  if ! pane_is_idle_shell "$pane"; then
+    if ! pid="$(pane_foreground_pid "$pane")" || [[ -z "$pid" ]]; then
+      warn "$what: could not find the agent's process; left alone"
+      return 0
+    fi
+
+    # TERM, not KILL: the agent gets to close the transcript that its resume
+    # command is about to read.
+    kill "$pid" 2>/dev/null || true
+
+    while (( waited < 100 )); do
+      pane_is_idle_shell "$pane" && break
+      command sleep 0.1
+      waited=$((waited + 1))
+    done
+
+    if ! pane_is_idle_shell "$pane"; then
+      warn "$what: did not come back to a shell after being stopped; left alone"
+      return 0
+    fi
+  fi
+
+  if ! tmux send-keys -t "$pane" "$resume" Enter 2>/dev/null; then
+    warn "$what: could not start it again"
+    return 0
+  fi
+
+  echo "  $what: restarted with '$resume'"
+}
+
+window_name_of() {
+  tmux display-message -p -t "$1" '#{window_name}' 2>/dev/null || true
+}
+
+# Every agent iwork can see, one line each: "<label>\t<pane>\t<tool>\t<busy>".
+# Collected once and used twice -- to decide which tools need upgrading at all,
+# and then to restart what those upgrades touched.
+list_live_agents() {
+  local folder=""
+  local project=""
+  local line=""
+  local session=""
+  local window_id=""
+  local window_name=""
+
+  while IFS= read -r folder; do
+    [[ -n "$folder" ]] || continue
+    line="$(locate_task_window "$folder")" || continue
+    IFS=' ' read -r session window_id window_name <<< "$line"
+    emit_live_agent "$window_id" "$window_name" "$folder"
+  done < <(list_worktree_folders)
+
+  while IFS= read -r project; do
+    [[ -n "$project" ]] || continue
+    window_id="$(find_master_window "$project")" || continue
+    emit_live_agent "$window_id" "$(window_name_of "$window_id")" "master of '$project'"
+  done < <(list_projects)
+}
+
+emit_live_agent() {
+  local window_id="$1"
+  local window_name="$2"
+  local what="$3"
+  local pane=""
+  local tool=""
+  local busy=""
+
+  pane="$(window_agent_pane "$window_id")"
+  [[ -n "$pane" ]] || return 0
+  tool="$(pane_agent_tool "$pane")" || return 0
+
+  case "$window_name" in
+    '*'*) busy=1 ;;
+  esac
+
+  printf '%s\t%s\t%s\t%s\n' "$what" "$pane" "$tool" "$busy"
+}
+
+cmd_update_agents() {
+  local dry=""
+  local force=""
+  local busy=""
+  local anyway=""
+  local agents=""
+  local tools=""
+  local tool=""
+  local what=""
+  local pane=""
+  local is_busy=""
+  local update_cmd=""
+  local before=""
+  local after=""
+  local moved=""
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -n|--dry-run) dry=1; shift ;;
+      -f|--force) force=1; shift ;;
+      --busy) busy=1; shift ;;
+      --restart) anyway=1; shift ;;
+      -h|--help) usage 0 ;;
+      *) die "usage: iwork update-agents [-n] [-f] [--busy] [--restart]" ;;
+    esac
+  done
+
+  require_config
+  warn_message_undelivered "update-agents restarts every agent, so there is nobody in particular to send it to"
+
+  [[ -z "$IWORK_NO_TMUX" ]] ||
+    die "update-agents restarts agents in tmux; there is nothing for it to do with --no-tmux"
+  command -v tmux >/dev/null 2>&1 || die "update-agents needs tmux"
+
+  agents="$(list_live_agents)"
+  if [[ -z "$agents" ]]; then
+    echo "No agents are running."
+    return 0
+  fi
+
+  # Only what is actually in use gets upgraded. A tree of claude tasks has no
+  # business running 'codex update'.
+  tools="$(printf '%s\n' "$agents" | cut -f3 | sort -u)"
+
+  echo "Agents running:"
+  while IFS= read -r tool; do
+    printf '  %-8s %s\n' "$tool" "$(agent_version "$tool" || printf 'version unknown')"
+    update_cmd="$(agent_update_command "$tool")" || case "$?" in
+      2)
+        die "'$tool' is installed as an app bundle, which updates itself rather
+  than being updated from here. Update it there, then re-run with --restart --
+  or set IWORK_UPDATE_$(agent_config_suffix "$tool") if it does have a command."
+        ;;
+      *)
+        die "iwork does not know how to upgrade '$tool' here.
+  Set IWORK_UPDATE_$(agent_config_suffix "$tool") in $IWORK_CONFIG_FILE to the command that does it."
+        ;;
+    esac
+    printf '  %-8s upgrade with: %s\n' "" "$update_cmd"
+  done <<< "$tools"
+  echo ""
+
+  if [[ -n "$dry" ]]; then
+    echo "Dry run — nothing is changed. Agents that would be restarted:"
+    while IFS=$'\t' read -r what pane tool is_busy; do
+      [[ -n "$what" ]] || continue
+      if [[ -n "$is_busy" && -z "$busy" ]]; then
+        echo "  $what: working right now, left alone (--busy to include it)"
+        continue
+      fi
+      echo "  $what: would restart with '$(agent_resume_command "$tool")'"
+    done <<< "$agents"
+    return 0
+  fi
+
+  if [[ -z "$force" ]]; then
+    confirm "Upgrade those and restart every agent on its conversation?" || die "aborted"
+  fi
+
+  # Which tools actually moved. An agent is only worth restarting if the thing
+  # it runs on changed underneath it.
+  while IFS= read -r tool; do
+    [[ -n "$tool" ]] || continue
+    before="$(agent_version "$tool" || true)"
+    update_cmd="$(agent_update_command "$tool")"
+
+    if ! eval "$update_cmd"; then
+      die "'$update_cmd' failed; no agent was restarted"
+    fi
+
+    after="$(agent_version "$tool" || true)"
+    if [[ "$before" != "$after" ]]; then
+      moved="${moved:+$moved }$tool"
+      echo "$tool is now: $after"
+    else
+      echo "$tool is unchanged: ${after:-unknown}"
+    fi
+  done <<< "$tools"
+
+  echo ""
+
+  if [[ -z "$moved" && -z "$anyway" ]]; then
+    echo "Nothing moved, so nothing needs restarting. Use --restart to do it anyway."
+    return 0
+  fi
+
+  while IFS=$'\t' read -r what pane tool is_busy; do
+    [[ -n "$what" ]] || continue
+
+    if [[ -z "$anyway" ]]; then
+      case " $moved " in
+        *" $tool "*) ;;
+        *) continue ;;
+      esac
+    fi
+
+    # An agent mid-answer is the one case worth leaving alone by default: the
+    # transcript survives, but whatever it was part way through does not.
+    if [[ -n "$is_busy" && -z "$busy" ]]; then
+      echo "  $what: working right now, left alone (--busy to include it)"
+      continue
+    fi
+
+    restart_task_agent "$pane" "$what" "$tool"
+  done <<< "$agents"
+}
+
 # --- resurrect ----------------------------------------------------------------
 
 # A tmux server that dies takes every agent with it and nothing else: the
@@ -5873,6 +6274,7 @@ run_init() {
     fi
     echo '# IWORK_TMUX_SESSION=tasks'
     echo '# IWORK_PROJECTS_TMUX_SESSION=projects'
+    echo '# IWORK_UPDATE_COMMAND=        # how "iwork update" upgrades Claude Code'
     echo '# IWORK_SESSION_MARKERS=off   # on = put the agent marker on session'
     echo '#                             # names too (UNSTABLE: see iwork -h)'
     echo '# IWORK_CONTEXT_TEMPLATE="$HOME/.config/iwork/task-context.md.tmpl"'
@@ -6372,6 +6774,19 @@ case "${1:-}" in
     resolve_park_target_path "${2:-}"
     exit 0
     ;;
+  --detect-agent-update)
+    # Exposed for the tests: the install-detection is the part most likely to be
+    # wrong on a machine nobody here has, and it is worth being able to ask it
+    # directly rather than only through a run that upgrades something.
+    require_config
+    detect_agent_update_for="${2:-}"
+    [[ -n "$detect_agent_update_for" ]] || die "usage: iwork --detect-agent-update <tool>"
+    detect_tool_update_command "$detect_agent_update_for" || case "$?" in
+      2) die "'$detect_agent_update_for' is installed as an app bundle, which updates itself" ;;
+      *) die "no update command known for '$detect_agent_update_for'" ;;
+    esac
+    exit 0
+    ;;
   --fold-sessions)
     # For the tmux 'session-created' hook. Any switcher that looks a session up
     # by the exact name it last saw will miss one whose marker has flipped since,
@@ -6456,6 +6871,12 @@ fi
 if [[ "${1:-}" == "skills" ]]; then
   shift
   cmd_skills "$@"
+  exit 0
+fi
+
+if [[ "${1:-}" == "update-agents" ]]; then
+  shift
+  cmd_update_agents "$@"
   exit 0
 fi
 
