@@ -250,6 +250,14 @@ assert_no_grep() {
   else ok; fi
 }
 
+assert_no_grep_str() {
+  local msg="$1" needle="$2" haystack="$3"
+  case "$haystack" in
+    *"$needle"*) bad "$msg (output unexpectedly contained '$needle')" ;;
+    *) ok ;;
+  esac
+}
+
 assert_contains() {
   local msg="$1" needle="$2" haystack="$3"
   case "$haystack" in
@@ -3166,6 +3174,85 @@ test_rm_from_another_window_still_kills_immediately() {
     *) ok ;;
   esac
   assert_no_file "and the task folder is gone" "$SB_TASKS/feat-one"
+}
+
+# --- files nobody claimed ----------------------------------------------------
+
+# An agent that writes a note at the task root rather than inside a repo used to
+# make the task un-removable: rm took the worktrees, rmdir found the folder
+# non-empty, and the run reported success while leaving the folder behind for
+# you to finish by hand.
+
+test_rm_lists_and_removes_files_it_did_not_create() {
+  mk_repo backend
+  iw feat/one -r backend >/dev/null 2>&1
+  printf 'notes\n' > "$SB_TASKS/feat-one/HANDOFF.md"
+  printf 'x\n' > "$SB_TASKS/feat-one/report.html"
+
+  local out
+  out="$(iw rm -f feat-one 2>&1)"
+
+  # Listed before they go, which is the whole safety story now that they do go.
+  assert_contains "the stray note is named in the plan" "HANDOFF.md" "$out"
+  assert_contains "and so is the other file" "report.html" "$out"
+  assert_contains "and said not to be iwork's" "iwork did not put it here" "$out"
+  assert_no_file "the task folder is actually gone" "$SB_TASKS/feat-one"
+}
+
+test_rm_takes_stray_dotfiles_too() {
+  mk_repo backend
+  iw feat/one -r backend >/dev/null 2>&1
+  # A stray dotfile is exactly the kind of thing that kept a folder alive while
+  # being invisible in the listing that explained why.
+  printf 'SECRET=1\n' > "$SB_TASKS/feat-one/.env"
+
+  local out
+  out="$(iw rm -f feat-one 2>&1)"
+  assert_contains "the dotfile is named" ".env" "$out"
+  assert_no_file "and the folder is gone" "$SB_TASKS/feat-one"
+}
+
+test_rm_does_not_list_its_own_files_as_strays() {
+  mk_repo backend
+  iw feat/one -r backend -p myproj >/dev/null 2>&1
+
+  # CLAUDE.md, AGENTS.md, .claude and .project are removed by name further
+  # down; listing them here as well would be noise.
+  local out
+  out="$(iw rm -f feat-one 2>&1)"
+  assert_no_grep_str "CLAUDE.md is not called a stray" "CLAUDE.md  (not a worktree" "$out"
+  assert_no_grep_str "nor is the project link" ".project  (not a worktree" "$out"
+  assert_no_file "and the folder still goes" "$SB_TASKS/feat-one"
+}
+
+test_rm_of_one_repo_leaves_stray_files_alone() {
+  mk_repo backend
+  mk_repo frontend
+  iw feat/one -r backend frontend >/dev/null 2>&1
+  printf 'notes\n' > "$SB_TASKS/feat-one/HANDOFF.md"
+
+  # The task survives a partial removal, so nothing at its root is in scope.
+  local out
+  out="$(iw rm -f feat-one -r frontend 2>&1)"
+  assert_no_file "the named worktree is gone" "$SB_TASKS/feat-one/frontend"
+  assert_file "the stray file is untouched" "$SB_TASKS/feat-one/HANDOFF.md"
+  case "$out" in
+    *"iwork did not put it here"*) bad "a partial removal listed stray files" ;;
+    *) ok ;;
+  esac
+}
+
+test_rm_does_not_mistake_a_worktree_for_a_stray() {
+  mk_repo backend
+  iw feat/one -r backend >/dev/null 2>&1
+
+  local out
+  out="$(iw rm -f feat-one 2>&1)"
+  case "$out" in
+    *"backend  (not a worktree"*) bad "a worktree was listed as a stray file" ;;
+    *) ok ;;
+  esac
+  assert_contains "it is listed as the worktree it is" "- backend" "$out"
 }
 
 # --- duplicate sessions -------------------------------------------------------
