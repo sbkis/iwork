@@ -3,7 +3,7 @@ set -euo pipefail
 
 SELF_PATH="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)/$(basename "${BASH_SOURCE[0]:-$0}")"
 IWORK_CONFIG_FILE="${IWORK_CONFIG_FILE:-${XDG_CONFIG_HOME:-$HOME/.config}/iwork/config}"
-IWORK_CONFIG_VARS=(IWORK_REPO_DIR IWORK_TASKS_DIR IWORK_PROJECTS_DIR IWORK_TMUX_SESSION IWORK_PROJECTS_TMUX_SESSION IWORK_CONTEXT_TEMPLATE IWORK_PROJECT_TEMPLATE IWORK_EDITOR IWORK_NO_TMUX IWORK_NO_CONTEXT IWORK_DETACH IWORK_BIG IWORK_ASSUME_YES IWORK_PROJECT IWORK_SHOW_LOG_LINES IWORK_SESSION_MARKERS IWORK_UPDATE_CLAUDE IWORK_UPDATE_CODEX IWORK_RESUME_CLAUDE IWORK_RESUME_CODEX)
+IWORK_CONFIG_VARS=(IWORK_REPO_DIR IWORK_TASKS_DIR IWORK_PROJECTS_DIR IWORK_TMUX_SESSION IWORK_PROJECTS_TMUX_SESSION IWORK_REPOS_TMUX_SESSION IWORK_CONTEXT_TEMPLATE IWORK_PROJECT_TEMPLATE IWORK_EDITOR IWORK_NO_TMUX IWORK_NO_CONTEXT IWORK_DETACH IWORK_BIG IWORK_ASSUME_YES IWORK_PROJECT IWORK_SHOW_LOG_LINES IWORK_SESSION_MARKERS IWORK_UPDATE_CLAUDE IWORK_UPDATE_CODEX IWORK_RESUME_CLAUDE IWORK_RESUME_CODEX)
 
 load_config() {
   local var="" restore=""
@@ -31,6 +31,8 @@ TASKS_DIR="${IWORK_TASKS_DIR:-${REPO_DIR:+$REPO_DIR/tasks}}"
 PROJECTS_DIR="${IWORK_PROJECTS_DIR:-${REPO_DIR:+$REPO_DIR/projects}}"
 TASKS_SESSION="${IWORK_TMUX_SESSION:-tasks}"
 PROJECTS_SESSION="${IWORK_PROJECTS_TMUX_SESSION:-projects}"
+# One window per repo in the repo directory, kept whole by 'iwork repos'.
+REPOS_SESSION="${IWORK_REPOS_TMUX_SESSION:-repos}"
 # UNSTABLE, and off by default. Putting the agent marker on a session *name*
 # makes that name change under every other tool: anything that looks a session
 # up by the name it last saw -- tmux-sessionx, a keybinding, a restorer -- misses
@@ -100,6 +102,7 @@ Usage: iwork [flags] <branch-name> [--from <task|branch>] -r <repo1> [repo2 ...]
        iwork skills [-n] [<task>]
        iwork update-agents [-n] [-f] [--busy] [--restart]
        iwork resurrect [-n] [--fresh] [--big <task>]...
+       iwork repos [-n] [-d]
        iwork init
        iwork install-hooks [settings-path]
        iwork --completion <bash|zsh>
@@ -294,6 +297,9 @@ Subcommands:
                  task that has none, and puts each project's windows back in
                  its session. Agents resume with 'claude --continue'; -n shows
                  the plan without touching anything (see Resurrect below)
+  repos          Open the repos session: one window per repo in the repo
+                 directory, each split shell | shell. Creates what is missing
+                 and never closes anything (see Repos below)
   install-hooks  Add Claude Code hooks to ~/.claude/settings.json: keep tmux
                  window and session names in sync with agent status, inject the
                  project brief at session start, log PRs, and prompt for a
@@ -435,6 +441,25 @@ Resurrect:
   that had none is not a restore. Resurrect says which projects have no master,
   and 'iwork master <project>' starts one.
 
+  Resurrect also rebuilds the repos session (see Repos below).
+
+Repos:
+  'iwork repos' keeps one tmux session (IWORK_REPOS_TMUX_SESSION, default
+  'repos') holding at least one window per repo in the repo directory, named
+  after the repo and split into two shells. Then it switches to it; -d stays
+  where you are, -n only says what it would open.
+
+  The rule is "at least one": windows you add yourself are yours, and nothing
+  is ever closed, renamed or reordered. A window iwork made is tagged with the
+  '@iwork_repo' option, so renaming it does not make a second one appear; a
+  window you made that carries a repo's name counts for that repo too. A repo
+  that has gone from disk is reported, and its window left for you to close.
+
+  A new clone gets its window the next time the session is synced: on
+  'iwork repos', 'iwork resurrect', any other iwork command while the session
+  exists, and on every session switch once the tmux hook from
+  'iwork --tmux-config' is installed.
+
 Examples:
   iwork feat/bla -r backend-api frontend
   iwork fix/login-bug -r auth-service web-app
@@ -461,6 +486,7 @@ Examples:
   iwork resurrect -n
   iwork resurrect
   iwork resurrect --big feat-huge-thing
+  iwork repos
   iwork install-hooks
 
 Options (all accepted before the branch name or after the repo list):
@@ -1630,6 +1656,11 @@ bind-key S choose-tree -Zs -O name -F '#{?session_format,#{@iwork_state}#{sessio
 #    under a name iwork has since renamed. This folds any such split the moment
 #    it appears, whichever tool made it. Harmless if nothing is wrong.
 set-hook -g session-created 'run-shell -b "$self_path_q --fold-sessions"'
+
+# 4. Keep the repos session whole: a repo cloned since the last sync gets its
+#    window whenever you switch sessions. A no-op until 'iwork repos' has made
+#    the session.
+set-hook -g client-session-changed 'run-shell -b "$self_path_q --sync-repos"'
 # --- /iwork ------------------------------------------------------------------
 EOF
 }
@@ -1936,7 +1967,7 @@ _iwork() {
   fi
 
   if [[ -z "$cmd" ]]; then
-    COMPREPLY=( $(compgen -W "add-repo rm park list cd claude codex master resurrect skills cull update-agents project todo log decided done drop init install-hooks --no-tmux --no-context --detach -d --big --from -b --branch --message -m -h --help --completion" -- "$cur") )
+    COMPREPLY=( $(compgen -W "add-repo rm park list cd claude codex master resurrect repos skills cull update-agents project todo log decided done drop init install-hooks --no-tmux --no-context --detach -d --big --from -b --branch --message -m -h --help --completion" -- "$cur") )
     return 0
   fi
 
@@ -2138,6 +2169,7 @@ _iwork() {
       'codex[open the task tmux window and run codex]' \
       'master[open the project master session that runs the tasks]' \
       'resurrect[restart the agents and windows a dead tmux server took]' \
+      'repos[open the session with one window per repo]' \
       'skills[relink each task'"'"'s .claude/skills from its worktrees]' \
       'cull[tear down tasks git can give back, for a project'"'"'s master]' \
       'update-agents[upgrade the agent CLIs and restart every agent onto them]' \
@@ -5458,6 +5490,242 @@ cmd_update_agents() {
   done <<< "$agents"
 }
 
+# --- the repos session --------------------------------------------------------
+
+# Tasks are one way into the code; the repos themselves are the other. The
+# repos session holds at least one window per repo in the repo directory, so
+# every repo is a prefix-w away without having to be opened first.
+#
+# The rule is "at least one", and it only ever adds. A window you open in here
+# yourself is yours, and nothing in this session is closed, renamed or moved by
+# iwork: the session is synced from hooks and from other commands, so anything
+# destructive would happen at moments you did not choose.
+
+REPOS_DRY=""
+
+# The name has to stay clear of the prefixes iwork sweeps, or resurrect would
+# read the repo windows as leftover task windows and close them.
+repos_session_name_ok() {
+  case "$REPOS_SESSION" in
+    ""|*:*|*.*) return 1 ;;
+    "$TASKS_SESSION"|"$TASKS_SESSION"-*|"$PROJECTS_SESSION"|"$PROJECTS_SESSION"-*) return 1 ;;
+  esac
+}
+
+require_repos_session_name() {
+  repos_session_name_ok ||
+    die "IWORK_REPOS_TMUX_SESSION='$REPOS_SESSION' is not usable: it may not contain ':' or '.', or be or start with '$TASKS_SESSION-' or '$PROJECTS_SESSION-', which are iwork's task and project sessions"
+}
+
+# One repo window: two shells side by side in the repo, the left one active.
+# Tagged with '@iwork_repo' so it is still recognised after a rename, or with
+# an agent's marker on its name.
+open_repo_window() {
+  local repo="$1"
+  local dir="$REPO_DIR/$repo"
+  local live=""
+  local window_id=""
+  local pane_id=""
+
+  if live="$(resolve_session_name "$REPOS_SESSION")"; then
+    if ! IFS=' ' read -r window_id pane_id < <(tmux new-window -d -t "=$live" -n "$repo" -c "$dir" -P -F '#{window_id} #{pane_id}' 2>/dev/null); then
+      warn "could not create tmux window '$repo'"
+      return 1
+    fi
+  else
+    if ! IFS=' ' read -r window_id pane_id < <(tmux new-session -d -s "$REPOS_SESSION" -n "$repo" -c "$dir" -P -F '#{window_id} #{pane_id}' 2>/dev/null); then
+      warn "could not create tmux session '$REPOS_SESSION'"
+      return 1
+    fi
+  fi
+
+  tmux set-option -w -t "$window_id" @iwork_repo "$repo" 2>/dev/null || true
+  tmux split-window -h -d -t "$pane_id" -c "$dir" 2>/dev/null || warn "could not split tmux window '$repo'"
+}
+
+# Syncs run from a tmux hook in the background, so two session switches in a
+# row start two at once -- and both would see the same repo missing and open it
+# twice. The lock sits next to the server's socket, which makes it one per tmux
+# server. Same shape as project_lock, without the EXIT trap: a sync is short and
+# runs inside commands that may hold a project lock of their own.
+REPOS_LOCK_DIR=""
+
+repos_lock() {
+  local socket=""
+  local dir=""
+  local pid=""
+  local waited=0
+
+  socket="$(tmux display-message -p '#{socket_path}' 2>/dev/null)" || return 1
+  [[ -n "$socket" ]] || return 1
+  dir="$socket.iwork-repos.lock"
+
+  while ! mkdir "$dir" 2>/dev/null; do
+    pid="$(cat "$dir/pid" 2>/dev/null || true)"
+
+    if [[ -n "$pid" ]] && ! kill -0 "$pid" 2>/dev/null; then
+      rm -rf "$dir" 2>/dev/null || true
+      continue
+    fi
+
+    waited=$((waited + 1))
+
+    if [[ -z "$pid" ]] && (( waited > 10 )); then
+      rm -rf "$dir" 2>/dev/null || true
+      continue
+    fi
+
+    (( waited <= 40 )) || return 1
+    sleep 0.1
+  done
+
+  printf '%s\n' "$$" > "$dir/pid" 2>/dev/null || true
+  REPOS_LOCK_DIR="$dir"
+}
+
+repos_unlock() {
+  [[ -n "$REPOS_LOCK_DIR" ]] || return 0
+  rm -rf "$REPOS_LOCK_DIR" 2>/dev/null || true
+  REPOS_LOCK_DIR=""
+}
+
+sync_repos_session() {
+  local rc=0
+
+  # A dry run changes nothing, so it has nothing to race. Without a server
+  # there is no socket to lock next to, and nothing to race either: the first
+  # new-session is what starts one.
+  if [[ -n "$REPOS_DRY" ]] || ! tmux list-sessions >/dev/null 2>&1; then
+    sync_repos_session_unlocked
+    return
+  fi
+
+  if ! repos_lock; then
+    warn "another iwork is syncing the repos session; skipped"
+    return 0
+  fi
+
+  sync_repos_session_unlocked || rc=$?
+  repos_unlock
+  return "$rc"
+}
+
+# Opens a window for every repo that has none, and names the tagged windows
+# whose repo is gone. A repo counts as covered by a window tagged for it, or by
+# any window carrying its name -- so a window you made yourself called
+# 'frontend' is not given a twin. Bash 3.2 has no associative arrays, hence the
+# newline-framed strings.
+sync_repos_session_unlocked() {
+  local live=""
+  local repos=""
+  local repo=""
+  local tag=""
+  local name=""
+  local covered=$'\n'
+  local tagged=$'\n'
+  local opened=0
+
+  repos="$(list_repos)"
+
+  if live="$(resolve_session_name "$REPOS_SESSION")"; then
+    # The tag is read behind a fixed prefix: an untagged window's empty field
+    # would otherwise vanish into IFS, which folds leading tabs away.
+    while IFS=$'\t' read -r tag name; do
+      tag="${tag#t:}"
+      if [[ -n "$tag" ]]; then
+        covered="$covered$tag"$'\n'
+        tagged="$tagged$tag"$'\n'
+      fi
+      covered="$covered${name#[*!]}"$'\n'
+    done < <(tmux list-windows -t "=$live" -F "t:#{@iwork_repo}"$'\t''#{window_name}' 2>/dev/null)
+  fi
+
+  while IFS= read -r repo; do
+    [[ -n "$repo" ]] || continue
+    [[ "$covered" != *$'\n'"$repo"$'\n'* ]] || continue
+
+    if [[ -n "$REPOS_DRY" ]]; then
+      echo "  $repo: would open a window in session '${live:-$REPOS_SESSION}'"
+      continue
+    fi
+
+    open_repo_window "$repo" || continue
+    echo "  $repo: opened a window in session '${live:-$REPOS_SESSION}'"
+    opened=$((opened + 1))
+  done <<< "$repos"
+
+  while IFS= read -r repo; do
+    [[ -n "$repo" ]] || continue
+    [[ $'\n'"$repos"$'\n' != *$'\n'"$repo"$'\n'* ]] || continue
+    echo "  $repo: no longer in $REPO_DIR; its window is left for you to close"
+  done <<< "${tagged#$'\n'}"
+}
+
+# For every other command, and the tmux hook: bring an existing repos session
+# up to date without a word. Never creates the session -- only 'iwork repos'
+# and 'resurrect' do that -- and never fails the command it rides along with.
+refresh_repos_session() {
+  [[ -z "$IWORK_NO_TMUX" && -n "$REPO_DIR" ]] || return 0
+  command -v tmux >/dev/null 2>&1 || return 0
+  repos_session_name_ok || return 0
+  resolve_session_name "$REPOS_SESSION" >/dev/null 2>&1 || return 0
+  REPOS_DRY="" sync_repos_session >/dev/null 2>&1 || true
+}
+
+cmd_repos() {
+  local body=""
+  local live=""
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -n|--dry-run) REPOS_DRY=1; shift ;;
+      -d|--detach) IWORK_DETACH=1; shift ;;
+      -h|--help) usage 0 ;;
+      *) die "usage: iwork repos [-n] [-d]" ;;
+    esac
+  done
+
+  require_config
+  warn_message_undelivered "repos does not start an agent"
+
+  [[ -z "$IWORK_NO_TMUX" ]] ||
+    die "repos is a tmux session; there is nothing for it to do with --no-tmux"
+  command -v tmux >/dev/null 2>&1 || die "repos needs tmux"
+  require_repos_session_name
+
+  [[ -n "$(list_repos)" ]] || { echo "No repos in $REPO_DIR."; return 0; }
+
+  [[ -z "$REPOS_DRY" ]] || echo "Dry run — nothing is changed."
+
+  body="$(sync_repos_session)"
+  [[ -z "$body" ]] || printf '%s\n' "$body"
+
+  [[ -z "$REPOS_DRY" ]] || return 0
+
+  # open_repo_window warns per repo; this is the one line that says the whole
+  # thing did not happen, rather than a summary claiming it did.
+  live="$(resolve_session_name "$REPOS_SESSION")" ||
+    die "could not create tmux session '$REPOS_SESSION'"
+  [[ -n "$body" ]] || echo "Every repo has a window in session '$live'."
+
+  [[ -z "$IWORK_DETACH" ]] || return 0
+
+  if in_tmux; then
+    tmux switch-client -t "=$live" 2>/dev/null || true
+  elif [[ -t 0 && -t 1 ]]; then
+    exec tmux attach-session -t "=$live"
+  else
+    echo "Attach with: tmux attach -t '$live'"
+  fi
+}
+
+# The repos session in resurrect's terms: rebuilt whole, since after a dead
+# server there is nothing to be additive to.
+resurrect_repos() {
+  repos_session_name_ok || { warn "IWORK_REPOS_TMUX_SESSION='$REPOS_SESSION' is not usable; repos session skipped"; return 0; }
+  REPOS_DRY="$RESURRECT_DRY" sync_repos_session
+}
+
 # --- resurrect ----------------------------------------------------------------
 
 # A tmux server that dies takes every agent with it and nothing else: the
@@ -5945,6 +6213,7 @@ cmd_resurrect() {
   resurrect_section "Leftovers:" resurrect_sweep
   resurrect_section "Tasks:" resurrect_tasks
   resurrect_section "Projects:" resurrect_projects
+  resurrect_section "Repos:" resurrect_repos
 
   echo "Done. 'iwork list' shows where everything ended up."
 }
@@ -6316,6 +6585,7 @@ run_init() {
     fi
     echo '# IWORK_TMUX_SESSION=tasks'
     echo '# IWORK_PROJECTS_TMUX_SESSION=projects'
+    echo '# IWORK_REPOS_TMUX_SESSION=repos'
     echo '# IWORK_UPDATE_COMMAND=        # how "iwork update" upgrades Claude Code'
     echo '# IWORK_SESSION_MARKERS=off   # on = put the agent marker on session'
     echo '#                             # names too (UNSTABLE: see iwork -h)'
@@ -6854,6 +7124,12 @@ case "${1:-}" in
     done < <(iwork_sessions | sed 's/^[*!]//' | sort -u)
     exit 0
     ;;
+  --sync-repos)
+    # For the tmux 'client-session-changed' hook: a repo cloned since the last
+    # sync gets its window. Silent and always successful, like --fold-sessions.
+    refresh_repos_session
+    exit 0
+    ;;
   --tmux-config)
     print_tmux_config
     exit 0
@@ -6868,6 +7144,14 @@ case "${1:-}" in
   --hook)
     handle_claude_hook
     ;;
+esac
+
+# A repo cloned since the repos session was last synced gets its window on the
+# next iwork command, whatever that command is. Silent, and a no-op unless the
+# session exists.
+case "${1:-}" in
+  -*|init|repos|resurrect) ;;
+  *) refresh_repos_session ;;
 esac
 
 if [[ "${1:-}" == "init" ]]; then
@@ -6925,6 +7209,13 @@ fi
 if [[ "${1:-}" == "resurrect" ]]; then
   shift
   cmd_resurrect "$@"
+  exit 0
+fi
+
+# 'iwork repos -r ...' is still a task on a branch called 'repos'.
+if [[ "${1:-}" == "repos" && "${2:-}" != "-r" ]]; then
+  shift
+  cmd_repos "$@"
   exit 0
 fi
 
