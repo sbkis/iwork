@@ -140,6 +140,10 @@ setw -g automatic-rename off        # let iwork own the task window names
 bind Tab switch-client -l           # prefix+Tab: toggle last session
 
 bind T switch-client -t tasks       # prefix+T: jump to the tasks session
+bind R switch-client -t repos       # prefix+R: jump to the repos session
+
+# Keep the repos session whole: a new clone gets its window on the next switch
+set-hook -g client-session-changed 'run-shell -b "iwork --sync-repos"'
 
 # Waiting-agent counter in the status bar. -a covers every session, so it also
 # counts agents inside per-task `tasks-*` sessions (see Big tasks below).
@@ -196,6 +200,9 @@ iwork list
 # After a tmux server died: restart every agent where it belongs
 iwork resurrect -n
 iwork resurrect
+
+# A session with a window per repo, kept whole as repos come and go
+iwork repos
 
 # Relink every task's .claude/skills from its worktrees
 iwork skills
@@ -1093,6 +1100,47 @@ that window first.
 
 Set `IWORK_BIG=1` in your config to make every task work this way.
 
+## The repos session: a window per repo
+
+Tasks are one way into the code; the repos themselves are the other. `iwork
+repos` keeps a session (`repos` by default) with **at least one window per repo**
+in `IWORK_REPO_DIR`, named after the repo and split into two shells:
+
+```
+session repos
+|- window "backend-api"           shell | shell
+|- window "frontend"              shell | shell
+'- window "scratch"               yours: iwork never touches it
+```
+
+```bash
+iwork repos        # create what is missing, then switch to it
+iwork repos -d     # create what is missing, stay where you are
+iwork repos -n     # say what it would open
+```
+
+The rule is "at least one", and iwork only ever adds:
+
+- **Your windows are yours.** Anything you open in the session stays. Nothing
+  in it is closed, renamed or reordered by iwork.
+- **No twins.** A window iwork made is tagged with the `@iwork_repo` option, so
+  renaming it, or an agent's `*`/`!` marker on its name, does not get it a
+  second window. A window you made yourself that carries a repo's name counts
+  for that repo too.
+- **Gone repos are reported, not closed.** When a repo leaves the repo
+  directory, `iwork repos` names its window and leaves it for you to close.
+
+A new clone gets its window the next time the session is synced, with no need to
+run anything by hand:
+
+- `iwork repos` and `iwork resurrect` (which also creates the session);
+- any other iwork command, as long as the session exists;
+- every session switch, with the `client-session-changed` hook from
+  `iwork --tmux-config`.
+
+Only `iwork repos` and `resurrect` create the session. The rest keep one you have
+already made up to date.
+
 
 ## Updating the agents across every task
 
@@ -1188,6 +1236,8 @@ It reads the tasks directory as the truth and makes tmux match it again:
 - **Puts each project back together**: adopts a master left in the old shared
   `projects` session and gathers the project's task windows into its session,
   the same repair `iwork master` does, for every project at once.
+- **Rebuilds the [repos session](#the-repos-session-a-window-per-repo)**, one
+  window per repo, the same as `iwork repos -d`.
 
 Agents come back with `claude --continue`, which resumes the last conversation in
 that directory. Pass `--fresh` to start them cold instead. A task whose directory
@@ -1406,6 +1456,7 @@ overrides.
 | `IWORK_PROJECTS_DIR` | `$IWORK_REPO_DIR/projects` | Where project memory lives (see [Projects](#projects-memory-across-many-tasks)) |
 | `IWORK_TMUX_SESSION` | `tasks` | tmux session for tasks that belong to no project, and the prefix for a `--big` task's own session (`tasks-<task>`) |
 | `IWORK_PROJECTS_TMUX_SESSION` | `projects` | prefix for the session each project owns (`projects-<project>`), holding its master and its tasks (see [The master](#the-master-one-agent-whose-job-is-the-project)) |
+| `IWORK_REPOS_TMUX_SESSION` | `repos` | tmux session with a window per repo (see [The repos session](#the-repos-session-a-window-per-repo)); may not be or start with the task or project session prefixes |
 | `IWORK_CONTEXT_TEMPLATE` | `~/.config/iwork/task-context.md.tmpl` | Template for the generated `CLAUDE.md`/`AGENTS.md` (seeded with a default on first use, then yours to edit) |
 | `IWORK_PROJECT_TEMPLATE` | `~/.config/iwork/project-context.md.tmpl` | Template for the project block injected into those files (same deal: seeded once, then yours) |
 | `IWORK_PROJECT` | unset | Fallback project for `todo`/`log`/`decided`/`done`/`drop`. A task's own `.project` link always wins over it; `-p` wins over both |

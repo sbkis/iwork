@@ -4063,6 +4063,136 @@ test_update_does_not_restart_anything_when_the_update_fails() {
   assert_eq "the agent is untouched" "$before" "$(agent_pid_of '=tasks:feat-one')"
 }
 
+# --- repos session -------------------------------------------------------------
+
+# Panes of a window in the repos session, as "<count> <path-of-first>".
+repo_window_panes() {
+  local window="$1"
+  tmux_t list-panes -t "=repos:$window" -F '#{pane_current_path}' 2>/dev/null |
+    awk 'NR==1{p=$0} END{print NR, p}'
+}
+
+test_repos_opens_one_window_per_repo() {
+  command -v tmux >/dev/null 2>&1 || { printf '    skip (no tmux)\n'; return 0; }
+  mk_repo backend
+  mk_repo frontend
+  WANT_TMUX=1 iw repos -d >/dev/null 2>&1
+  assert_eq "a window per repo, in order" "backend frontend " "$(windows_of_session repos)"
+
+  local panes
+  panes="$(repo_window_panes backend)"
+  assert_eq "split into two shells" "2" "${panes%% *}"
+  case "${panes#* }" in
+    */repos/backend) ok ;;
+    *) bad "panes start in the repo (got '${panes#* }')" ;;
+  esac
+  assert_eq "tagged with its repo" "frontend" \
+    "$(tmux_t show-options -wqv -t '=repos:frontend' @iwork_repo)"
+}
+
+test_repos_is_idempotent_and_adds_new_clones() {
+  command -v tmux >/dev/null 2>&1 || { printf '    skip (no tmux)\n'; return 0; }
+  mk_repo backend
+  WANT_TMUX=1 iw repos -d >/dev/null 2>&1
+  assert_contains "a second run has nothing to do" "Every repo has a window" \
+    "$(WANT_TMUX=1 iw repos -d 2>&1)"
+  mk_repo frontend
+  WANT_TMUX=1 iw repos -d >/dev/null 2>&1
+  assert_eq "the new clone is appended" "backend frontend " "$(windows_of_session repos)"
+}
+
+test_repos_keeps_hand_made_windows_and_never_duplicates() {
+  command -v tmux >/dev/null 2>&1 || { printf '    skip (no tmux)\n'; return 0; }
+  mk_repo backend
+  mk_repo frontend
+  mk_repo shared
+  WANT_TMUX=1 iw repos -d >/dev/null 2>&1
+  # A window of your own, a renamed iwork window, an agent-marked one, and a
+  # hand-made window that already carries a repo's name.
+  tmux_t new-window -d -t '=repos' -n scratch
+  tmux_t rename-window -t '=repos:backend' be
+  tmux_t rename-window -t '=repos:frontend' '*frontend'
+  tmux_t kill-window -t '=repos:shared'
+  tmux_t new-window -d -t '=repos' -n shared
+  WANT_TMUX=1 iw repos -d >/dev/null 2>&1
+  assert_eq "nothing added, nothing removed" "*frontend be scratch shared " \
+    "$(windows_of_session repos | tr ' ' '\n' | sort | tr '\n' ' ' | sed 's/^ //')"
+}
+
+test_repos_reports_a_repo_that_is_gone_but_keeps_its_window() {
+  command -v tmux >/dev/null 2>&1 || { printf '    skip (no tmux)\n'; return 0; }
+  mk_repo backend
+  mk_repo frontend
+  WANT_TMUX=1 iw repos -d >/dev/null 2>&1
+  rm -rf "$SB_REPOS/frontend"
+  assert_contains "the gone repo is named" "frontend: no longer in" \
+    "$(WANT_TMUX=1 iw repos -d 2>&1)"
+  assert_eq "and its window stays" "backend frontend " "$(windows_of_session repos)"
+}
+
+test_repos_dry_run_changes_nothing() {
+  command -v tmux >/dev/null 2>&1 || { printf '    skip (no tmux)\n'; return 0; }
+  mk_repo backend
+  assert_contains "the plan is printed" "backend: would open" \
+    "$(WANT_TMUX=1 iw repos -n 2>&1)"
+  assert_eq "no session made" "" "$(windows_of_session repos)"
+}
+
+test_repos_synced_by_other_commands_once_it_exists() {
+  command -v tmux >/dev/null 2>&1 || { printf '    skip (no tmux)\n'; return 0; }
+  mk_repo backend
+  WANT_TMUX=1 iw list >/dev/null 2>&1
+  assert_eq "other commands never create it" "" "$(windows_of_session repos)"
+  WANT_TMUX=1 iw repos -d >/dev/null 2>&1
+  mk_repo frontend
+  WANT_TMUX=1 iw list >/dev/null 2>&1
+  assert_eq "but keep it whole" "backend frontend " "$(windows_of_session repos)"
+  mk_repo shared
+  WANT_TMUX=1 iw --sync-repos >/dev/null 2>&1
+  assert_eq "and so does the tmux hook" "backend frontend shared " "$(windows_of_session repos)"
+}
+
+test_repos_concurrent_syncs_do_not_duplicate() {
+  command -v tmux >/dev/null 2>&1 || { printf '    skip (no tmux)\n'; return 0; }
+  mk_repo backend
+  WANT_TMUX=1 iw repos -d >/dev/null 2>&1
+  mk_repo frontend
+  mk_repo shared
+  # Two session switches in a row fire the hook twice, in the background.
+  local i
+  for i in 1 2 3 4; do
+    WANT_TMUX=1 iw --sync-repos >/dev/null 2>&1 &
+  done
+  wait
+  assert_eq "each new repo opened once" "backend frontend shared " "$(windows_of_session repos)"
+}
+
+test_resurrect_builds_the_repos_session() {
+  command -v tmux >/dev/null 2>&1 || { printf '    skip (no tmux)\n'; return 0; }
+  mk_repo backend
+  mk_repo frontend
+  local out
+  out="$(WANT_TMUX=1 iw resurrect 2>&1)"
+  assert_contains "resurrect says so" "Repos:" "$out"
+  assert_eq "a window per repo" "backend frontend " "$(windows_of_session repos)"
+}
+
+test_repos_branch_name_still_makes_a_task() {
+  mk_repo backend
+  iw repos -r backend >/dev/null 2>&1
+  assert_dir "'iwork repos -r' is a task on branch 'repos'" "$SB_TASKS/repos/backend"
+}
+
+test_repos_session_name_may_not_shadow_a_task_session() {
+  command -v tmux >/dev/null 2>&1 || { printf '    skip (no tmux)\n'; return 0; }
+  mk_repo backend
+  echo 'IWORK_REPOS_TMUX_SESSION=tasks-repos' >> "$SB/config"
+  assert_contains "refused, and says why" "IWORK_REPOS_TMUX_SESSION='tasks-repos' is not usable" \
+    "$(WANT_TMUX=1 iw repos -d 2>&1)"
+  # Nor would resurrect then sweep the repo windows as leftover task windows.
+  assert_eq "no session made" "" "$(windows_of_session tasks-repos)"
+}
+
 # --- runner -------------------------------------------------------------------
 
 echo "iwork tests  ($IWORK_SRC)"
